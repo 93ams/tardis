@@ -158,8 +158,23 @@ atomic or mutex between them, fail the run with CWE-362, even though
 the simulator itself never runs two tasks at once. With
 `.atomic_lock_order = true`, two `std.Io.Mutex` taken in both orders by
 that object fail the run with CWE-833, without a deadlock having to
-happen. `build.zig`
-shows the wiring for `src/sec/tests/shadow_test.zig`.
+happen.
+
+In `build.zig`, one call builds the object and links it into the test:
+
+```zig
+const tardis_build = @import("tardis");
+_ = tardis_build.addInstrumentedObject(b, tests, .{
+    .name = "sut",
+    .root_source_file = b.path("src/sut.zig"),
+    .target = target,
+    .optimize = optimize,
+});
+```
+
+The test reaches the object through `extern fn` declarations;
+`src/sec/tests/shadow_test.zig` and `src/sec/tests/shadow/sut.zig` are a
+worked example.
 
 ## Build steps
 
@@ -172,6 +187,10 @@ shows the wiring for `src/sec/tests/shadow_test.zig`.
 | `zig build evidence` | the certification campaigns, bundles in `zig-out/tardis-evidence` |
 | `zig build bench` | throughput benchmarks, always optimized |
 | `zig build run` | the demo |
+
+`scripts/verify.sh` runs the formatting check and the suite in all four
+build modes and with `-Dsec`; `.github/workflows/test.yml` runs the suite
+on Linux, macOS and Windows.
 
 Useful flags: `-Dtest-filter=<text>`, `-Doptimize=<mode>`, `-Dsec`,
 `-Dlibc` (link libc; the fork server then uses libc's `fork`),

@@ -1,0 +1,3 @@
+# Sources stay LF on every platform: `zig fmt --check` and the evidence
+# bundle's file hashes both read the bytes on disk.
+* text=auto eol=lf

@@ -86,16 +86,6 @@ pub fn build(b: *std.Build) void {
     // with the sanitizer's callbacks, linked into a test that is not (Zig
     // links its own sanitizer runtime into anything that is). The C is
     // built with clang's load and store tracing, which every target has.
-    const shadow_sut = b.addObject(.{
-        .name = "shadow_sut",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/sec/tests/shadow/sut.zig"),
-            .target = target,
-            .optimize = optimize,
-            .sanitize_thread = true,
-        }),
-        .use_llvm = true,
-    });
     const shadow_mod = b.createModule(.{
         .root_source_file = b.path("src/sec/tests/shadow_test.zig"),
         .target = target,
@@ -103,12 +93,15 @@ pub fn build(b: *std.Build) void {
         .imports = sec_imports,
         .link_libc = true,
     });
-    shadow_mod.addObject(shadow_sut);
     shadow_mod.addCSourceFile(.{ .file = b.path("src/sec/tests/c/shadow.c"), .flags = &.{ "-std=c99", "-Wall", "-fsanitize-coverage=trace-pc,trace-loads,trace-stores", "-fno-autolink" } });
-    // LLVM for the test too: `sut_parse` takes a `std.mem.Allocator`, whose
-    // functions have Zig's calling convention, and Zig's own backend and
-    // LLVM do not agree on it.
-    sec_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = shadow_mod, .filters = test_filters, .use_llvm = true })).step);
+    const shadow_tests = b.addTest(.{ .root_module = shadow_mod, .filters = test_filters });
+    _ = addInstrumentedObject(b, shadow_tests, .{
+        .name = "shadow_sut",
+        .root_source_file = b.path("src/sec/tests/shadow/sut.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    sec_step.dependOn(&b.addRunArtifact(shadow_tests).step);
     test_step.dependOn(sec_step);
 
     // `zig build evidence`: the certification campaigns in certification
@@ -241,6 +234,41 @@ pub fn build(b: *std.Build) void {
             tools(b, termancy, mod, sec_mod, target, optimize, test_filters, test_step);
         }
     }
+}
+
+pub const InstrumentedObject = struct {
+    name: []const u8,
+    root_source_file: std.Build.LazyPath,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    imports: []const std.Build.Module.Import = &.{},
+};
+
+/// Builds the code under test as an object with the sanitizer's callbacks
+/// and links it into `tests`, for `tardis_sec`'s shadow memory, race
+/// detector and lock order (plan2.md §3.8, §4.5, §4.6). From a consumer's
+/// `build.zig`: `@import("tardis").addInstrumentedObject(b, tests, .{ ... })`.
+///
+/// The test must export the runtime (`comptime { tardis_sec.exportSanitizer(); }`)
+/// and reach the object through `extern fn` declarations. Both are built by
+/// LLVM: Zig types that cross the boundary (an `Allocator`, an `Io`) carry
+/// functions with Zig's calling convention, on which Zig's own backend and
+/// LLVM differ. `tests` itself must not be built with `sanitize_thread`.
+pub fn addInstrumentedObject(b: *std.Build, tests: *std.Build.Step.Compile, options: InstrumentedObject) *std.Build.Step.Compile {
+    const object = b.addObject(.{
+        .name = options.name,
+        .root_module = b.createModule(.{
+            .root_source_file = options.root_source_file,
+            .target = options.target,
+            .optimize = options.optimize,
+            .imports = options.imports,
+            .sanitize_thread = true,
+        }),
+        .use_llvm = true,
+    });
+    tests.root_module.addObject(object);
+    tests.use_llvm = true;
+    return object;
 }
 
 fn tools(
