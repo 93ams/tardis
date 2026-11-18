@@ -1,0 +1,37 @@
+const std = @import("std");
+const sec = @import("tardis_sec");
+test "every declaration is analyzed" {
+    std.testing.refAllDecls(sec);
+    std.testing.refAllDecls(sec.ShadowCell);
+    std.testing.refAllDecls(sec.WorkerSec);
+    std.testing.refAllDecls(sec.LockdepGraph);
+    std.testing.refAllDecls(sec.Registry);
+    std.testing.refAllDecls(sec.Amplification);
+    std.testing.refAllDecls(sec.mcdc);
+    std.testing.refAllDecls(sec.traceability);
+    std.testing.refAllDecls(sec.evidence);
+    std.testing.refAllDecls(sec.Campaign);
+    std.testing.refAllDecls(sec.Certified);
+    std.testing.refAllDecls(sec.CertifyOptions);
+    std.testing.refAllDecls(sec.Sandbox);
+    std.testing.refAllDecls(sec.SecurityConfig);
+    std.testing.refAllDecls(sec.RequirementScope);
+    std.testing.refAllDecls(sec.SecurityHooks);
+    std.testing.refAllDecls(sec.NoopSecurityHooks);
+    var cells: [16]sec.ShadowCell = undefined;
+    var w = sec.WorkerSec.init(0x1000, &cells);
+    sec.attachWorker(&w);
+    defer sec.attachWorker(null);
+    const buf: *[8]u8 = @ptrFromInt(0x1000);
+    _ = buf;
+    sec.SecurityHooks.onNetRead(&w, 0x1000, "abcdefgh");
+    try std.testing.expectEqual(sec.ByteState.untrusted_input, w.stateAt(0x1003));
+    sec.SecurityHooks.onLockAcquire(&w, 4);
+    sec.SecurityHooks.onLockRelease(&w, 4);
+    sec.SecurityHooks.onCausalStep(&w, 1);
+    sec.SecurityHooks.onVfsOp(&w, .open, "x");
+    try std.testing.expect(sec.SecurityHooks.onBranchCmp(&w, .{ .pc = 0, .lhs = 1, .rhs = 1, .width_bytes = 8, .critical = true }));
+    sec.enterSandbox(.{});
+    try std.testing.expect(!sec.activeSandbox().?.allowsPath("/etc"));
+    _ = sec.withSecurity(.{ .mode = .certification_eal7 });
+}

@@ -1,0 +1,70 @@
+# Certification evidence (plan2.md §7.5, §8.7 week 16): runs the certified
+# campaigns in certification mode, keeps their signed bundles as a build
+# artifact, and uploads their SARIF to code scanning.
+#
+# termancy is a sibling path dependency (`../termancy`), so both
+# repositories are checked out side by side.
+name: evidence
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  certify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: tardis
+      - uses: actions/checkout@v4
+        with:
+          repository: 93ams/termancy
+          path: termancy
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      # Only the campaigns meant to pass: the planted-bug campaigns would
+      # raise code-scanning alerts on purpose. `-Dedges` builds them with
+      # Zig's edge counters, so each bundle's `edges.json` (and the SARIF)
+      # lists the certified code the campaign never ran (plan2.md §7.1).
+      - name: Certification campaigns
+        working-directory: tardis
+        run: zig build evidence -Doptimize=ReleaseSafe -Dedges -Dtest-filter="echo quorum"
+      - name: Check the dead-edge report
+        working-directory: tardis
+        run: |
+          for e in zig-out/tardis-evidence/*/edges.json; do
+            # A campaign that names no scope measures nothing.
+            jq -e '.instrumented and ((.scope | length) == 0 or (.measured and .edges > 0))' "$e"
+          done
+      - name: Verify the bundles
+        working-directory: tardis
+        run: |
+          zig build -Doptimize=ReleaseSafe
+          for d in zig-out/tardis-evidence/*/; do ./zig-out/bin/tardis replay-evidence "$d"; done
+      # The manifest names the commit that produced it (read from .git,
+      # plan2.md §7.5): it must be the one this workflow checked out. A
+      # campaign that names no repository records none, and `all` of an
+      # empty list holds; at least one bundle must name this repository.
+      - name: Check the recorded revision
+        working-directory: tardis
+        run: |
+          named=0
+          for m in zig-out/tardis-evidence/*/manifest.json; do
+            jq -e --arg sha "$GITHUB_SHA" '[.revisions[] | select(.name == "tardis")] | all(.commit == $sha)' "$m"
+            named=$((named + $(jq '[.revisions[] | select(.name == "tardis")] | length' "$m")))
+          done
+          test "$named" -ge 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tardis-evidence
+          path: tardis/zig-out/tardis-evidence
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: tardis/zig-out/tardis-evidence
+          category: tardis-sec

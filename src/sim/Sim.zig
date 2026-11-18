@@ -1,0 +1,3469 @@
+//! The simulator: deterministic scheduler (plan §4) and `std.Io` VTable
+//! implementation (plan §4.5, §6.2) over the virtual filesystem.
+//!
+//! One `Sim` runs one execution at a time. `beginRun` formats fresh state for
+//! a seed; `endRun` abandons anything left over. All memory is allocated in
+//! `create` except the SUT heap and fuzz arena (see `alloc.zig`).
+
+const Sim = @This();
+
+const std = @import("std");
+const builtin = @import("builtin");
+const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
+const Io = std.Io;
+const File = Io.File;
+const Dir = Io.Dir;
+
+const decide = @import("decide.zig");
+const trace_mod = @import("trace.zig");
+const fault = @import("fault.zig");
+const oracle = @import("../check/oracle.zig");
+const alloc_mod = @import("alloc.zig");
+const fiber = @import("fiber.zig");
+const sched = @import("sched.zig");
+const vfs_mod = @import("../model/vfs.zig");
+const fuzz = @import("../search/fuzz.zig");
+const net_mod = @import("../model/net.zig");
+const explore = @import("../search/explore.zig");
+const seam = @import("sec_seam.zig");
+const ionet = Io.net;
+
+pub const TaskId = sched.TaskId;
+pub const Persona = vfs_mod.Persona;
+pub const CrashMode = vfs_mod.CrashMode;
+pub const Ppm = decide.Ppm;
+pub const NodeId = net_mod.NodeId;
+
+const is_windows = builtin.os.tag == .windows;
+
+pub const Limits = struct {
+    /// Fiber tasks per run (the root task is extra).
+    tasks_max: u16 = 64,
+    fiber_stack_bytes: u32 = 256 * 1024,
+    /// Budget for `env.allocator` per boot.
+    heap_bytes_max: u64 = 64 * 1024 * 1024,
+    fuzz_slice_len_max: u32 = 1024,
+    trace_ring_len: u32 = 64,
+    assertions_max: u32 = 64,
+    vfs: vfs_mod.Limits = .{},
+    net: net_mod.Limits = .{},
+    /// Names registered with `addHost` for virtual DNS.
+    hosts_max: u8 = 16,
+};
+
+pub const Config = struct {
+    preempt_ppm: Ppm = 250_000,
+    async_inline_ppm: Ppm = 200_000,
+    swarm: bool = true,
+    faults: fault.FaultOptions = .{},
+    limits: Limits = .{},
+    epoch_offset_ns: u64 = 1_700_000_000 * std.time.ns_per_s,
+    /// Number of simulated nodes, each with its own filesystem and address.
+    nodes: u8 = 1,
+    net: net_mod.Options = .{},
+    /// Print failure reports and diagnostics to stderr.
+    report: bool = true,
+    /// Fail a run whose code makes a real system call (`syscalls.zig`).
+    trap_syscalls: bool = false,
+    /// Answer `rdtsc` with virtual time (`tsc.zig`).
+    virtual_tsc: bool = false,
+    /// An optional security layer (plan2.md §2.2), one instance per `Sim`.
+    security: ?seam.Security = null,
+};
+
+/// Bytes available for an `async`/`concurrent` context and result.
+pub const task_buffer_bytes = 1024;
+const task_buffer_align = 64;
+
+const State = enum(u8) { free, runnable, blocked, finished };
+
+const Block = union(enum) {
+    none,
+    sleep,
+    futex: usize,
+    await_task: TaskId,
+    group: *Io.Group,
+    driver,
+    net,
+    lock,
+};
+
+const Start = union(enum) {
+    none,
+    future: *const fn (context: *const anyopaque, result: *anyopaque) void,
+    group: *const fn (context: *const anyopaque) void,
+    daemon: *const fn (context: *const anyopaque) void,
+};
+
+const Task = struct {
+    state: State,
+    node: NodeId,
+    /// Spawned by `spawnOn` (or by such a task): exempt from task leak checks.
+    daemon: bool,
+    /// Decision addressing (M3): spawn path and per-stream draw counters.
+    keys: decide.KeyContext,
+    /// Tasks spawned by this task so far (gives children stable paths).
+    children: u32,
+    ctx: fiber.Context,
+    stack: []align(16) u8,
+    block: Block,
+    cancelable_block: bool,
+    deadline_ns: ?u64,
+    woke_by_timeout: bool,
+    cancel_requested: bool,
+    cancel_protection: Io.CancelProtection,
+    awaiter: ?TaskId,
+    group: ?*Io.Group,
+    start: Start,
+    result_len: usize,
+    /// Stores the task made with a weak ordering and other tasks do not
+    /// see yet (`atomic.zig`), oldest first.
+    stores: [stores_max]PendingStore,
+    stores_len: u8,
+    context_buf: [task_buffer_bytes]u8 align(task_buffer_align),
+    result_buf: [task_buffer_bytes]u8 align(task_buffer_align),
+};
+
+/// Per-run cost counters (M4 cost ledger). All integers, so they are
+/// as deterministic as the trace.
+pub const Stats = struct {
+    /// Bytes the program wrote to files (logical).
+    disk_write_bytes: u64 = 0,
+    disk_read_bytes: u64 = 0,
+    disk_syncs: u64 = 0,
+    /// Stream bytes and writes, datagrams sent.
+    net_bytes: u64 = 0,
+    net_writes: u64 = 0,
+    datagrams: u64 = 0,
+};
+
+pub const Node = struct {
+    vfs: vfs_mod.Vfs,
+    /// Monotonic clock rate error in ppm (local = global * (1 + drift/1e6)).
+    drift_ppm: i32,
+    /// Offset of the `.real` clock (NTP steps).
+    real_offset_ns: i64,
+    crash_count: u32,
+    /// The node's volatile heap: wiped when the node crashes.
+    heap: alloc_mod.SutAllocator,
+};
+
+pub const host_name_bytes_max = 64;
+
+const Host = struct {
+    name: [host_name_bytes_max]u8,
+    name_len: u8,
+    node: NodeId,
+};
+
+const stores_max = 8;
+const PendingStore = struct { addr: usize, bits: u64, size: u8 };
+
+threadlocal var tls_sim: ?*Sim = null;
+
+gpa: Allocator,
+config: Config,
+
+decider: decide.Decider,
+trace: trace_mod.Trace,
+trace_ring: []trace_mod.Event,
+catalog: oracle.Catalog,
+catalog_storage: []oracle.Entry,
+plan: fault.Plan,
+/// The filesystem of the running task's node (updated on every switch).
+vfs: *vfs_mod.Vfs,
+nodes: []Node,
+net: net_mod.Net,
+hosts: []Host,
+hosts_len: u8,
+/// Guided exploration (M3): this run's coverage map, when collecting.
+coverage: ?explore.Map,
+prev_kind: u64,
+/// Shrinking (M3): when set, only these decisions keep their natural value.
+overlay: ?*const decide.Overlay,
+/// Shrinking (M3): records the keys of natural-valued draws.
+recorder: ?*decide.Recorder,
+/// Bounded exhaustive exploration: logs every keyed draw's domain.
+domain_log: ?*decide.DomainLog,
+/// Warm starts without re-running setup (plan §9 M5).
+warm: Warm,
+/// Fuzzy replay: the (stream, task) pairs the run drew from.
+anchors: ?*decide.Anchors,
+/// Bounded exhaustive exploration with state merging: what each node and
+/// each datagram inbox has seen so far (plan2.md §7.2).
+history: ?*History,
+/// Bounded exhaustive exploration with reduction: what each scheduling
+/// step touched (plan2.md §7.2).
+step_log: ?*StepLog,
+/// True while `fireTimers` wakes tasks: those wakes are caused by the
+/// clock, not by the running step.
+in_timers: bool,
+/// True while a run repeats one already counted (shrinking, the
+/// determinism re-run): layers that tally per run (requirement checks,
+/// campaign findings) skip it.
+rerun: bool,
+/// The campaign iteration being run (0 outside campaigns). With the
+/// persona, it orders runs the same way whichever worker ran them.
+iteration: u32,
+/// Warm starts (M5): when set, `Options.setup` runs first with `setup_seed`,
+/// then `reseed` switches to the iteration's seed.
+setup_seed: ?u64,
+/// The `Options.setup` function (a `*const fn (*Env) anyerror!void`).
+setup_fn: ?*const anyopaque,
+/// Cost ledger (M4): counters for the current run.
+stats: Stats,
+/// Chaos (M4): a nemesis runs while active; `generation` retires old ones.
+chaos_active: bool,
+chaos_generation: u32,
+/// `Options.chaos`: started before every body, healed after a drawn duration.
+auto_chaos: ?@import("../root.zig").Chaos,
+/// Virtual time at which automatic chaos heals (0: no automatic heal).
+heal_at_ns: u64,
+/// First error returned by a `spawnOn` task this run.
+daemon_error: ?anyerror,
+daemons_spawned: u32,
+/// The security layer's instance, when `Config.security` is set.
+sec: ?seam.Attached,
+/// Replacement datagram payloads from the security layer (first half) and
+/// replayed ones (second half), each one datagram long.
+sec_scratch: []u8,
+fuzz_arena: std.heap.ArenaAllocator,
+
+now_ns: u64,
+tasks: []Task,
+stacks: fiber.Stacks,
+/// Deadline of each blocked task (`no_timer` if none): a compact copy of
+/// `Task.deadline_ns` so timer scans stay in a few cache lines.
+timers: []u64,
+/// The pending deadlines as a binary min-heap, so the earliest is found
+/// without scanning every task. `timers[id]` stays the truth: an entry
+/// whose deadline is no longer its task's is stale, and is dropped when it
+/// reaches the top.
+timer_heap: []TimerEntry,
+timer_heap_len: usize,
+runq: sched.RunQueue,
+runq_words: []u64,
+current: TaskId,
+root_bounds: fiber.Bounds,
+free_ids: []TaskId,
+free_len: u32,
+deadlocked: bool,
+/// Task running the test body under `check` (0 when none).
+control: TaskId,
+
+persona: Persona,
+seed: u64,
+boot_count: u32,
+crash_count: u32,
+
+pub fn create(gpa: Allocator, config: Config) !*Sim {
+    if (!fiber.supported) return error.FibersUnsupported;
+    const limits = config.limits;
+    assert(limits.tasks_max >= 1);
+    assert(limits.fiber_stack_bytes >= 16 * 1024);
+    assert(limits.fiber_stack_bytes % 16 == 0);
+
+    const s = try gpa.create(Sim);
+    errdefer gpa.destroy(s);
+    s.gpa = gpa;
+    s.config = config;
+    s.decider = .init(0);
+
+    s.trace_ring = try gpa.alloc(trace_mod.Event, limits.trace_ring_len);
+    errdefer gpa.free(s.trace_ring);
+    s.trace = .init(s.trace_ring);
+
+    s.catalog_storage = try gpa.alloc(oracle.Entry, limits.assertions_max);
+    errdefer gpa.free(s.catalog_storage);
+    s.catalog = .init(s.catalog_storage);
+
+    s.plan = .init(config.faults);
+    assert(config.nodes >= 1 and config.nodes <= net_mod.nodes_limit);
+    s.nodes = try gpa.alloc(Node, config.nodes);
+    errdefer gpa.free(s.nodes);
+    var nodes_ready: usize = 0;
+    errdefer for (s.nodes[0..nodes_ready]) |*n| {
+        n.vfs.deinit();
+        n.heap.deinit();
+    };
+    for (s.nodes) |*n| {
+        // A fresh heap holds no pointers into itself, so it can be moved in.
+        var heap: alloc_mod.SutAllocator = try .init(gpa, &s.decider, limits.heap_bytes_max);
+        errdefer heap.deinit();
+        n.* = .{
+            .vfs = try .init(gpa, limits.vfs, .linux_ext4),
+            .drift_ppm = 0,
+            .real_offset_ns = 0,
+            .crash_count = 0,
+            .heap = heap,
+        };
+        nodes_ready += 1;
+    }
+    s.vfs = &s.nodes[0].vfs;
+    s.net = try .init(gpa, limits.net, config.nodes);
+    errdefer s.net.deinit();
+    s.hosts = try gpa.alloc(Host, limits.hosts_max);
+    errdefer gpa.free(s.hosts);
+    s.hosts_len = 0;
+    s.daemon_error = null;
+    s.daemons_spawned = 0;
+    s.stats = .{};
+    s.chaos_active = false;
+    s.chaos_generation = 0;
+    s.auto_chaos = null;
+    s.heal_at_ns = 0;
+    s.setup_seed = null;
+    s.setup_fn = null;
+    s.overlay = null;
+    s.recorder = null;
+    s.domain_log = null;
+    s.step_log = null;
+    s.anchors = null;
+    s.warm = .{};
+    s.history = null;
+    s.in_timers = false;
+    s.rerun = false;
+    s.iteration = 0;
+    s.coverage = null;
+    s.prev_kind = 0;
+    s.fuzz_arena = .init(gpa);
+    errdefer s.fuzz_arena.deinit();
+    s.sec = null;
+    s.sec_scratch = &.{};
+    if (config.security) |sec| {
+        s.sec_scratch = try gpa.alloc(u8, 2 * s.net.datagramCapacity());
+        const a: seam.Attached = .{ .provider = sec.provider, .ctx = try sec.provider.create(gpa, sec.params) };
+        s.sec = a;
+        for (s.nodes, 0..) |*n, i| {
+            n.heap.sec = a;
+            n.heap.sec_node = @intCast(i);
+            n.heap.sec_violation = .{ .ctx = s, .f = secViolationThunk };
+        }
+    }
+    errdefer if (s.sec) |a| {
+        a.provider.destroy(gpa, a.ctx);
+        gpa.free(s.sec_scratch);
+    };
+
+    const task_count = @as(usize, limits.tasks_max) + 1;
+    s.tasks = try gpa.alloc(Task, task_count);
+    errdefer gpa.free(s.tasks);
+    s.stacks = try fiber.Stacks.init(limits.tasks_max, limits.fiber_stack_bytes);
+    errdefer s.stacks.deinit();
+    s.timers = try gpa.alloc(u64, task_count);
+    errdefer gpa.free(s.timers);
+    @memset(s.timers, std.math.maxInt(u64));
+    s.timer_heap = try gpa.alloc(TimerEntry, 4 * task_count);
+    errdefer gpa.free(s.timer_heap);
+    s.timer_heap_len = 0;
+    s.runq_words = try gpa.alloc(u64, (task_count + 63) / 64);
+    errdefer gpa.free(s.runq_words);
+    s.runq = .init(s.runq_words);
+    s.free_ids = try gpa.alloc(TaskId, task_count);
+    errdefer gpa.free(s.free_ids);
+
+    for (s.tasks, 0..) |*t, i| {
+        t.state = .free;
+        t.stores_len = 0;
+        if (i == 0) {
+            t.stack = &.{};
+        } else {
+            t.stack = s.stacks.stack(i - 1);
+            fiber.paintCanary(t.stack);
+        }
+    }
+    s.now_ns = 0;
+    s.current = 0;
+    s.root_bounds = .{ .base = 0, .limit = 0 };
+    s.free_len = 0;
+    s.deadlocked = false;
+    s.control = 0;
+    s.persona = .linux_ext4;
+    s.seed = 0;
+    s.boot_count = 0;
+    s.crash_count = 0;
+    return s;
+}
+
+pub fn destroy(s: *Sim) void {
+    const gpa = s.gpa;
+    if (tls_sim == s) tls_sim = null;
+    gpa.free(s.free_ids);
+    gpa.free(s.runq_words);
+    gpa.free(s.timers);
+    gpa.free(s.timer_heap);
+    s.stacks.deinit();
+    gpa.free(s.tasks);
+    s.fuzz_arena.deinit();
+    if (s.sec) |a| {
+        a.provider.destroy(gpa, a.ctx);
+        gpa.free(s.sec_scratch);
+    }
+    s.warm.drop(gpa);
+    gpa.free(s.hosts);
+    s.net.deinit();
+    for (s.nodes) |*n| {
+        n.vfs.deinit();
+        n.heap.deinit();
+    }
+    gpa.free(s.nodes);
+    gpa.free(s.catalog_storage);
+    gpa.free(s.trace_ring);
+    gpa.destroy(s);
+}
+
+pub fn io(s: *Sim) Io {
+    return .{ .userdata = s, .vtable = &vtable };
+}
+
+/// Returns the simulator behind `io`, or null if `io` is not a TARDIS io.
+pub fn fromIo(i: Io) ?*Sim {
+    if (i.vtable != &vtable) return null;
+    return @ptrCast(@alignCast(i.userdata.?));
+}
+
+fn fromUserdata(userdata: ?*anyopaque) *Sim {
+    return @ptrCast(@alignCast(userdata.?));
+}
+
+// ===========================================================================
+// Run lifecycle
+
+pub fn beginRun(s: *Sim, seed: u64, persona: Persona) void {
+    tls_sim = s;
+    s.seed = seed;
+    s.persona = persona;
+    s.decider = .init(seed);
+    // Every draw of the run, from here on, is keyed (M3).
+    s.tasks[0].keys = .root;
+    s.tasks[0].children = 0;
+    s.decider.ctx = &s.tasks[0].keys;
+    s.decider.overlay = s.overlay;
+    s.decider.recorder = s.recorder;
+    s.decider.domain_log = s.domain_log;
+    s.decider.anchors = s.anchors;
+    s.decider.on_draw = if (s.history != null) .{ .ctx = s, .f = historyDraw } else null;
+    s.decider.on_natural = .{ .ctx = s, .f = recordDecision };
+    if (s.sec) |a| a.provider.begin_run(a.ctx, seed);
+    if (s.coverage) |m| m.clear();
+    s.prev_kind = 0;
+    s.plan = .init(s.config.faults);
+    if (s.config.swarm) s.plan.drawSwarm(&s.decider);
+    s.trace.reset();
+    s.now_ns = 0;
+    const drift_max = s.config.faults.clock_drift_ppm_max;
+    const drift_on = drift_max > 0 and s.plan.isEnabled(.clock_drift);
+    for (s.nodes) |*n| {
+        n.vfs.reset(persona);
+        n.real_offset_ns = 0;
+        n.crash_count = 0;
+        n.drift_ppm = 0;
+        n.heap.reset();
+        n.heap.oom_ppm = if (s.plan.isEnabled(.oom)) s.config.faults.oom_ppm else 0;
+        if (drift_on) {
+            const span: u64 = 2 * @as(u64, drift_max);
+            n.drift_ppm = @as(i32, @intCast(s.decider.range(.clock, 0, span))) - @as(i32, @intCast(drift_max));
+        }
+    }
+    s.vfs = &s.nodes[0].vfs;
+    s.net.reset();
+    s.hosts_len = 0;
+    s.daemon_error = null;
+    s.daemons_spawned = 0;
+    s.stats = .{};
+    s.chaos_active = false;
+    s.heal_at_ns = 0;
+    _ = s.fuzz_arena.reset(.retain_capacity);
+    s.boot_count = 1;
+    s.crash_count = 0;
+    s.deadlocked = false;
+    s.control = 0;
+    s.root_bounds = fiber.currentBounds();
+
+    for (s.tasks) |*t| t.state = .free;
+    s.runq.clear();
+    @memset(s.timers, no_timer);
+    s.timer_heap_len = 0;
+    s.current = 0;
+    s.resetTask(0);
+    s.tasks[0].state = .runnable;
+    s.runq.insert(0);
+    s.rebuildFreeList();
+}
+
+pub fn endRun(s: *Sim) void {
+    assert(s.current == 0);
+    s.abandonAllExcept(0, 0);
+    s.plan.clearTargeted();
+}
+
+fn resetTask(s: *Sim, id: TaskId) void {
+    const t = &s.tasks[id];
+    t.node = 0;
+    t.daemon = false;
+    t.block = .none;
+    t.cancelable_block = false;
+    t.deadline_ns = null;
+    t.woke_by_timeout = false;
+    t.cancel_requested = false;
+    t.cancel_protection = .unblocked;
+    t.awaiter = null;
+    t.group = null;
+    t.start = .none;
+    t.result_len = 0;
+    t.stores_len = 0;
+}
+
+/// Rebuilds the free list so that ids are handed out lowest first.
+fn rebuildFreeList(s: *Sim) void {
+    s.free_len = 0;
+    var i: usize = s.tasks.len;
+    while (i > 1) {
+        i -= 1;
+        if (s.tasks[i].state != .free) continue;
+        s.free_ids[s.free_len] = @intCast(i);
+        s.free_len += 1;
+    }
+}
+
+/// Drops every task except `keep_a` and `keep_b` without running them
+/// further (a crash, or the end of a run).
+fn abandonAllExcept(s: *Sim, keep_a: TaskId, keep_b: TaskId) void {
+    for (s.tasks, 0..) |*t, i| {
+        if (i == keep_a or i == keep_b) continue;
+        if (t.state == .free) continue;
+        t.state = .free;
+        s.runq.remove(@intCast(i));
+    }
+    s.rebuildFreeList();
+}
+
+fn recordDecision(ctx: *anyopaque, stream: decide.Stream, key: u64, forced: bool) void {
+    const s: *Sim = @ptrCast(@alignCast(ctx));
+    s.record(.decision, @backingInt(stream), key, @intFromBool(forced), @tagName(stream));
+}
+
+/// One scheduling step of a run: a task running from the point it was
+/// chosen until it next yields or blocks, with what it touched outside its
+/// own node. Two steps that are `independent` leave the same state in
+/// either order.
+pub const Step = struct {
+    task: TaskId,
+    node: NodeId,
+    /// Keyed draws logged when the step ended (`open_end` while it runs).
+    end_draws: usize = open_end,
+    /// The tasks runnable when it was chosen (bit per task id).
+    runnable: u64,
+    /// The tasks it woke.
+    woke: u64 = 0,
+    /// The datagram inboxes (node, port) it read or wrote.
+    inboxes: [inboxes_max]u32 = undefined,
+    inboxes_len: u8 = 0,
+    /// It did something whose effect on other nodes is not tracked, so it
+    /// is dependent with every step.
+    global: bool,
+
+    pub const inboxes_max = 6;
+    pub const open_end = std.math.maxInt(usize);
+
+    fn bit(id: TaskId) u64 {
+        return @as(u64, 1) << @as(u6, @intCast(id));
+    }
+
+    pub fn independent(a: *const Step, b: *const Step) bool {
+        if (a.global or b.global) return false;
+        // Tasks of one node share its memory, files and sockets.
+        if (a.node == b.node) return false;
+        if (a.woke & bit(b.task) != 0 or b.woke & bit(a.task) != 0) return false;
+        for (a.inboxes[0..a.inboxes_len]) |x| {
+            for (b.inboxes[0..b.inboxes_len]) |y| if (x == y) return false;
+        }
+        return true;
+    }
+
+    /// True when `b`, run right after `a`, could have run before it with
+    /// the same result, and that order comes first in the search (the
+    /// lower task id first): this order need not be explored.
+    pub fn redundantAfter(b: *const Step, a: *const Step) bool {
+        if (b.task >= a.task) return false;
+        if (a.runnable & bit(b.task) == 0) return false;
+        return a.independent(b);
+    }
+};
+
+pub const StepLog = struct {
+    steps: []Step,
+    len: usize = 0,
+    /// More steps than fit: the later ones are not logged.
+    overflowed: bool = false,
+
+    pub fn init(buffer: []Step) StepLog {
+        return .{ .steps = buffer };
+    }
+
+    pub fn slice(l: *const StepLog) []const Step {
+        return l.steps[0..l.len];
+    }
+};
+
+/// The state `Options.setup` leaves, kept so that later iterations start
+/// from a copy of it instead of running setup again.
+///
+/// Setup is deterministic (it runs with the campaign's setup seed), so
+/// every iteration's setup leaves the same state. The snapshot holds what
+/// setup can change in a simulator that is otherwise as `beginRun` leaves
+/// it: each node's filesystem (sharing its pages, `Vfs.Snapshot`) and
+/// clock offset, the virtual time, the body task's decision counters, the
+/// trace so far, the coverage bits, the cost counters and the host names.
+/// It is only taken when setup changed nothing else: no task, socket,
+/// heap block or open handle is left, no link was cut, nothing crashed, no
+/// assertion was counted, and no security layer or decision overlay is
+/// attached. Otherwise setup runs every iteration, as before.
+///
+/// Every `check_every`-th warm start runs setup for real and compares the
+/// result with the snapshot. A difference turns warm starts off for the
+/// rest of the simulator's life.
+pub const Warm = struct {
+    state: enum { none, ready, off } = .none,
+    /// False: setup runs every iteration (`Options.warm_restore`).
+    enabled: bool = true,
+    /// This run re-runs setup to compare it with the snapshot.
+    verifying: bool = false,
+    /// Assertion catalog totals before setup: setup must not count any.
+    catalog_len: usize = 0,
+    catalog_reached: u64 = 0,
+    /// Warm starts made from the snapshot, and setups re-run to check it.
+    restores: u64 = 0,
+    checks: u64 = 0,
+    mismatches: u64 = 0,
+    interruptions: u8 = 0,
+
+    persona: Persona = undefined,
+    setup_seed: u64 = 0,
+    now_ns: u64 = 0,
+    stats: Stats = .{},
+    keys: decide.KeyContext = .root,
+    keyed_draws: u64 = 0,
+    last_key: u64 = 0,
+    prev_kind: u64 = 0,
+    trace_hash: u64 = 0,
+    trace_count: u64 = 0,
+    ring_next: usize = 0,
+    ring: []trace_mod.Event = &.{},
+    coverage: []u64 = &.{},
+    hosts: []Host = &.{},
+    clocks: []Clock = &.{},
+    files: []vfs_mod.Vfs.Snapshot = &.{},
+
+    pub const check_every = 64;
+    /// Runs that could not use the snapshot before warm starts give up.
+    pub const interruptions_max = 4;
+
+    const Clock = struct { drift_ppm: i32, real_offset_ns: i64 };
+
+    fn drop(w: *Warm, gpa: Allocator) void {
+        for (w.files) |*f| f.deinit(gpa);
+        gpa.free(w.files);
+        gpa.free(w.clocks);
+        gpa.free(w.hosts);
+        gpa.free(w.coverage);
+        gpa.free(w.ring);
+        w.files = &.{};
+        w.clocks = &.{};
+        w.hosts = &.{};
+        w.coverage = &.{};
+        w.ring = &.{};
+    }
+};
+
+fn catalogReached(s: *const Sim) u64 {
+    var n: u64 = 0;
+    for (s.catalog.entries[0..s.catalog.len]) |e| n += e.reached_count;
+    return n;
+}
+
+/// True if this run may start from a snapshot, or have one taken: a plain
+/// campaign run, with nothing that changes or watches setup's decisions.
+fn warmPlainRun(s: *const Sim) bool {
+    return s.warm.enabled and s.warm.state != .off and s.sec == null and s.overlay == null and
+        s.recorder == null and s.domain_log == null and s.anchors == null and
+        s.step_log == null and s.history == null and s.auto_chaos == null;
+}
+
+/// True if the simulator differs from a fresh run only in what the
+/// snapshot holds.
+fn warmOnlySnapshotState(s: *const Sim) bool {
+    // Setup and the body run on one task (`control`); the root task
+    // waits for it.
+    const me = s.current;
+    if (me != s.control or s.runq.count != 1 or s.timer_heap_len != 0) return false;
+    for (s.tasks, 0..) |t, i| {
+        if (i != 0 and i != me and t.state != .free) return false;
+    }
+    if (s.tasks[me].children != 0 or s.tasks[me].stores_len != 0 or s.daemons_spawned != 0) return false;
+    if (s.daemon_error != null or s.deadlocked or s.chaos_active or s.heal_at_ns != 0) return false;
+    if (s.boot_count != 1 or s.crash_count != 0) return false;
+    if (s.plan.hasTargeted() or !s.net.pristine()) return false;
+    if (s.catalog.len != s.warm.catalog_len or s.catalogReached() != s.warm.catalog_reached) return false;
+    for (s.nodes) |*n| {
+        if (n.crash_count != 0 or !n.heap.pristine() or !n.vfs.noHandles()) return false;
+    }
+    return true;
+}
+
+/// Before setup: starts the run from the snapshot if there is one. True
+/// if it did, and setup must not run.
+pub fn warmRestore(s: *Sim) bool {
+    const w = &s.warm;
+    w.verifying = false;
+    if (!s.warmPlainRun()) {
+        // This run's setup may decide differently (a shrink candidate, a
+        // replay) and write other bytes into the pages the snapshot
+        // shares, which `reset` has just freed: the snapshot goes.
+        if (w.state == .ready) {
+            w.drop(s.gpa);
+            w.interruptions += 1;
+            w.state = if (w.interruptions > Warm.interruptions_max) .off else .none;
+        }
+        return false;
+    }
+    w.catalog_len = s.catalog.len;
+    w.catalog_reached = s.catalogReached();
+    if (w.state != .ready) return false;
+    if (w.persona != s.persona or w.setup_seed != s.seed) {
+        // Another persona: its setup leaves another state.
+        w.drop(s.gpa);
+        w.state = .none;
+        return false;
+    }
+    if ((w.restores + w.checks) % Warm.check_every == 0) {
+        w.verifying = true;
+        return false;
+    }
+    w.restores += 1;
+    for (s.nodes, w.files, w.clocks) |*n, *f, c| {
+        n.vfs.restore(f);
+        n.drift_ppm = c.drift_ppm;
+        n.real_offset_ns = c.real_offset_ns;
+    }
+    s.now_ns = w.now_ns;
+    s.stats = w.stats;
+    s.tasks[s.current].keys = w.keys;
+    s.decider.keyed_draws = w.keyed_draws;
+    s.decider.last_key = w.last_key;
+    s.prev_kind = w.prev_kind;
+    s.trace.hash = w.trace_hash;
+    s.trace.count = w.trace_count;
+    s.trace.ring_next = w.ring_next;
+    @memcpy(s.trace.ring, w.ring);
+    if (s.coverage) |m| @memcpy(m.words, w.coverage);
+    @memcpy(s.hosts[0..w.hosts.len], w.hosts);
+    s.hosts_len = @intCast(w.hosts.len);
+    return true;
+}
+
+/// After setup ran: takes the snapshot, or compares this setup's result
+/// with it.
+pub fn warmCapture(s: *Sim) void {
+    const w = &s.warm;
+    if (!s.warmPlainRun()) return;
+    if (!s.warmOnlySnapshotState()) {
+        w.drop(s.gpa);
+        w.state = .off;
+        return;
+    }
+    if (w.state == .ready) {
+        if (!w.verifying) return;
+        w.checks += 1;
+        var same = s.now_ns == w.now_ns and s.trace.hash == w.trace_hash and s.trace.count == w.trace_count and
+            std.meta.eql(s.tasks[s.current].keys, w.keys) and s.hosts_len == w.hosts.len;
+        for (s.nodes, w.files, w.clocks) |*n, *f, c| {
+            same = same and n.vfs.matches(f) and n.drift_ppm == c.drift_ppm and n.real_offset_ns == c.real_offset_ns;
+        }
+        if (!same) {
+            w.mismatches += 1;
+            w.drop(s.gpa);
+            w.state = .off;
+            return;
+        }
+        // The pages this setup wrote are the snapshot's: pin them again.
+        for (s.nodes, w.files) |*n, *f| n.vfs.restore(f);
+        return;
+    }
+    s.warmTake() catch {
+        w.drop(s.gpa);
+        w.state = .off;
+    };
+}
+
+fn warmTake(s: *Sim) !void {
+    const w = &s.warm;
+    const gpa = s.gpa;
+    w.ring = try gpa.dupe(trace_mod.Event, s.trace.ring);
+    w.coverage = if (s.coverage) |m| try gpa.dupe(u64, m.words[0..]) else &.{};
+    w.hosts = try gpa.dupe(Host, s.hosts[0..s.hosts_len]);
+    w.clocks = try gpa.alloc(Warm.Clock, s.nodes.len);
+    for (s.nodes, w.clocks) |n, *c| c.* = .{ .drift_ppm = n.drift_ppm, .real_offset_ns = n.real_offset_ns };
+    const files = try gpa.alloc(vfs_mod.Vfs.Snapshot, s.nodes.len);
+    var taken: usize = 0;
+    errdefer {
+        for (files[0..taken]) |*f| f.deinit(gpa);
+        gpa.free(files);
+    }
+    for (s.nodes, files) |*n, *f| {
+        f.* = try n.vfs.snapshot(gpa);
+        taken += 1;
+    }
+    w.files = files;
+    w.persona = s.persona;
+    w.setup_seed = s.seed;
+    w.now_ns = s.now_ns;
+    w.stats = s.stats;
+    w.keys = s.tasks[s.current].keys;
+    w.keyed_draws = s.decider.keyed_draws;
+    w.last_key = s.decider.last_key;
+    w.prev_kind = s.prev_kind;
+    w.trace_hash = s.trace.hash;
+    w.trace_count = s.trace.count;
+    w.ring_next = s.trace.ring_next;
+    w.state = .ready;
+}
+
+/// What a run has done so far, kept so that two runs that did the same
+/// things in a different order get the same value (`state`), and are known
+/// to be in the same state.
+///
+/// Each node has a hash of its own events in their order: what its tasks
+/// did, which of them ran, and every keyed draw they made with its value.
+/// Each datagram inbox has a hash of its sends, receives, binds and closes
+/// in their order. Everything else (streams, spawns, crashes, link
+/// changes, futexes, clock steps, time advancing) is folded together with
+/// all of the above at the moment it happens, so nothing is reordered
+/// across it.
+///
+/// A task's behaviour is a function of what it observes: its draws, its
+/// node's files and memory, what it receives, and the clock. So equal
+/// histories mean equal states, as long as tasks on different nodes share
+/// no memory except through the simulator (the assumption of
+/// `ExhaustiveOptions.reduce`).
+pub const History = struct {
+    nodes: []u64,
+    global: u64 = 0,
+    inbox_keys: [inboxes_max]u32 = undefined,
+    inbox_hashes: [inboxes_max]u64 = undefined,
+    inboxes_len: u8 = 0,
+    points: []Point,
+    len: usize = 0,
+    /// Something the histories do not capture: no more points are logged.
+    blind: bool = false,
+
+    pub const inboxes_max = 32;
+
+    /// The state before a scheduling choice: the keyed draws logged so
+    /// far, and the state's hash.
+    pub const Point = struct { draws: usize, state: u64 };
+
+    pub fn init(nodes: []u64, points: []Point) History {
+        @memset(nodes, 0);
+        return .{ .nodes = nodes, .points = points };
+    }
+
+    pub fn slice(h: *const History) []const Point {
+        return h.points[0..h.len];
+    }
+
+    fn combined(h: *const History) u64 {
+        var x = h.global;
+        for (h.nodes, 0..) |n, i| x = decide.mix(x, decide.mix(i, n));
+        // Inboxes in no order: they are found in the order they are used.
+        var inboxes: u64 = 0;
+        for (h.inbox_keys[0..h.inboxes_len], h.inbox_hashes[0..h.inboxes_len]) |k, v| inboxes +%= decide.mix(k, v);
+        return decide.mix(x, inboxes);
+    }
+};
+
+/// An event that stays inside the current task's node.
+fn historyNode(s: *Sim, kind: trace_mod.Kind, a: u64, b: u64, c: u64, label: []const u8) void {
+    const h = s.history orelse return;
+    const n = &h.nodes[s.tasks[s.current].node];
+    const lh: u64 = if (label.len == 0) 0 else explore.labelHash(label);
+    n.* = decide.mix(decide.mix(n.*, (@as(u64, @backingInt(kind)) << 16) | s.current), decide.mix(decide.mix(a, b), decide.mix(c, lh)));
+}
+
+/// An event that may matter to any node: nothing commutes with it.
+fn historyGlobal(s: *Sim, x: u64) void {
+    const h = s.history orelse return;
+    h.global = decide.mix(h.combined(), x);
+}
+
+/// The current task used the datagram inbox at (node, port).
+fn historyInbox(s: *Sim, node: NodeId, port: u16) void {
+    const h = s.history orelse return;
+    const key = (@as(u32, node) << 16) | port;
+    const at = for (h.inbox_keys[0..h.inboxes_len], 0..) |k, i| {
+        if (k == key) break i;
+    } else blk: {
+        if (h.inboxes_len == History.inboxes_max) {
+            h.blind = true;
+            return;
+        }
+        h.inbox_keys[h.inboxes_len] = key;
+        h.inbox_hashes[h.inboxes_len] = 0;
+        h.inboxes_len += 1;
+        break :blk h.inboxes_len - 1;
+    };
+    // Who used it, and what that node had done until then.
+    const me = s.tasks[s.current].node;
+    h.inbox_hashes[at] = decide.mix(h.inbox_hashes[at], decide.mix(me, h.nodes[me]));
+}
+
+/// A keyed draw and its value. The scheduler's own draws are left out:
+/// what they chose shows as the tasks that ran.
+fn historyDraw(ctx: *anyopaque, stream: decide.Stream, key: u64, value: u64) void {
+    const s: *Sim = @ptrCast(@alignCast(ctx));
+    const h = s.history orelse return;
+    if (stream == .schedule) return;
+    const n = &h.nodes[s.tasks[s.current].node];
+    n.* = decide.mix(n.*, decide.mix(key, value));
+}
+
+/// The state before a scheduling choice.
+fn historyPoint(s: *Sim) void {
+    const h = s.history orelse return;
+    // A security layer keeps state across nodes, and a pending targeted
+    // fault counts operations on every node: the histories miss both.
+    if (s.sec != null or s.plan.hasTargeted()) h.blind = true;
+    if (h.blind or h.len == h.points.len) {
+        h.blind = true;
+        return;
+    }
+    var x = decide.mix(h.combined(), s.now_ns);
+    for (s.runq.words) |w| x = decide.mix(x, w);
+    h.points[h.len] = .{ .draws = if (s.domain_log) |l| l.len else 0, .state = x };
+    h.len += 1;
+}
+
+/// The step being run, if steps are logged.
+fn stepNow(s: *Sim) ?*Step {
+    const l = s.step_log orelse return null;
+    if (l.len == 0 or l.overflowed) return null;
+    const st = &l.steps[l.len - 1];
+    return if (st.end_draws == Step.open_end) st else null;
+}
+
+/// The running step did something that may matter to any other step.
+pub fn touchGlobal(s: *Sim) void {
+    if (s.stepNow()) |st| st.global = true;
+    s.historyGlobal(0x6C0BA1);
+}
+
+/// The running step read or wrote the datagram inbox at (node, port).
+fn touchInbox(s: *Sim, node: NodeId, port: u16) void {
+    s.historyInbox(node, port);
+    const st = s.stepNow() orelse return;
+    const key = (@as(u32, node) << 16) | port;
+    for (st.inboxes[0..st.inboxes_len]) |k| if (k == key) return;
+    if (st.inboxes_len == Step.inboxes_max) {
+        st.global = true;
+        return;
+    }
+    st.inboxes[st.inboxes_len] = key;
+    st.inboxes_len += 1;
+}
+
+/// The running step ends: the current task yields or blocks.
+fn endStep(s: *Sim) void {
+    const st = s.stepNow() orelse return;
+    // A pending targeted fault counts operations on every node.
+    if (s.plan.hasTargeted()) st.global = true;
+    st.end_draws = if (s.domain_log) |l| l.len else 0;
+}
+
+/// `next` was chosen to run.
+fn beginStep(s: *Sim, next: TaskId) void {
+    const l = s.step_log orelse return;
+    if (l.len == l.steps.len) {
+        l.overflowed = true;
+        return;
+    }
+    // A security layer keeps state across nodes (taint by content), and
+    // tasks beyond the mask cannot be tracked: no reduction then.
+    var global = s.sec != null or next >= 64 or s.plan.hasTargeted();
+    for (s.runq.words[1..]) |w| global = global or w != 0;
+    l.steps[l.len] = .{
+        .task = next,
+        .node = s.tasks[next].node,
+        .runnable = s.runq.words[0],
+        .global = global,
+    };
+    l.len += 1;
+}
+
+fn record(s: *Sim, kind: trace_mod.Kind, a: u64, b: u64, c: u64, label: []const u8) void {
+    s.trace.record(s.now_ns, s.current, kind, a, b, c, label);
+    if (s.step_log != null or s.history != null) switch (kind) {
+        // The task's own keyed draws: folded as they are made.
+        .decision => {},
+        // Which task runs on its node (not which one ran before it, on
+        // whatever node).
+        .switch_to => s.historyNode(kind, 0, b, 0, ""),
+        // Time moves when nothing can run: the same in every order, and
+        // after it nothing is as before.
+        .clock_advance => s.historyGlobal(decide.mix(@backingInt(kind), a)),
+        // Scheduling, and the node's files.
+        .sleep, .finish, .random => s.historyNode(kind, a, b, c, label),
+        .open, .create, .close, .read, .write, .sync, .set_length, .stat => s.historyNode(kind, a, b, c, label),
+        .delete, .rename, .mkdir, .dir_read, .fs_link, .chmod => s.historyNode(kind, a, b, c, label),
+        // Datagram operations name their inboxes at the call (`touchInbox`).
+        // Their socket slots and handles depend on which node bound
+        // first, so they are left out: the inbox says which socket.
+        .net_send, .net_receive => s.historyNode(kind, 0, b, c, label),
+        .net_bind => s.historyNode(kind, a, b, 0, label),
+        .net_close => s.historyNode(kind, 0, 0, 0, label),
+        else => {
+            s.touchGlobal();
+            s.historyGlobal(decide.mix(decide.mix(@backingInt(kind), a), decide.mix(b, c)));
+        },
+    };
+    if (s.coverage) |m| {
+        switch (kind) {
+            // Scheduling noise and decision markers are not behaviour.
+            .switch_to, .clock_advance, .sleep, .decision, .spawn, .finish => {},
+            else => {
+                const lh: u64 = if (label.len == 0) 0 else explore.labelHash(label);
+                m.set(decide.mix(decide.mix(s.prev_kind, @backingInt(kind)), lh));
+                s.prev_kind = @backingInt(kind);
+            },
+        }
+    }
+}
+
+// ===========================================================================
+// Scheduler
+
+fn boundsOf(s: *Sim, id: TaskId) fiber.Bounds {
+    if (id == 0) return s.root_bounds;
+    return fiber.boundsOf(s.tasks[id].stack);
+}
+
+fn checkCanary(s: *Sim, id: TaskId) void {
+    if (id == 0) return;
+    if (!fiber.canaryIntact(s.tasks[id].stack)) {
+        std.debug.print("tardis: stack overflow in task {d} (seed=0x{x}); raise limits.fiber_stack_bytes\n", .{ id, s.seed });
+        @panic("tardis: fiber stack overflow");
+    }
+}
+
+fn switchToTask(s: *Sim, next: TaskId) void {
+    const prev = s.current;
+    if (prev == next) return;
+    s.checkCanary(prev);
+    s.current = next;
+    s.vfs = &s.nodes[s.tasks[next].node].vfs;
+    s.decider.ctx = &s.tasks[next].keys;
+    s.record(.switch_to, prev, next, 0, "");
+    fiber.switchTo(&s.tasks[prev].ctx, &s.tasks[next].ctx, s.boundsOf(next));
+    // Resumed: whoever switched back to us set `current`.
+    assert(s.current == prev);
+}
+
+fn wake(s: *Sim, id: TaskId) void {
+    const t = &s.tasks[id];
+    if (t.state != .blocked) return;
+    t.state = .runnable;
+    t.block = .none;
+    t.cancelable_block = false;
+    t.deadline_ns = null;
+    s.timers[id] = no_timer;
+    s.runq.insert(id);
+    if (!s.in_timers) s.secSync(.wake, s.current, id);
+    if (!s.in_timers) if (s.stepNow()) |st| {
+        if (id < 64) st.woke |= @as(u64, 1) << @as(u6, @intCast(id)) else st.global = true;
+    };
+}
+
+const no_timer = std.math.maxInt(u64);
+
+const TimerEntry = struct {
+    deadline: u64,
+    id: TaskId,
+
+    fn before(a: TimerEntry, b: TimerEntry) bool {
+        return if (a.deadline != b.deadline) a.deadline < b.deadline else a.id < b.id;
+    }
+};
+
+/// A task blocked with a deadline. When the heap is full of stale entries
+/// it is rebuilt from `timers`, which holds at most one per task.
+fn timerPush(s: *Sim, deadline: u64, id: TaskId) void {
+    if (s.timer_heap_len == s.timer_heap.len) {
+        s.timer_heap_len = 0;
+        for (s.timers, 0..) |d, i| {
+            if (d != no_timer and i != id) s.timerInsert(.{ .deadline = d, .id = @intCast(i) });
+        }
+    }
+    s.timerInsert(.{ .deadline = deadline, .id = id });
+}
+
+fn timerInsert(s: *Sim, e: TimerEntry) void {
+    const h = s.timer_heap;
+    var i = s.timer_heap_len;
+    s.timer_heap_len += 1;
+    while (i > 0) {
+        const parent = (i - 1) / 2;
+        if (!e.before(h[parent])) break;
+        h[i] = h[parent];
+        i = parent;
+    }
+    h[i] = e;
+}
+
+fn timerPop(s: *Sim) void {
+    const h = s.timer_heap;
+    s.timer_heap_len -= 1;
+    const n = s.timer_heap_len;
+    if (n == 0) return;
+    const e = h[n];
+    var i: usize = 0;
+    while (true) {
+        var child = 2 * i + 1;
+        if (child >= n) break;
+        if (child + 1 < n and h[child + 1].before(h[child])) child += 1;
+        if (!h[child].before(e)) break;
+        h[i] = h[child];
+        i = child;
+    }
+    h[i] = e;
+}
+
+/// The earliest live entry, after dropping the stale ones above it: those
+/// whose task was woken, re-blocked with another deadline, or is no longer
+/// blocked (freed, dropped), whose `timers` slot is cleared here.
+fn timerTop(s: *Sim) ?TimerEntry {
+    while (s.timer_heap_len > 0) {
+        const e = s.timer_heap[0];
+        if (s.timers[e.id] == e.deadline) {
+            const t = &s.tasks[e.id];
+            if (t.state == .blocked and t.deadline_ns != null) return e;
+            s.timers[e.id] = no_timer;
+        }
+        s.timerPop();
+    }
+    return null;
+}
+
+/// Wakes every blocked task whose deadline has passed.
+fn fireTimers(s: *Sim) void {
+    s.in_timers = true;
+    defer s.in_timers = false;
+    while (s.timerTop()) |e| {
+        if (e.deadline > s.now_ns) return;
+        s.timerPop();
+        s.tasks[e.id].woke_by_timeout = true;
+        s.wake(e.id);
+    }
+}
+
+fn earliestDeadline(s: *Sim) ?u64 {
+    const e = s.timerTop() orelse return null;
+    return e.deadline;
+}
+
+/// Picks the next task and switches to it. Returns when the current task is
+/// next resumed. The current task may or may not be runnable.
+fn reschedule(s: *Sim) void {
+    s.endStep();
+    while (true) {
+        s.fireTimers();
+        if (s.runq.count > 0) {
+            s.historyPoint();
+            const rank = s.decider.uniform(.schedule, s.runq.count);
+            const next = s.runq.pickNth(rank);
+            s.beginStep(next);
+            s.switchToTask(next);
+            return;
+        }
+        if (s.earliestDeadline()) |d| {
+            assert(d > s.now_ns);
+            s.record(.clock_advance, d - s.now_ns, 0, 0, "");
+            s.now_ns = d;
+            continue;
+        }
+        // Nothing runnable and no timers: deadlock.
+        s.record(.deadlock, 0, 0, 0, "");
+        const root = &s.tasks[0];
+        if (root.state == .blocked and root.block == .driver and !s.deadlocked) {
+            s.deadlocked = true;
+            s.wake(0);
+            continue;
+        }
+        s.dumpTasks();
+        std.debug.print("tardis: deadlock: no runnable task and no pending timer (seed=0x{x} persona={s})\n", .{ s.seed, @tagName(s.persona) });
+        s.trace.dump(16);
+        @panic("tardis: deadlock");
+    }
+}
+
+fn block(s: *Sim, reason: Block, deadline_ns: ?u64, cancelable: bool) void {
+    s.atomicFlush();
+    const id = s.current;
+    const t = &s.tasks[id];
+    assert(t.state == .runnable);
+    t.state = .blocked;
+    t.block = reason;
+    t.cancelable_block = cancelable;
+    t.deadline_ns = deadline_ns;
+    s.timers[id] = deadline_ns orelse no_timer;
+    if (deadline_ns) |d| s.timerPush(d, id);
+    t.woke_by_timeout = false;
+    s.runq.remove(id);
+    s.reschedule();
+    assert(s.tasks[id].state == .runnable);
+}
+
+/// Writes the current task's buffered stores to memory, oldest first.
+pub fn atomicFlush(s: *Sim) void {
+    const t = &s.tasks[s.current];
+    for (t.stores[0..t.stores_len]) |p| {
+        const dst: [*]u8 = @ptrFromInt(p.addr);
+        @memcpy(dst[0..p.size], std.mem.asBytes(&p.bits)[0..p.size]);
+    }
+    t.stores_len = 0;
+}
+
+/// The current task stores `bits` to `addr` with a weak ordering: other
+/// tasks see it when the buffer drains.
+pub fn atomicBuffer(s: *Sim, addr: usize, bits: u64, size: u8) void {
+    const t = &s.tasks[s.current];
+    if (t.stores_len == stores_max) s.atomicFlush();
+    t.stores[t.stores_len] = .{ .addr = addr, .bits = bits, .size = size };
+    t.stores_len += 1;
+}
+
+/// The current task's latest buffered store to `addr`, if any.
+pub fn atomicBuffered(s: *Sim, addr: usize) ?u64 {
+    const t = &s.tasks[s.current];
+    var i: usize = t.stores_len;
+    while (i > 0) {
+        i -= 1;
+        if (t.stores[i].addr == addr) return t.stores[i].bits;
+    }
+    return null;
+}
+
+/// An atomic operation: memory other tasks (on any node) may share, and
+/// a point where another task may run. The task's buffered stores drain
+/// here unless a keyed decision holds them (benign: they drain).
+pub fn atomicPoint(s: *Sim, hold_ppm: decide.Ppm) void {
+    s.touchGlobal();
+    if (s.tasks[s.current].stores_len > 0 and !s.decider.chance(.schedule, hold_ppm)) s.atomicFlush();
+    if (s.runq.count <= 1) return;
+    if (!s.decider.chance(.schedule, s.config.preempt_ppm)) return;
+    s.reschedule();
+}
+
+/// A scheduling point: possibly yield to another runnable task.
+fn maybeYield(s: *Sim) void {
+    s.atomicFlush(); // a simulated operation: the store buffer has drained
+    if (s.runq.count <= 1) return;
+    if (!s.decider.chance(.schedule, s.config.preempt_ppm)) return;
+    s.reschedule();
+}
+
+fn sleepUntil(s: *Sim, deadline_ns: u64, cancelable: bool) void {
+    s.record(.sleep, deadline_ns -| s.now_ns, 0, 0, "");
+    s.block(.sleep, deadline_ns, cancelable);
+}
+
+/// Consumes a pending cancel request if the task observes cancelation.
+fn cancelPoint(s: *Sim) Io.Cancelable!void {
+    const t = &s.tasks[s.current];
+    if (!t.cancel_requested) return;
+    if (t.cancel_protection == .blocked) return;
+    t.cancel_requested = false;
+    s.record(.cancel, 1, 0, 0, "");
+    return error.Canceled;
+}
+
+fn requestCancel(s: *Sim, id: TaskId) void {
+    const t = &s.tasks[id];
+    if (t.state == .free or t.state == .finished) return;
+    t.cancel_requested = true;
+    s.record(.cancel, 0, id, 0, "");
+    if (t.state == .blocked and t.cancelable_block and t.cancel_protection == .unblocked) s.wake(id);
+}
+
+fn dumpTasks(s: *Sim) void {
+    std.debug.print("tardis: tasks at virtual time {d} ns:\n", .{s.now_ns});
+    for (s.tasks, 0..) |*t, i| {
+        if (t.state == .free) continue;
+        std.debug.print("  task {d}: {s}", .{ i, @tagName(t.state) });
+        if (t.state == .blocked) {
+            std.debug.print(" on {s}", .{@tagName(t.block)});
+            if (t.deadline_ns) |d| std.debug.print(" until {d} ns", .{d});
+        }
+        std.debug.print("\n", .{});
+    }
+}
+
+// ===========================================================================
+// Task spawning and completion
+
+fn allocTask(s: *Sim) ?TaskId {
+    if (s.free_len == 0) return null;
+    s.free_len -= 1;
+    const id = s.free_ids[s.free_len];
+    assert(s.tasks[id].state == .free);
+    return id;
+}
+
+fn freeTask(s: *Sim, id: TaskId) void {
+    assert(id != 0);
+    const t = &s.tasks[id];
+    t.state = .free;
+    s.runq.remove(id);
+    s.free_ids[s.free_len] = id;
+    s.free_len += 1;
+}
+
+fn fitsBuffer(len: usize, alignment: std.mem.Alignment) bool {
+    return len <= task_buffer_bytes and alignment.toByteUnits() <= task_buffer_align;
+}
+
+const Trampoline = fiber.Trampoline(&fiberMain);
+
+fn spawn(s: *Sim, start: Start, context: []const u8, group: ?*Io.Group, result_len: usize) ?TaskId {
+    const id = s.allocTask() orelse return null;
+    s.resetTask(id);
+    const t = &s.tasks[id];
+    t.node = s.tasks[s.current].node;
+    t.daemon = s.tasks[s.current].daemon;
+    const parent = &s.tasks[s.current];
+    t.keys = parent.keys.child(parent.children);
+    t.children = 0;
+    parent.children += 1;
+    t.start = start;
+    t.group = group;
+    t.result_len = result_len;
+    @memcpy(t.context_buf[0..context.len], context);
+    t.ctx = fiber.initContext(t.stack, Trampoline.entry);
+    t.state = .runnable;
+    s.runq.insert(id);
+    s.record(.spawn, id, @intFromBool(group != null), 0, "");
+    s.secSync(.spawn, s.current, id);
+    return id;
+}
+
+fn fiberMain() callconv(.c) noreturn {
+    const s = tls_sim.?;
+    const id = s.current;
+    const t = &s.tasks[id];
+    switch (t.start) {
+        .future => |f| f(&t.context_buf, &t.result_buf),
+        .group, .daemon => |f| f(&t.context_buf),
+        .none => unreachable,
+    }
+    s.finishCurrent();
+}
+
+fn finishCurrent(s: *Sim) noreturn {
+    s.atomicFlush();
+    const id = s.current;
+    const t = &s.tasks[id];
+    s.record(.finish, id, 0, 0, "");
+    s.runq.remove(id);
+    if (t.group) |g| s.secSync(.release, id, @intFromPtr(g)) else if (t.start != .daemon) s.secSync(.release, id, seam.futureKey(id));
+    if (t.group) |g| {
+        t.group = null;
+        assert(g.state > 0);
+        g.state -= 1;
+        if (g.state == 0) s.wakeGroupWaiters(g);
+        // The slot is reused only by a later spawn, which runs on another
+        // stack after we have switched away.
+        s.freeTask(id);
+    } else if (t.start == .daemon) {
+        s.freeTask(id);
+    } else {
+        t.state = .finished;
+        if (t.awaiter) |a| s.wake(a);
+    }
+    s.reschedule();
+    unreachable; // a finished task is never resumed
+}
+
+fn wakeGroupWaiters(s: *Sim, g: *Io.Group) void {
+    for (s.tasks, 0..) |*t, i| {
+        if (t.state != .blocked) continue;
+        switch (t.block) {
+            .group => |bg| if (bg == g) s.wake(@intCast(i)),
+            else => {},
+        }
+    }
+}
+
+// ===========================================================================
+// Driver (used by `tardis.check`)
+
+pub const Body = *const fn (ctx: *anyopaque) anyerror!void;
+
+const ControlContext = struct {
+    body: Body,
+    ctx: *anyopaque,
+};
+
+fn controlStart(context: *const anyopaque, result: *anyopaque) void {
+    const c: *const ControlContext = @ptrCast(@alignCast(context));
+    const r: *anyerror!void = @ptrCast(@alignCast(result));
+    r.* = c.body(c.ctx);
+}
+
+pub const DriveResult = struct {
+    outcome: anyerror!void,
+    control: TaskId,
+};
+
+/// Runs `body` on a control fiber until it finishes or the run deadlocks.
+/// Must be called from the root task.
+/// Key path of the driver task (task 0) under `check`.
+const driver_key_path: u64 = 0xD71E_5EED_0000_0001;
+
+pub fn drive(s: *Sim, body: Body, ctx: *anyopaque) DriveResult {
+    assert(s.current == 0);
+    const cc: ControlContext = .{ .body = body, .ctx = ctx };
+    const id = s.spawn(.{ .future = controlStart }, std.mem.asBytes(&cc), null, @sizeOf(anyerror!void)) orelse
+        @panic("tardis: no task slot for the control fiber");
+    const t = &s.tasks[id];
+    // The body draws the decisions the root task would under `tardis.sim`,
+    // so replay tokens work under either entry point. The driver (task 0)
+    // gets its own path so its draws never share a key with the body's.
+    t.keys = .root;
+    s.tasks[0].keys = .{ .path = driver_key_path, .counters = @splat(0) };
+    s.control = id;
+    defer s.control = 0;
+    while (t.state != .finished) {
+        if (s.deadlocked) {
+            if (s.config.report) s.dumpTasks();
+            return .{ .outcome = error.Deadlock, .control = id };
+        }
+        t.awaiter = 0;
+        s.block(.driver, null, false);
+    }
+    const r: *const (anyerror!void) = @ptrCast(@alignCast(&t.result_buf));
+    return .{ .outcome = r.*, .control = id };
+}
+
+// ===========================================================================
+// Services used by `Env`
+
+/// Must be called from the test body (the root task under `sim`, the
+/// control task under `check`), which survives the crash; every other task
+/// is dropped.
+pub fn crashAndReboot(s: *Sim, mode: CrashMode) void {
+    if (s.current != 0 and s.current != s.control) {
+        @panic("tardis: crashAndReboot must be called from the test body, not from a spawned task");
+    }
+    for (s.nodes, 0..) |*n, i| s.crashVfs(&n.vfs, @intCast(i), mode);
+    s.dropTasks(null);
+    s.net.reset();
+    for (s.nodes) |*n| n.heap.reset();
+    s.plan.clearTargeted();
+    s.boot_count += 1;
+    s.crash_count += 1;
+}
+
+fn crashVfs(s: *Sim, v: *vfs_mod.Vfs, node: NodeId, mode: CrashMode) void {
+    const f = s.config.faults;
+    const report = v.crash(
+        mode,
+        &s.decider,
+        f.torn_writes and s.plan.isEnabled(.torn_write),
+        f.metadata_loss and s.plan.isEnabled(.metadata_loss),
+    );
+    s.nodes[node].crash_count += 1;
+    if (node == 0) {
+        s.record(.crash, @backingInt(mode), report.journal_ops_kept, report.inodes_torn, @tagName(mode));
+    } else {
+        s.record(.node_crash, node, report.journal_ops_kept, report.inodes_torn, @tagName(mode));
+    }
+}
+
+/// Drops every task (on `node`, or on every node when null) except the root
+/// and the caller, without running them further.
+fn dropTasks(s: *Sim, node: ?NodeId) void {
+    // Dropped group members no longer count as pending, so a surviving
+    // `group.await` returns instead of hanging. Writing to a group that lived
+    // on a dropped stack is harmless: stacks stay mapped for the Sim's lifetime.
+    for (s.tasks, 0..) |*t, i| {
+        if (i == 0 or i == s.current) continue;
+        if (t.state == .free or t.state == .finished) continue;
+        if (node) |n| if (t.node != n) continue;
+        const g = t.group orelse continue;
+        t.group = null;
+        g.state -|= 1;
+        if (g.state == 0) {
+            g.token.store(null, .release);
+            s.wakeGroupWaiters(g);
+        }
+    }
+    // Under `check`, the root is the driver; it stays blocked on the control fiber.
+    for (s.tasks, 0..) |*t, i| {
+        if (i == 0 or i == s.current) continue;
+        if (t.state == .free) continue;
+        if (node) |n| if (t.node != n) continue;
+        t.state = .free;
+        s.runq.remove(@intCast(i));
+    }
+    s.rebuildFreeList();
+}
+
+/// Crashes and immediately reboots one node: its tasks are dropped (except
+/// the caller, if it is the test body), its filesystem keeps only what
+/// `mode` lets survive, and its sockets disappear; peers on other nodes see
+/// a reset or, for black-holed connections, a timeout.
+pub fn crashNode(s: *Sim, node: NodeId, mode: CrashMode) void {
+    assert(node < s.nodes.len);
+    const body = s.current == 0 or s.current == s.control;
+    if (!body and s.tasks[s.current].node == node) {
+        @panic("tardis: crashNode called from a task on the node being crashed");
+    }
+    s.crashVfs(&s.nodes[node].vfs, node, mode);
+    s.dropTasks(node);
+    s.nodes[node].heap.reset();
+    const freed = s.net.crashNode(node, s.now_ns, &s.decider, s.config.net);
+    s.record(.net_fault, node, freed, 0, "node crash");
+    s.netWakeAll();
+}
+
+/// Cuts (`up == false`) or heals the directed link `from -> to`.
+pub fn setLink(s: *Sim, from: NodeId, to: NodeId, up: bool) void {
+    assert(from < s.nodes.len and to < s.nodes.len);
+    s.net.setLink(from, to, up, s.now_ns, &s.decider, s.config.net);
+    s.record(.link, from, to, @intFromBool(up), if (up) "heal" else "cut");
+    s.netWakeAll();
+}
+
+/// Steps node `node`'s real-time clock by `delta_ns` (an NTP step).
+pub fn stepClock(s: *Sim, node: NodeId, delta_ns: i64) void {
+    s.nodes[node].real_offset_ns += delta_ns;
+    s.record(.clock_step, node, @bitCast(delta_ns), 0, "");
+}
+
+/// Starts `start(context)` as a daemon task on `node`. Daemons are not
+/// awaited; they end when they return, when their node crashes, or when the
+/// run ends.
+pub fn spawnDaemon(s: *Sim, node: NodeId, start: *const fn (context: *const anyopaque) void, context: []const u8, context_alignment: std.mem.Alignment) error{ ConcurrencyUnavailable, NoSuchNode }!void {
+    if (node >= s.nodes.len) return error.NoSuchNode;
+    if (!fitsBuffer(context.len, context_alignment)) return error.ConcurrencyUnavailable;
+    const id = s.spawn(.{ .daemon = start }, context, null, 0) orelse return error.ConcurrencyUnavailable;
+    s.tasks[id].node = node;
+    s.tasks[id].daemon = true;
+    s.daemons_spawned += 1;
+    s.record(.node_spawn, node, id, 0, "");
+}
+
+/// Called by a daemon wrapper when the daemon returned an error.
+pub fn daemonFailed(s: *Sim, err: anyerror) void {
+    s.record(.note, s.tasks[s.current].node, @intFromError(err), 0, @errorName(err));
+    if (s.daemon_error == null) s.daemon_error = err;
+}
+
+/// The security layer found a violation: the run fails with
+/// `error.SecurityViolation` (the layer keeps the details).
+pub fn securityFailed(s: *Sim, cwe: u16) void {
+    s.record(.note, s.tasks[s.current].node, cwe, 0, "security violation (a = CWE)");
+    if (s.daemon_error == null) s.daemon_error = error.SecurityViolation;
+}
+
+/// The constants the run compared against, from the security layer
+/// (comparison feedback for guided exploration).
+pub fn secTokens(s: *Sim) []const u64 {
+    const a = s.sec orelse return &.{};
+    const f = a.provider.tokens orelse return &.{};
+    return f(a.ctx);
+}
+
+/// The body returned: the security layer checks the run as a whole.
+pub fn secEndRun(s: *Sim) void {
+    const a = s.sec orelse return;
+    const cwe = a.provider.end_run(a.ctx);
+    if (cwe != 0) s.securityFailed(cwe);
+}
+
+/// The security layer's key for this run's first finding (seam 4): 0
+/// without a layer, without findings, or if the layer gives no keys.
+pub fn secFindingKey(s: *Sim) u64 {
+    const a = s.sec orelse return 0;
+    const f = a.provider.finding_key orelse return 0;
+    return f(a.ctx);
+}
+
+/// Fork server: the layer's per-run tallies, packed in the child (0 bytes
+/// without a layer or without the hook).
+pub fn secForkExport(s: *Sim, out: []u8) usize {
+    const a = s.sec orelse return 0;
+    const f = a.provider.fork_export orelse return 0;
+    return @min(f(a.ctx, out), out.len);
+}
+
+/// ... and unpacked in the parent.
+pub fn secForkImport(s: *Sim, bytes: []const u8) void {
+    const a = s.sec orelse return;
+    const f = a.provider.fork_import orelse return;
+    f(a.ctx, bytes);
+}
+
+/// Seam 4: the campaign is over (`check` returning).
+pub fn secCampaignEnd(s: *Sim, end: *const seam.CampaignEnd) void {
+    const a = s.sec orelse return;
+    const f = a.provider.campaign_end orelse return;
+    f(a.ctx, end);
+}
+
+fn secViolationThunk(ctx: *anyopaque, cwe: u16) void {
+    const s: *Sim = @ptrCast(@alignCast(ctx));
+    s.securityFailed(cwe);
+}
+
+fn secEgress(s: *Sim, sink: seam.Sink, bytes: []const u8) void {
+    const a = s.sec orelse return;
+    if (bytes.len == 0) return;
+    const cwe = a.provider.egress(a.ctx, sink, bytes);
+    if (cwe != 0) s.securityFailed(cwe);
+}
+
+/// The first `n` bytes of `data` were just filled from `sink`.
+fn secIngress(s: *Sim, sink: seam.Sink, data: []const []u8, n: usize) void {
+    const a = s.sec orelse return;
+    var left = n;
+    for (data) |d| {
+        if (left == 0) break;
+        const k = @min(d.len, left);
+        a.provider.ingress(a.ctx, sink, d[0..k]);
+        left -= k;
+    }
+}
+
+/// Tells the security layer what orders tasks (`seam.TaskSync`).
+fn secSync(s: *Sim, op: seam.TaskSync, a: usize, b: usize) void {
+    const at = s.sec orelse return;
+    const f = at.provider.task_sync orelse return;
+    f(at.ctx, op, a, b);
+}
+
+/// A path about to be used: the security layer's sink check (untrusted
+/// bytes in a path, plan2.md §5.2). A violation fails the run at its end.
+fn secPath(s: *Sim, op: seam.VfsOp, path: []const u8) void {
+    const a = s.sec orelse return;
+    const cwe = a.provider.path(a.ctx, s.currentNode(), op, path);
+    if (cwe != 0) s.securityFailed(cwe);
+}
+
+/// A capability about to be used (plan2.md §5.2). A violation fails the
+/// run at its end; the call itself goes on unchanged.
+fn secCapability(s: *Sim, cap: seam.Capability, argv: []const []const u8) void {
+    const a = s.sec orelse return;
+    const cwe = a.provider.capability(a.ctx, s.currentNode(), cap, argv);
+    if (cwe != 0) s.securityFailed(cwe);
+}
+
+/// Where a parent swap moves the original directory.
+const toctou_aside = ".tardis-toctou-aside";
+
+/// A filesystem operation the layer may answer with a swap: the attacker's
+/// move, between the check and this use. A swap whose target is missing
+/// leaves the entry as it was.
+fn secVfs(s: *Sim, op: seam.VfsOp, parent: vfs_mod.InodeId, path: []const u8) void {
+    const a = s.sec orelse return;
+    const swap = a.provider.vfs_op(a.ctx, s.currentNode(), op, parent, path) orelse return;
+    switch (swap.kind) {
+        .symlink => {
+            s.vfs.deleteFile(parent, path) catch return;
+            s.vfs.symLink(parent, swap.target, path) catch return;
+            s.record(.fs_link, parent, 3, 0, "toctou swap");
+        },
+        .hard_link => {
+            const ino = s.vfs.lookup(parent, swap.target) catch return;
+            if (s.vfs.inodes[ino].kind != .file) return;
+            s.vfs.deleteFile(parent, path) catch return;
+            s.vfs.hardLink(ino, parent, path) catch return;
+            s.record(.fs_link, parent, 4, 0, "toctou hard link");
+        },
+        .parent_symlink => {
+            const end = for (path, 0..) |c, i| {
+                if (c == '/' or (c == '\\' and s.vfs.persona.backslashSeparator())) break i;
+            } else return;
+            const first = path[0..end];
+            if (first.len == 0 or std.mem.eql(u8, first, ".") or std.mem.eql(u8, first, "..")) return;
+            s.vfs.rename(parent, first, parent, toctou_aside) catch return;
+            s.vfs.symLink(parent, swap.target, first) catch return;
+            s.record(.fs_link, parent, 5, 0, "toctou parent swap");
+        },
+        .directory => {
+            s.vfs.deleteFile(parent, path) catch return;
+            _ = s.vfs.makeDir(parent, path) catch return;
+            s.record(.fs_link, parent, 6, 0, "toctou directory");
+        },
+    }
+}
+
+/// A preemption point the security layer adds where core has none (a
+/// second read of shared memory, plan2.md §4.1): with probability `ppm`,
+/// as a keyed scheduling decision, another task runs first.
+pub fn preemptionPoint(s: *Sim, ppm: Ppm) void {
+    if (s.runq.count <= 1) return;
+    if (!s.decider.chance(.schedule, ppm)) return;
+    s.reschedule();
+}
+
+fn fileSink(s: *Sim, ino: vfs_mod.InodeId) seam.Sink {
+    const node = s.currentNode();
+    return .{ .kind = .file, .node = node, .peer_node = node, .id = ino };
+}
+
+fn socketSink(s: *Sim, kind: seam.Sink.Kind, slot: u16, peer_node: NodeId) seam.Sink {
+    return .{ .kind = kind, .node = s.net.sockets[slot].node, .peer_node = peer_node, .id = slot };
+}
+
+pub fn active() *Sim {
+    return tls_sim.?;
+}
+
+/// The simulator running on this thread, if any.
+pub fn activeOrNull() ?*Sim {
+    return tls_sim;
+}
+
+pub fn currentNode(s: *const Sim) NodeId {
+    return s.tasks[s.current].node;
+}
+
+/// Registers `name` in virtual DNS as node `node`'s address.
+pub fn addHost(s: *Sim, name: []const u8, node: NodeId) void {
+    assert(node < s.nodes.len);
+    if (name.len > host_name_bytes_max) @panic("tardis: host name too long");
+    if (s.hosts_len == s.hosts.len) @panic("tardis: too many hosts (raise limits.hosts_max)");
+    const h = &s.hosts[s.hosts_len];
+    @memcpy(h.name[0..name.len], name);
+    h.name_len = @intCast(name.len);
+    h.node = node;
+    s.hosts_len += 1;
+}
+
+pub fn advanceTime(s: *Sim, delta_ns: u64) void {
+    s.sleepUntil(s.now_ns + delta_ns, false);
+}
+
+pub const LeakReport = struct {
+    tasks: u32,
+    handles: u32,
+    allocations: u64,
+    sockets: u32 = 0,
+
+    pub fn any(r: LeakReport) bool {
+        return r.tasks != 0 or r.handles != 0 or r.allocations != 0 or r.sockets != 0;
+    }
+};
+
+/// Live resources at the end of the test body. Daemon tasks are never
+/// counted. A node with a live daemon is skipped entirely, since its
+/// daemons own that node's handles, sockets and heap legitimately; every
+/// other node (and node 0's heap, which backs `env.allocator`) must be clean.
+/// A crashed node's heap is wiped, so a crash does not strand allocations.
+pub fn leaks(s: *Sim, exclude: TaskId) LeakReport {
+    var r: LeakReport = .{ .tasks = 0, .handles = 0, .allocations = 0 };
+    var daemon_nodes: u32 = 0;
+    for (s.tasks, 0..) |*t, i| {
+        if (i == 0 or i == s.current or i == exclude) continue;
+        if (t.state == .free) continue;
+        if (t.daemon) {
+            daemon_nodes |= @as(u32, 1) << @intCast(t.node);
+        } else {
+            r.tasks += 1;
+        }
+    }
+    for (s.nodes, 0..) |*node, i| {
+        if (daemon_nodes & (@as(u32, 1) << @intCast(i)) != 0) continue;
+        r.handles += node.vfs.openHandleCount();
+        r.allocations += node.heap.live_count;
+        r.sockets += s.net.openCountOn(@intCast(i));
+    }
+    return r;
+}
+
+pub fn generator(s: *Sim) fuzz.Generator {
+    return .{
+        .decider = &s.decider,
+        .allocator = s.fuzz_arena.allocator(),
+        .slice_len_max = s.config.limits.fuzz_slice_len_max,
+    };
+}
+
+// ===========================================================================
+// Fault helpers
+
+fn injected(s: *Sim, comptime E: type, op: fault.OpKind) ?E {
+    if (s.plan.takeTargeted(op)) |err| {
+        s.record(.fault, @backingInt(op), 1, 0, @errorName(err));
+        return fault.castError(E, err);
+    }
+    const probabilistic = switch (op) {
+        .read, .write, .sync => true,
+        else => false,
+    };
+    if (probabilistic and s.plan.isEnabled(.io_error) and s.decider.chance(.fault, s.config.faults.io_error_ppm)) {
+        s.record(.fault, @backingInt(op), 0, 0, "InputOutput");
+        return fault.castError(E, error.InputOutput);
+    }
+    return null;
+}
+
+/// Common prologue for operations that may be canceled.
+fn enter(s: *Sim, comptime E: type) E!void {
+    if (comptime fault.hasError(E, "Canceled")) {
+        s.cancelPoint() catch return @field(E, "Canceled");
+    }
+    s.maybeYield();
+}
+
+fn ioLatency(s: *Sim) void {
+    const f = s.config.faults;
+    if (f.io_latency_max_ns == 0) return;
+    if (!s.plan.isEnabled(.latency)) return;
+    const d = s.decider.range(.latency, f.io_latency_min_ns, f.io_latency_max_ns);
+    if (d == 0) return;
+    s.sleepUntil(s.now_ns + d, false);
+}
+
+/// Possibly shortens a transfer of `n` bytes.
+fn shortLen(s: *Sim, n: usize) usize {
+    if (n <= 1) return n;
+    if (!s.plan.isEnabled(.short_io)) return n;
+    if (!s.decider.chance(.fault, s.config.faults.short_io_ppm)) return n;
+    return @intCast(s.decider.range(.fault, 1, n - 1));
+}
+
+fn vfsError(comptime E: type, err: vfs_mod.Error) E {
+    return switch (err) {
+        error.InvalidHandle => fault.castError(E, error.Unexpected),
+        else => fault.castError(E, err),
+    };
+}
+
+// ===========================================================================
+// Handles
+
+fn handleValue(h: File.Handle) u32 {
+    if (is_windows) return @truncate(@intFromPtr(h));
+    return @bitCast(@as(i32, @intCast(h)));
+}
+
+fn toHandle(v: u32) File.Handle {
+    if (is_windows) return @ptrFromInt(@as(usize, v));
+    return @intCast(v);
+}
+
+/// Resolves a directory handle. Handles TARDIS did not issue (for example
+/// `Dir.cwd()`) refer to the root.
+fn dirInode(s: *Sim, dir: Dir) vfs_mod.Error!vfs_mod.InodeId {
+    const v = handleValue(dir.handle);
+    if (v == vfs_mod.root_handle_value) return vfs_mod.root_inode;
+    const h = s.vfs.handle(v) catch |err| {
+        const slot_plus = v & 0xFFFF;
+        const epoch = v >> 16;
+        const ours = slot_plus >= 1 and slot_plus <= s.vfs.handles.len and epoch >= 1 and epoch <= 0x3FFF;
+        if (ours) return err;
+        return vfs_mod.root_inode;
+    };
+    if (s.vfs.inodes[h.inode].kind != .dir) return error.NotDir;
+    return h.inode;
+}
+
+fn fileHandle(s: *Sim, file: File) vfs_mod.Error!*vfs_mod.Handle {
+    return s.vfs.handle(handleValue(file.handle));
+}
+
+pub fn rootDir() Dir {
+    return .{ .handle = toHandle(vfs_mod.root_handle_value) };
+}
+
+fn makeFile(v: u32) File {
+    return .{ .handle = toHandle(v), .flags = .{ .nonblocking = false } };
+}
+
+fn intOrVoid(comptime T: type, v: u64) T {
+    return switch (@typeInfo(T)) {
+        .void => {},
+        .int => @intCast(@min(v, std.math.maxInt(T))),
+        else => @compileError("unexpected stat field type"),
+    };
+}
+
+fn makeStat(s: *Sim, ino: vfs_mod.InodeId) File.Stat {
+    const i = &s.vfs.inodes[ino];
+    const t: Io.Timestamp = .{ .nanoseconds = @as(i96, s.config.epoch_offset_ns) + i.mtime_ns };
+    const is_dir = i.kind == .dir;
+    return .{
+        .inode = intOrVoid(File.INode, @as(u64, ino) + 1),
+        .nlink = intOrVoid(File.NLink, i.cur_links),
+        .size = if (is_dir) 0 else i.cur_len_bytes,
+        .permissions = if (is_dir) .default_dir else .default_file,
+        .kind = fileKind(i.kind),
+        .atime = null,
+        .mtime = t,
+        .ctime = t,
+        .block_size = vfs_mod.page_bytes,
+    };
+}
+
+fn syncClock(s: *Sim) void {
+    s.vfs.now_ns = s.now_ns;
+}
+
+// ===========================================================================
+// VTable
+
+const vtable: Io.VTable = blk: {
+    var v = Io.failing.vtable.*;
+    v.async = async;
+    v.concurrent = concurrent;
+    v.await = await;
+    v.cancel = cancel;
+    v.groupAsync = groupAsync;
+    v.groupConcurrent = groupConcurrent;
+    v.groupAwait = groupAwait;
+    v.groupCancel = groupCancel;
+    v.recancel = recancel;
+    v.swapCancelProtection = swapCancelProtection;
+    v.checkCancel = checkCancel;
+    v.futexWait = futexWait;
+    v.futexWaitUncancelable = futexWaitUncancelable;
+    v.futexWake = futexWake;
+    v.operate = operate;
+    v.dirCreateDir = dirCreateDir;
+    v.dirCreateDirPath = dirCreateDirPath;
+    v.dirCreateDirPathOpen = dirCreateDirPathOpen;
+    v.dirOpenDir = dirOpenDir;
+    v.dirStat = dirStat;
+    v.dirStatFile = dirStatFile;
+    v.dirAccess = dirAccess;
+    v.dirCreateFile = dirCreateFile;
+    v.dirOpenFile = dirOpenFile;
+    v.dirClose = dirClose;
+    v.dirDeleteFile = dirDeleteFile;
+    v.dirDeleteDir = dirDeleteDir;
+    v.dirRename = dirRename;
+    v.dirRenamePreserve = dirRenamePreserve;
+    v.dirCreateFileAtomic = dirCreateFileAtomic;
+    v.dirSetPermissions = dirSetPermissions;
+    v.dirSetFilePermissions = dirSetFilePermissions;
+    v.fileSetPermissions = fileSetPermissions;
+    v.fileStat = fileStat;
+    v.fileLength = fileLength;
+    v.fileClose = fileClose;
+    v.fileWritePositional = fileWritePositional;
+    v.fileReadPositional = fileReadPositional;
+    v.fileSeekBy = fileSeekBy;
+    v.fileSeekTo = fileSeekTo;
+    v.fileSync = fileSync;
+    v.fileSetLength = fileSetLength;
+    v.now = now;
+    v.clockResolution = clockResolution;
+    v.sleep = sleep;
+    v.random = random;
+    v.randomSecure = randomSecure;
+    v.dirRead = dirRead;
+    v.fileLock = fileLock;
+    v.fileTryLock = fileTryLock;
+    v.fileUnlock = fileUnlock;
+    v.fileDowngradeLock = fileDowngradeLock;
+    v.netListenIp = netListenIp;
+    v.netAccept = netAccept;
+    v.netConnectIp = netConnectIp;
+    v.netClose = netClose;
+    v.netShutdown = netShutdown;
+    v.netWriteFile = netWriteFile;
+    v.netLookup = netLookup;
+    v.netBindIp = netBindIp;
+    v.batchAwaitAsync = batchAwaitAsync;
+    v.batchAwaitConcurrent = batchAwaitConcurrent;
+    v.batchCancel = batchCancel;
+    v.dirHardLink = dirHardLink;
+    v.fileHardLink = fileHardLink;
+    v.dirSymLink = dirSymLink;
+    v.dirReadLink = dirReadLink;
+    v.processSpawn = processSpawn;
+    v.processReplace = processReplace;
+    break :blk v;
+};
+
+// --- tasks -----------------------------------------------------------------
+
+fn async(
+    userdata: ?*anyopaque,
+    result: []u8,
+    result_alignment: std.mem.Alignment,
+    context: []const u8,
+    context_alignment: std.mem.Alignment,
+    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+) ?*Io.AnyFuture {
+    const s = fromUserdata(userdata);
+    const fits = fitsBuffer(context.len, context_alignment) and fitsBuffer(result.len, result_alignment);
+    const inline_run = !fits or s.decider.chance(.schedule, s.config.async_inline_ppm);
+    if (!inline_run) {
+        if (s.spawn(.{ .future = start }, context, null, result.len)) |id| {
+            s.maybeYield();
+            return @ptrCast(&s.tasks[id]);
+        }
+    }
+    s.record(.spawn, 0, 2, 0, "inline");
+    start(context.ptr, result.ptr);
+    return null;
+}
+
+fn concurrent(
+    userdata: ?*anyopaque,
+    result_len: usize,
+    result_alignment: std.mem.Alignment,
+    context: []const u8,
+    context_alignment: std.mem.Alignment,
+    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+) Io.ConcurrentError!*Io.AnyFuture {
+    const s = fromUserdata(userdata);
+    if (!fitsBuffer(context.len, context_alignment) or !fitsBuffer(result_len, result_alignment))
+        return error.ConcurrencyUnavailable;
+    const id = s.spawn(.{ .future = start }, context, null, result_len) orelse return error.ConcurrencyUnavailable;
+    s.maybeYield();
+    return @ptrCast(&s.tasks[id]);
+}
+
+fn taskIdOf(s: *Sim, any_future: *Io.AnyFuture) TaskId {
+    const t: *Task = @ptrCast(@alignCast(any_future));
+    const id: TaskId = @intCast((@intFromPtr(t) - @intFromPtr(s.tasks.ptr)) / @sizeOf(Task));
+    assert(&s.tasks[id] == t);
+    return id;
+}
+
+fn awaitTask(s: *Sim, id: TaskId, result: []u8) void {
+    const t = &s.tasks[id];
+    while (t.state != .finished) {
+        assert(t.state != .free); // awaiting an abandoned task
+        t.awaiter = s.current;
+        s.block(.{ .await_task = id }, null, false);
+    }
+    @memcpy(result, t.result_buf[0..result.len]);
+    s.secSync(.acquire, s.current, seam.futureKey(id));
+    s.freeTask(id);
+}
+
+fn await(userdata: ?*anyopaque, any_future: *Io.AnyFuture, result: []u8, result_alignment: std.mem.Alignment) void {
+    _ = result_alignment;
+    const s = fromUserdata(userdata);
+    s.awaitTask(s.taskIdOf(any_future), result);
+}
+
+fn cancel(userdata: ?*anyopaque, any_future: *Io.AnyFuture, result: []u8, result_alignment: std.mem.Alignment) void {
+    _ = result_alignment;
+    const s = fromUserdata(userdata);
+    const id = s.taskIdOf(any_future);
+    s.requestCancel(id);
+    s.awaitTask(id, result);
+}
+
+fn groupAdd(s: *Sim, g: *Io.Group) void {
+    g.state += 1;
+    g.token.store(@ptrCast(s), .release);
+}
+
+fn groupAsync(
+    userdata: ?*anyopaque,
+    group: *Io.Group,
+    context: []const u8,
+    context_alignment: std.mem.Alignment,
+    start: *const fn (context: *const anyopaque) void,
+) void {
+    const s = fromUserdata(userdata);
+    const fits = fitsBuffer(context.len, context_alignment);
+    if (fits and !s.decider.chance(.schedule, s.config.async_inline_ppm)) {
+        if (s.spawn(.{ .group = start }, context, group, 0)) |_| {
+            s.groupAdd(group);
+            s.maybeYield();
+            return;
+        }
+    }
+    s.record(.spawn, 0, 3, 0, "inline");
+    start(context.ptr);
+}
+
+fn groupConcurrent(
+    userdata: ?*anyopaque,
+    group: *Io.Group,
+    context: []const u8,
+    context_alignment: std.mem.Alignment,
+    start: *const fn (context: *const anyopaque) void,
+) Io.ConcurrentError!void {
+    const s = fromUserdata(userdata);
+    if (!fitsBuffer(context.len, context_alignment)) return error.ConcurrencyUnavailable;
+    _ = s.spawn(.{ .group = start }, context, group, 0) orelse return error.ConcurrencyUnavailable;
+    s.groupAdd(group);
+    s.maybeYield();
+}
+
+fn cancelGroupMembers(s: *Sim, g: *Io.Group) void {
+    for (s.tasks, 0..) |*t, i| {
+        if (t.state == .free or t.state == .finished) continue;
+        if (t.group != g) continue;
+        s.requestCancel(@intCast(i));
+    }
+}
+
+fn groupAwait(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) Io.Cancelable!void {
+    _ = token;
+    const s = fromUserdata(userdata);
+    var canceled = false;
+    while (group.state > 0) {
+        if (!canceled) {
+            s.cancelPoint() catch {
+                canceled = true;
+                s.cancelGroupMembers(group);
+            };
+        }
+        if (group.state == 0) break;
+        s.block(.{ .group = group }, null, !canceled);
+    }
+    s.secSync(.acquire, s.current, @intFromPtr(group));
+    group.token.store(null, .release);
+    if (canceled) return error.Canceled;
+}
+
+fn groupCancel(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) void {
+    _ = token;
+    const s = fromUserdata(userdata);
+    s.cancelGroupMembers(group);
+    while (group.state > 0) s.block(.{ .group = group }, null, false);
+    s.secSync(.acquire, s.current, @intFromPtr(group));
+    group.token.store(null, .release);
+}
+
+fn recancel(userdata: ?*anyopaque) void {
+    const s = fromUserdata(userdata);
+    s.tasks[s.current].cancel_requested = true;
+}
+
+fn swapCancelProtection(userdata: ?*anyopaque, new: Io.CancelProtection) Io.CancelProtection {
+    const s = fromUserdata(userdata);
+    const t = &s.tasks[s.current];
+    const old = t.cancel_protection;
+    t.cancel_protection = new;
+    return old;
+}
+
+fn checkCancel(userdata: ?*anyopaque) Io.Cancelable!void {
+    const s = fromUserdata(userdata);
+    try s.cancelPoint();
+    s.maybeYield();
+}
+
+// --- futex -----------------------------------------------------------------
+
+/// The current node's clock reading for global virtual time `g`.
+fn localTime(s: *const Sim, g: u64) i128 {
+    const drift = s.nodes[s.currentNode()].drift_ppm;
+    return @as(i128, g) + @divTrunc(@as(i128, g) * drift, decide.ppm_one);
+}
+
+/// Global virtual nanoseconds that elapse while the current node's clock
+/// advances by `local_delta`.
+fn globalDelta(s: *const Sim, local_delta: i128) u64 {
+    if (local_delta <= 0) return 0;
+    const drift = s.nodes[s.currentNode()].drift_ppm;
+    const den: i128 = @as(i128, decide.ppm_one) + drift;
+    const g = @divFloor(local_delta * decide.ppm_one + den - 1, den);
+    return @intCast(@min(g, std.math.maxInt(u64) - s.now_ns));
+}
+
+fn deadlineFrom(s: *Sim, timeout: Io.Timeout) ?u64 {
+    switch (timeout) {
+        .none => return null,
+        .duration => |d| return s.now_ns + s.globalDelta(d.raw.nanoseconds),
+        .deadline => |d| {
+            var ns: i128 = d.raw.nanoseconds;
+            if (d.clock == .real) ns -= @as(i128, s.config.epoch_offset_ns) + s.nodes[s.currentNode()].real_offset_ns;
+            return s.now_ns + s.globalDelta(ns - s.localTime(s.now_ns));
+        },
+    }
+}
+
+fn futexWaitImpl(s: *Sim, ptr: *const u32, expected: u32, deadline_ns: ?u64, cancelable: bool) void {
+    if (@atomicLoad(u32, ptr, .acquire) != expected) {
+        s.maybeYield();
+        return;
+    }
+    if (s.plan.isEnabled(.spurious_wakeup) and s.decider.chance(.fault, s.config.faults.spurious_wakeup_ppm)) {
+        s.record(.futex_wait, 0, 1, 0, "spurious");
+        s.maybeYield();
+        return;
+    }
+    s.record(.futex_wait, 0, 0, 0, "");
+    s.block(.{ .futex = @intFromPtr(ptr) }, deadline_ns, cancelable);
+}
+
+fn futexWait(userdata: ?*anyopaque, ptr: *const u32, expected: u32, timeout: Io.Timeout) Io.Cancelable!void {
+    const s = fromUserdata(userdata);
+    try s.cancelPoint();
+    s.futexWaitImpl(ptr, expected, s.deadlineFrom(timeout), true);
+    try s.cancelPoint();
+}
+
+fn futexWaitUncancelable(userdata: ?*anyopaque, ptr: *const u32, expected: u32) void {
+    const s = fromUserdata(userdata);
+    s.futexWaitImpl(ptr, expected, null, false);
+}
+
+fn futexWake(userdata: ?*anyopaque, ptr: *const u32, max_waiters: u32) void {
+    const s = fromUserdata(userdata);
+    const addr = @intFromPtr(ptr);
+    var woken: u32 = 0;
+    while (woken < max_waiters) {
+        var count: u64 = 0;
+        for (s.tasks) |*t| {
+            if (t.state == .blocked and t.block == .futex and t.block.futex == addr) count += 1;
+        }
+        if (count == 0) break;
+        var pick = s.decider.uniform(.schedule, count);
+        for (s.tasks, 0..) |*t, i| {
+            if (t.state != .blocked or t.block != .futex or t.block.futex != addr) continue;
+            if (pick == 0) {
+                s.wake(@intCast(i));
+                break;
+            }
+            pick -= 1;
+        }
+        woken += 1;
+    }
+    s.record(.futex_wake, woken, max_waiters, 0, "");
+    s.maybeYield();
+}
+
+// --- time and randomness ---------------------------------------------------
+
+fn now(userdata: ?*anyopaque, clock: Io.Clock) Io.Timestamp {
+    const s = fromUserdata(userdata);
+    var t: i128 = s.localTime(s.now_ns);
+    if (clock == .real) t += @as(i128, s.config.epoch_offset_ns) + s.nodes[s.currentNode()].real_offset_ns;
+    return .{ .nanoseconds = @intCast(t) };
+}
+
+fn clockResolution(userdata: ?*anyopaque, clock: Io.Clock) Io.Clock.ResolutionError!Io.Duration {
+    _ = userdata;
+    _ = clock;
+    return .{ .nanoseconds = 1 };
+}
+
+fn sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
+    const s = fromUserdata(userdata);
+    try s.cancelPoint();
+    const deadline = s.deadlineFrom(timeout);
+    s.record(.sleep, if (deadline) |d| d -| s.now_ns else std.math.maxInt(u64), 0, 0, "");
+    s.block(.sleep, deadline, true);
+    try s.cancelPoint();
+}
+
+fn random(userdata: ?*anyopaque, buffer: []u8) void {
+    const s = fromUserdata(userdata);
+    s.decider.fill(.random, buffer);
+    s.record(.random, buffer.len, 0, 0, "");
+}
+
+fn randomSecure(userdata: ?*anyopaque, buffer: []u8) Io.RandomSecureError!void {
+    random(userdata, buffer);
+}
+
+// --- directories -----------------------------------------------------------
+
+fn dirCreateDir(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, permissions: Dir.Permissions) Dir.CreateDirError!void {
+    _ = permissions;
+    const s = fromUserdata(userdata);
+    const E = Dir.CreateDirError;
+    try s.enter(E);
+    s.syncClock();
+    if (s.injected(E, .metadata)) |e| return e;
+    const parent = s.dirInode(dir) catch |err| return vfsError(E, err);
+    _ = s.vfs.makeDir(parent, sub_path) catch |err| return vfsError(E, err);
+    s.record(.mkdir, 0, 0, 0, sub_path);
+}
+
+fn dirCreateDirPath(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, permissions: Dir.Permissions) Dir.CreateDirPathError!Dir.CreatePathStatus {
+    _ = permissions;
+    const s = fromUserdata(userdata);
+    const E = Dir.CreateDirPathError;
+    try s.enter(E);
+    s.syncClock();
+    if (s.injected(E, .metadata)) |e| return e;
+    const parent = s.dirInode(dir) catch |err| return vfsError(E, err);
+    const r = s.vfs.makePath(parent, sub_path) catch |err| return vfsError(E, err);
+    s.record(.mkdir, 1, 0, 0, sub_path);
+    return switch (r.status) {
+        .existed => .existed,
+        .created => .created,
+    };
+}
+
+fn dirCreateDirPathOpen(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, permissions: Dir.Permissions, options: Dir.OpenOptions) Dir.CreateDirPathOpenError!Dir {
+    _ = permissions;
+    _ = options;
+    const s = fromUserdata(userdata);
+    const E = Dir.CreateDirPathOpenError;
+    try s.enter(E);
+    s.syncClock();
+    if (s.injected(E, .metadata)) |e| return e;
+    const parent = s.dirInode(dir) catch |err| return vfsError(E, err);
+    const r = s.vfs.makePath(parent, sub_path) catch |err| return vfsError(E, err);
+    const h = s.vfs.openHandle(r.inode, true, false) catch |err| return vfsError(E, err);
+    s.record(.mkdir, 2, h, 0, sub_path);
+    return .{ .handle = toHandle(h) };
+}
+
+fn dirOpenDir(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, options: Dir.OpenOptions) Dir.OpenError!Dir {
+    _ = options;
+    const s = fromUserdata(userdata);
+    const E = Dir.OpenError;
+    try s.enter(E);
+    if (s.injected(E, .open)) |e| return e;
+    const parent = s.dirInode(dir) catch |err| return vfsError(E, err);
+    const ino = s.vfs.lookup(parent, sub_path) catch |err| return vfsError(E, err);
+    if (s.vfs.inodes[ino].kind != .dir) return vfsError(E, error.NotDir);
+    const h = s.vfs.openHandle(ino, true, false) catch |err| return vfsError(E, err);
+    s.record(.open, h, 1, 0, sub_path);
+    return .{ .handle = toHandle(h) };
+}
+
+fn dirStat(userdata: ?*anyopaque, dir: Dir) Dir.StatError!Dir.Stat {
+    const s = fromUserdata(userdata);
+    const E = Dir.StatError;
+    try s.enter(E);
+    const ino = s.dirInode(dir) catch |err| return vfsError(E, err);
+    return s.makeStat(ino);
+}
+
+fn dirStatFile(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, options: Dir.StatFileOptions) Dir.StatFileError!File.Stat {
+    const s = fromUserdata(userdata);
+    const E = Dir.StatFileError;
+    try s.enter(E);
+    const parent = s.dirInode(dir) catch |err| return vfsError(E, err);
+    s.secVfs(.stat, parent, sub_path);
+    const ino = s.vfs.lookupEx(parent, sub_path, options.follow_symlinks) catch |err| return vfsError(E, err);
+    s.record(.stat, ino, 0, 0, sub_path);
+    return s.makeStat(ino);
+}
+
+fn dirAccess(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, options: Dir.AccessOptions) Dir.AccessError!void {
+    _ = options;
+    const s = fromUserdata(userdata);
+    const E = Dir.AccessError;
+    try s.enter(E);
+    const parent = s.dirInode(dir) catch |err| return vfsError(E, err);
+    s.secVfs(.access, parent, sub_path);
+    _ = s.vfs.lookup(parent, sub_path) catch |err| return vfsError(E, err);
+}
+
+fn dirCreateFile(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, options: Dir.CreateFileOptions) File.OpenError!File {
+    const s = fromUserdata(userdata);
+    const E = File.OpenError;
+    try s.enter(E);
+    s.syncClock();
+    if (s.injected(E, .open)) |e| return e;
+    const parent = s.dirInode(dir) catch |err| return vfsError(E, err);
+    s.secPath(.create, sub_path);
+    const ino = s.vfs.createFile(parent, sub_path, .{ .exclusive = options.exclusive, .truncate = options.truncate }) catch |err|
+        return vfsError(E, err);
+    const h = s.vfs.openHandle(ino, options.read, true) catch |err| return vfsError(E, err);
+    s.record(.create, h, ino, 0, sub_path);
+    return makeFile(h);
+}
+
+fn dirOpenFile(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, options: Dir.OpenFileOptions) File.OpenError!File {
+    const s = fromUserdata(userdata);
+    const E = File.OpenError;
+    try s.enter(E);
+    if (s.injected(E, .open)) |e| return e;
+    const parent = s.dirInode(dir) catch |err| return vfsError(E, err);
+    s.secPath(.open, sub_path);
+    s.secVfs(.open, parent, sub_path);
+    const ino = s.vfs.lookup(parent, sub_path) catch |err| return vfsError(E, err);
+    const is_dir = s.vfs.inodes[ino].kind == .dir;
+    if (is_dir and (!options.allow_directory or options.mode != .read_only)) return vfsError(E, error.IsDir);
+    const h = s.vfs.openHandle(ino, options.mode != .write_only, options.mode != .read_only) catch |err|
+        return vfsError(E, err);
+    s.record(.open, h, ino, 0, sub_path);
+    return makeFile(h);
+}
+
+fn dirClose(userdata: ?*anyopaque, dirs: []const Dir) void {
+    const s = fromUserdata(userdata);
+    for (dirs) |d| {
+        const v = handleValue(d.handle);
+        if (v == vfs_mod.root_handle_value) continue;
+        s.record(.close, v, 1, 0, "");
+        s.vfs.closeHandle(v);
+    }
+}
+
+fn dirDeleteFile(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8) Dir.DeleteFileError!void {
+    const s = fromUserdata(userdata);
+    const E = Dir.DeleteFileError;
+    try s.enter(E);
+    s.syncClock();
+    if (s.injected(E, .metadata)) |e| return e;
+    const parent = s.dirInode(dir) catch |err| return vfsError(E, err);
+    s.secPath(.delete, sub_path);
+    s.vfs.deleteFile(parent, sub_path) catch |err| return vfsError(E, err);
+    s.record(.delete, 0, 0, 0, sub_path);
+}
+
+fn dirDeleteDir(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8) Dir.DeleteDirError!void {
+    const s = fromUserdata(userdata);
+    const E = Dir.DeleteDirError;
+    try s.enter(E);
+    s.syncClock();
+    if (s.injected(E, .metadata)) |e| return e;
+    const parent = s.dirInode(dir) catch |err| return vfsError(E, err);
+    s.vfs.deleteDir(parent, sub_path) catch |err| return vfsError(E, err);
+    s.record(.delete, 1, 0, 0, sub_path);
+}
+
+fn dirRename(userdata: ?*anyopaque, old_dir: Dir, old_sub_path: []const u8, new_dir: Dir, new_sub_path: []const u8) Dir.RenameError!void {
+    const s = fromUserdata(userdata);
+    const E = Dir.RenameError;
+    try s.enter(E);
+    s.syncClock();
+    if (s.injected(E, .metadata)) |e| return e;
+    const old_parent = s.dirInode(old_dir) catch |err| return vfsError(E, err);
+    const new_parent = s.dirInode(new_dir) catch |err| return vfsError(E, err);
+    s.secPath(.rename, old_sub_path);
+    s.secPath(.rename, new_sub_path);
+    s.vfs.rename(old_parent, old_sub_path, new_parent, new_sub_path) catch |err| return vfsError(E, err);
+    s.record(.rename, 0, 0, 0, old_sub_path);
+}
+
+// Permissions are accepted but not modelled: the target must exist, and the
+// call is traced, so code that sets modes (private files, `+x`) runs.
+
+fn dirSetPermissions(userdata: ?*anyopaque, dir: Dir, permissions: Dir.Permissions) Dir.SetPermissionsError!void {
+    _ = permissions;
+    const s = fromUserdata(userdata);
+    const E = Dir.SetPermissionsError;
+    try s.enter(E);
+    const ino = s.dirInode(dir) catch |err| return vfsError(E, err);
+    s.record(.chmod, ino, 0, 0, "");
+}
+
+fn dirSetFilePermissions(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, permissions: File.Permissions, options: Dir.SetFilePermissionsOptions) Dir.SetFilePermissionsError!void {
+    _ = permissions;
+    _ = options;
+    const s = fromUserdata(userdata);
+    const E = Dir.SetFilePermissionsError;
+    try s.enter(E);
+    if (s.injected(E, .metadata)) |e| return e;
+    const parent = s.dirInode(dir) catch |err| return vfsError(E, err);
+    const ino = s.vfs.lookup(parent, sub_path) catch |err| return vfsError(E, err);
+    s.record(.chmod, ino, 0, 0, sub_path);
+}
+
+fn fileSetPermissions(userdata: ?*anyopaque, file: File, permissions: File.Permissions) File.SetPermissionsError!void {
+    _ = permissions;
+    const s = fromUserdata(userdata);
+    const E = File.SetPermissionsError;
+    try s.enter(E);
+    const h = s.fileHandle(file) catch |err| return vfsError(E, err);
+    s.record(.chmod, h.inode, 0, 0, "");
+}
+
+/// Like `dirRename`, but fails with `error.PathAlreadyExists` instead of
+/// replacing an existing destination.
+fn dirRenamePreserve(userdata: ?*anyopaque, old_dir: Dir, old_sub_path: []const u8, new_dir: Dir, new_sub_path: []const u8) Dir.RenamePreserveError!void {
+    const s = fromUserdata(userdata);
+    const E = Dir.RenamePreserveError;
+    try s.enter(E);
+    s.syncClock();
+    if (s.injected(E, .metadata)) |e| return e;
+    const old_parent = s.dirInode(old_dir) catch |err| return vfsError(E, err);
+    const new_parent = s.dirInode(new_dir) catch |err| return vfsError(E, err);
+    if (s.vfs.lookupEx(new_parent, new_sub_path, false)) |_| {
+        return error.PathAlreadyExists;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return vfsError(E, err),
+    }
+    s.vfs.rename(old_parent, old_sub_path, new_parent, new_sub_path) catch |err| return vfsError(E, err);
+    s.record(.rename, 1, 0, 0, old_sub_path);
+}
+
+/// `Dir.createFileAtomic`: a named temporary file (16 hex digits) in the
+/// destination's directory, materialized later by `File.Atomic.replace`
+/// (a rename) or `File.Atomic.link` (`dirRenamePreserve`). There are no
+/// unnamed files (`O_TMPFILE`) in the simulation, so a crash before the
+/// rename leaves the temporary file behind, as on systems without them.
+fn dirCreateFileAtomic(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, options: Dir.CreateFileAtomicOptions) Dir.CreateFileAtomicError!File.Atomic {
+    const s = fromUserdata(userdata);
+    const E = Dir.CreateFileAtomicError;
+    try s.enter(E);
+    s.syncClock();
+    if (s.injected(E, .open)) |e| return e;
+    const base = std.fs.path.basename(sub_path);
+    const parent_path = sub_path[0 .. sub_path.len - base.len];
+    var parent = s.dirInode(dir) catch |err| return vfsError(E, err);
+    var target_dir = dir;
+    var close_dir = false;
+    if (parent_path.len > 0) {
+        const trimmed = std.mem.trimEnd(u8, parent_path, "/\\");
+        parent = if (options.make_path)
+            (s.vfs.makePath(parent, trimmed) catch |err| return vfsError(E, err)).inode
+        else
+            s.vfs.lookup(parent, trimmed) catch |err| return vfsError(E, err);
+        if (s.vfs.inodes[parent].kind != .dir) return vfsError(E, error.NotDir);
+        const dh = s.vfs.openHandle(parent, true, false) catch |err| return vfsError(E, err);
+        target_dir = .{ .handle = toHandle(dh) };
+        close_dir = true;
+    }
+    errdefer if (close_dir) s.vfs.closeHandle(handleValue(target_dir.handle));
+    var name_value = s.decider.next(.random);
+    while (true) : (name_value +%= 1) {
+        const name = std.fmt.hex(name_value);
+        const ino = s.vfs.createFile(parent, &name, .{ .exclusive = true, .truncate = false }) catch |err| switch (err) {
+            error.PathAlreadyExists => continue,
+            else => return vfsError(E, err),
+        };
+        const h = s.vfs.openHandle(ino, true, true) catch |err| return vfsError(E, err);
+        s.record(.create, h, ino, 0, &name);
+        return .{
+            .file = makeFile(h),
+            .file_basename_hex = name_value,
+            .file_open = true,
+            .file_exists = true,
+            .dir = target_dir,
+            .close_dir_on_deinit = close_dir,
+            .dest_sub_path = base,
+        };
+    }
+}
+
+// --- files -----------------------------------------------------------------
+
+fn fileStat(userdata: ?*anyopaque, file: File) File.StatError!File.Stat {
+    const s = fromUserdata(userdata);
+    const E = File.StatError;
+    try s.enter(E);
+    const h = s.fileHandle(file) catch |err| return vfsError(E, err);
+    return s.makeStat(h.inode);
+}
+
+fn fileLength(userdata: ?*anyopaque, file: File) File.LengthError!u64 {
+    const s = fromUserdata(userdata);
+    const E = File.LengthError;
+    try s.enter(E);
+    const h = s.fileHandle(file) catch |err| return vfsError(E, err);
+    return s.vfs.inodes[h.inode].cur_len_bytes;
+}
+
+fn fileClose(userdata: ?*anyopaque, files: []const File) void {
+    const s = fromUserdata(userdata);
+    for (files) |f| {
+        const v = handleValue(f.handle);
+        if (s.fileHandle(f)) |h| {
+            if (h.lock != .none) s.secFileLock(h.inode, false);
+        } else |_| {}
+        s.record(.close, v, 0, 0, "");
+        s.vfs.closeHandle(v);
+    }
+    s.wakeBlocked(.lock);
+}
+
+/// Writes `header`, then `data[0..n-1]`, then `data[n-1]` repeated `splat`
+/// times, at `offset`. Returns bytes written (possibly short).
+fn writeVectors(s: *Sim, comptime E: type, ino: vfs_mod.InodeId, header: []const u8, data: []const []const u8, splat: usize, offset: u64) E!usize {
+    var total: usize = header.len;
+    if (data.len > 0) {
+        for (data[0 .. data.len - 1]) |d| total += d.len;
+        total += data[data.len - 1].len * splat;
+    }
+    const limit = s.shortLen(total);
+    // Segment k: 0 = header, 1..data.len-1 = data[k-1], then `splat` copies of the last element.
+    const segment_count: usize = if (data.len == 0) 1 else data.len + splat;
+    var written: usize = 0;
+    var k: usize = 0;
+    while (k < segment_count and written < limit) : (k += 1) {
+        const seg: []const u8 = if (k == 0) header else data[@min(k - 1, data.len - 1)];
+        if (seg.len == 0) continue;
+        const want = @min(seg.len, limit - written);
+        s.secEgress(s.fileSink(ino), seg[0..want]);
+        const n = s.vfs.write(ino, offset + written, seg[0..want]) catch |err| {
+            if (written > 0) break;
+            return vfsError(E, err);
+        };
+        written += n;
+        if (n < want) break;
+    }
+    s.stats.disk_write_bytes += written;
+    return written;
+}
+
+fn fileWritePositional(userdata: ?*anyopaque, file: File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) File.WritePositionalError!usize {
+    const s = fromUserdata(userdata);
+    const E = File.WritePositionalError;
+    try s.enter(E);
+    s.ioLatency();
+    const h = s.fileHandle(file) catch |err| return vfsError(E, err);
+    if (!h.writable) return vfsError(E, error.NotOpenForWriting);
+    if (s.lockViolation(file)) return fault.castError(E, error.LockViolation);
+    const ino = h.inode;
+    if (s.injected(E, .write)) |e| return e;
+    s.syncClock();
+    const n = try s.writeVectors(E, ino, header, data, splat, offset);
+    s.record(.write, ino, offset, n, "");
+    return n;
+}
+
+fn readVectors(s: *Sim, ino: vfs_mod.InodeId, data: []const []u8, offset: u64) usize {
+    var total: usize = 0;
+    for (data) |d| total += d.len;
+    const limit = s.shortLen(total);
+    var done: usize = 0;
+    for (data) |d| {
+        if (done >= limit) break;
+        const want = @min(d.len, limit - done);
+        const n = s.vfs.read(ino, offset + done, d[0..want]);
+        done += n;
+        if (n < want) break;
+    }
+    s.secIngress(s.fileSink(ino), data, done);
+    s.stats.disk_read_bytes += done;
+    return done;
+}
+
+fn fileReadPositional(userdata: ?*anyopaque, file: File, data: []const []u8, offset: u64) File.ReadPositionalError!usize {
+    const s = fromUserdata(userdata);
+    const E = File.ReadPositionalError;
+    try s.enter(E);
+    s.ioLatency();
+    const h = s.fileHandle(file) catch |err| return vfsError(E, err);
+    if (!h.readable) return vfsError(E, error.NotOpenForReading);
+    if (s.lockViolation(file)) return fault.castError(E, error.LockViolation);
+    const ino = h.inode;
+    if (s.vfs.inodes[ino].kind == .dir) return vfsError(E, error.IsDir);
+    if (s.injected(E, .read)) |e| return e;
+    const n = s.readVectors(ino, data, offset);
+    s.record(.read, ino, offset, n, "");
+    return n;
+}
+
+fn fileSeekBy(userdata: ?*anyopaque, file: File, relative_offset: i64) File.SeekError!void {
+    const s = fromUserdata(userdata);
+    const E = File.SeekError;
+    try s.enter(E);
+    const h = s.fileHandle(file) catch |err| return vfsError(E, err);
+    const pos: i64 = @as(i64, @intCast(h.pos)) + relative_offset;
+    if (pos < 0) return fault.castError(E, error.Unseekable);
+    h.pos = @intCast(pos);
+}
+
+fn fileSeekTo(userdata: ?*anyopaque, file: File, absolute_offset: u64) File.SeekError!void {
+    const s = fromUserdata(userdata);
+    const E = File.SeekError;
+    try s.enter(E);
+    const h = s.fileHandle(file) catch |err| return vfsError(E, err);
+    h.pos = absolute_offset;
+}
+
+fn fileSync(userdata: ?*anyopaque, file: File) File.SyncError!void {
+    const s = fromUserdata(userdata);
+    const E = File.SyncError;
+    try s.enter(E);
+    s.ioLatency();
+    const h = s.fileHandle(file) catch |err| return vfsError(E, err);
+    const ino = h.inode;
+    if (s.injected(E, .sync)) |e| return e;
+    s.vfs.sync(ino);
+    s.stats.disk_syncs += 1;
+    s.record(.sync, ino, s.vfs.journalPending(), 0, "");
+}
+
+fn fileSetLength(userdata: ?*anyopaque, file: File, length: u64) File.SetLengthError!void {
+    const s = fromUserdata(userdata);
+    const E = File.SetLengthError;
+    try s.enter(E);
+    const h = s.fileHandle(file) catch |err| return vfsError(E, err);
+    if (!h.writable) return vfsError(E, error.NotOpenForWriting);
+    if (s.lockViolation(file)) return fault.castError(E, error.LockViolation);
+    const ino = h.inode;
+    if (s.injected(E, .write)) |e| return e;
+    s.syncClock();
+    s.vfs.setLength(ino, length) catch |err| return vfsError(E, err);
+    s.record(.set_length, ino, length, 0, "");
+}
+
+fn readStreaming(s: *Sim, op: Io.Operation.FileReadStreaming) Io.Operation.FileReadStreaming.Result {
+    const E = Io.Operation.FileReadStreaming.Error;
+    s.maybeYield();
+    s.ioLatency();
+    const h = s.fileHandle(op.file) catch |err| return vfsError(E, err);
+    if (!h.readable) return vfsError(E, error.NotOpenForReading);
+    if (s.lockViolation(op.file)) return fault.castError(E, error.LockViolation);
+    const ino = h.inode;
+    if (s.vfs.inodes[ino].kind == .dir) return vfsError(E, error.IsDir);
+    if (s.injected(E, .read)) |e| return e;
+    var total: usize = 0;
+    for (op.data) |d| total += d.len;
+    const pos = h.pos;
+    const n = s.readVectors(ino, op.data, pos);
+    s.record(.read, ino, pos, n, "stream");
+    if (n == 0 and total > 0) return error.EndOfStream;
+    h.pos = pos + n;
+    return n;
+}
+
+fn writeStreaming(s: *Sim, op: Io.Operation.FileWriteStreaming) Io.Operation.FileWriteStreaming.Result {
+    const E = Io.Operation.FileWriteStreaming.Error;
+    s.maybeYield();
+    s.ioLatency();
+    const h = s.fileHandle(op.file) catch |err| return vfsError(E, err);
+    if (!h.writable) return vfsError(E, error.NotOpenForWriting);
+    if (s.lockViolation(op.file)) return fault.castError(E, error.LockViolation);
+    const ino = h.inode;
+    if (s.injected(E, .write)) |e| return e;
+    s.syncClock();
+    const pos = h.pos;
+    const n = try s.writeVectors(E, ino, op.header, op.data, op.splat, pos);
+    h.pos = pos + n;
+    s.record(.write, ino, pos, n, "stream");
+    return n;
+}
+
+// --- wake helpers ------------------------------------------------------------
+
+fn wakeBlocked(s: *Sim, tag: std.meta.Tag(Block)) void {
+    for (s.tasks, 0..) |*t, i| {
+        if (t.state == .blocked and std.meta.activeTag(t.block) == tag) s.wake(@intCast(i));
+    }
+}
+
+/// Network state changed: every task waiting on the network re-checks.
+fn netWakeAll(s: *Sim) void {
+    s.wakeBlocked(.net);
+}
+
+// --- directory listing -----------------------------------------------------
+
+/// Bytes at the start of `Dir.Reader.buffer` holding the listing order.
+const dir_reader_state_bytes = 2 * @sizeOf(u32);
+
+/// Lists entries in an order drawn per listing (real directories promise no
+/// order), so code that depends on readdir order is caught.
+fn dirRead(userdata: ?*anyopaque, r: *Dir.Reader, entries: []Dir.Entry) Dir.Reader.Error!usize {
+    const s = fromUserdata(userdata);
+    const E = Dir.Reader.Error;
+    try s.enter(E);
+    const dir_ino = s.dirInode(r.dir) catch |err| return vfsError(E, err);
+    const slots: u32 = @intCast(s.vfs.dentrySlots());
+    assert(r.buffer.len > dir_reader_state_bytes);
+    const state: *[2]u32 = @ptrCast(r.buffer[0..dir_reader_state_bytes]);
+    switch (r.state) {
+        .finished => return 0,
+        .reset => {
+            // Visit slot (offset + k * stride) mod slots for k = 0..slots-1.
+            var stride: u32 = @intCast(s.decider.range(.fault, 1, slots));
+            while (std.math.gcd(stride, slots) != 1) stride += 1;
+            state[0] = @intCast(s.decider.uniform(.fault, slots));
+            state[1] = stride;
+            r.index = 0;
+            r.state = .reading;
+        },
+        .reading => {},
+    }
+    var name_pos: usize = dir_reader_state_bytes;
+    var n: usize = 0;
+    while (r.index < slots and n < entries.len) {
+        const pos = (state[0] + @as(u64, r.index) * state[1]) % slots;
+        if (s.vfs.childAt(dir_ino, pos)) |c| {
+            if (name_pos + c.name.len > r.buffer.len) break;
+            const name = r.buffer[name_pos..][0..c.name.len];
+            @memcpy(name, c.name);
+            name_pos += c.name.len;
+            entries[n] = .{
+                .name = name,
+                .kind = fileKind(c.kind),
+                .inode = intOrVoid(File.INode, @as(u64, c.inode) + 1),
+            };
+            n += 1;
+        }
+        r.index += 1;
+    }
+    if (r.index >= slots) r.state = .finished;
+    s.record(.dir_read, dir_ino, n, 0, "");
+    return n;
+}
+
+// --- file locks ------------------------------------------------------------
+
+fn toLockKind(l: File.Lock) vfs_mod.LockKind {
+    return switch (l) {
+        .none => .none,
+        .shared => .shared,
+        .exclusive => .exclusive,
+    };
+}
+
+fn setLock(s: *Sim, file: File, kind: vfs_mod.LockKind) void {
+    const h = s.fileHandle(file) catch return;
+    const was = h.lock;
+    h.lock = kind;
+    s.record(.lock, handleValue(file.handle), @backingInt(kind), 0, "");
+    if (@backingInt(kind) < @backingInt(was)) s.wakeBlocked(.lock);
+}
+
+fn fileLock(userdata: ?*anyopaque, file: File, lock: File.Lock) File.LockError!void {
+    const s = fromUserdata(userdata);
+    const E = File.LockError;
+    try s.enter(E);
+    const v = handleValue(file.handle);
+    _ = s.fileHandle(file) catch |err| return vfsError(E, err);
+    const want = toLockKind(lock);
+    const first = s.fileHandle(file) catch |err| return vfsError(E, err);
+    const taking = want != .none and first.lock == .none;
+    const ino = first.inode;
+    if (taking) s.secFileLock(ino, true);
+    errdefer if (taking) s.secFileLock(ino, false);
+    while (want != .none and s.vfs.lockConflicts(v, want)) {
+        s.record(.lock, v, @backingInt(want), 1, "wait");
+        s.block(.lock, null, true);
+        try s.cancelPoint();
+        _ = s.fileHandle(file) catch |err| return vfsError(E, err);
+    }
+    s.setLock(file, want);
+}
+
+fn fileTryLock(userdata: ?*anyopaque, file: File, lock: File.Lock) File.LockError!bool {
+    const s = fromUserdata(userdata);
+    const E = File.LockError;
+    try s.enter(E);
+    _ = s.fileHandle(file) catch |err| return vfsError(E, err);
+    const want = toLockKind(lock);
+    if (want != .none and s.vfs.lockConflicts(handleValue(file.handle), want)) return false;
+    s.setLock(file, want);
+    return true;
+}
+
+fn fileUnlock(userdata: ?*anyopaque, file: File) void {
+    const s = fromUserdata(userdata);
+    if (s.fileHandle(file)) |h| {
+        if (h.lock != .none) s.secFileLock(h.inode, false);
+    } else |_| {}
+    s.setLock(file, .none);
+}
+
+/// A file lock taken or dropped by the current task, for the security
+/// layer's lock order (plan2.md §4.2).
+fn secFileLock(s: *Sim, ino: vfs_mod.InodeId, held: bool) void {
+    const a = s.sec orelse return;
+    a.provider.file_lock(a.ctx, s.currentNode(), ino, held);
+}
+
+fn fileDowngradeLock(userdata: ?*anyopaque, file: File) File.DowngradeLockError!void {
+    const s = fromUserdata(userdata);
+    const E = File.DowngradeLockError;
+    try s.enter(E);
+    const h = s.fileHandle(file) catch |err| return vfsError(E, err);
+    if (h.lock == .exclusive) s.setLock(file, .shared);
+}
+
+/// Windows locks are mandatory: I/O through another handle fails while a
+/// handle holds an exclusive lock.
+fn lockViolation(s: *Sim, file: File) bool {
+    return s.persona.sharingViolations() and s.vfs.lockedByOther(handleValue(file.handle));
+}
+
+// --- network ---------------------------------------------------------------
+
+fn ip4(bytes: [4]u8, port: u16) ionet.IpAddress {
+    return .{ .ip4 = .{ .bytes = bytes, .port = port } };
+}
+
+/// Sleeps for one modeled one-way network latency (not cancelable).
+fn netDelay(s: *Sim) void {
+    const o = s.config.net;
+    const d = s.decider.range(.net, o.latency_min_ns, @max(o.latency_min_ns, o.latency_max_ns));
+    if (d > 0) s.sleepUntil(s.now_ns + d, false);
+}
+
+fn netFaultError(comptime E: type, f: net_mod.Fault) E {
+    return switch (f) {
+        .none => unreachable,
+        .reset => fault.castError(E, error.ConnectionResetByPeer),
+        .timed_out => fault.castError(E, error.ConnectionTimedOut),
+    };
+}
+
+fn maybeInjectReset(s: *Sim, slot: u16) void {
+    if (!s.plan.isEnabled(.net_reset)) return;
+    if (!s.decider.chance(.fault, s.config.faults.net_reset_ppm)) return;
+    s.net.resetConnection(slot, s.now_ns, &s.decider, s.config.net);
+    s.record(.net_fault, slot, 0, 0, "reset");
+    s.netWakeAll();
+}
+
+fn streamSlot(s: *Sim, handle: ionet.Socket.Handle) ?u16 {
+    const slot = s.net.decode(handleValue(handle)) catch return null;
+    if (s.net.sockets[slot].kind != .stream) return null;
+    return slot;
+}
+
+fn netListenIp(userdata: ?*anyopaque, address: *const ionet.IpAddress, options: ionet.IpAddress.ListenOptions) ionet.IpAddress.ListenError!ionet.Socket {
+    const s = fromUserdata(userdata);
+    const E = ionet.IpAddress.ListenError;
+    try s.enter(E);
+    s.secCapability(.net_listen, &.{});
+    if (options.mode != .stream) return error.SocketModeUnsupported;
+    if (options.protocol != .tcp) return error.ProtocolUnsupportedByAddressFamily;
+    const a = switch (address.*) {
+        .ip4 => |a| a,
+        .ip6 => return error.AddressFamilyUnsupported,
+    };
+    const node = s.currentNode();
+    if (!net_mod.Net.isLocal(node, a.bytes)) return error.AddressUnavailable;
+    const port = if (a.port == 0) s.net.ephemeralPort(node, false) orelse return error.AddressInUse else a.port;
+    const slot = try s.net.listen(node, port, options.kernel_backlog);
+    const v = s.net.encode(slot);
+    s.record(.net_listen, node, port, v, "");
+    return .{ .handle = toHandle(v), .address = ip4(a.bytes, port) };
+}
+
+fn netAccept(userdata: ?*anyopaque, server: ionet.Socket.Handle, options: ionet.Server.AcceptOptions) ionet.Server.AcceptError!ionet.Socket {
+    _ = options;
+    const s = fromUserdata(userdata);
+    const E = ionet.Server.AcceptError;
+    try s.enter(E);
+    if (s.injected(E, .accept)) |e| return e;
+    while (true) {
+        const l = s.net.decode(handleValue(server)) catch return error.SocketNotListening;
+        const ls = &s.net.sockets[l];
+        if (ls.kind != .listener or ls.shut_recv) return error.SocketNotListening;
+        if (s.net.popBacklog(l)) |sv| {
+            const ss = &s.net.sockets[sv];
+            const v = s.net.encode(sv);
+            s.record(.net_accept, ss.node, ss.peer_node, v, "");
+            return .{ .handle = toHandle(v), .address = ip4(net_mod.Net.nodeAddress(ss.peer_node), ss.peer_port) };
+        }
+        s.block(.net, null, true);
+        try s.cancelPoint();
+    }
+}
+
+fn netConnectIp(userdata: ?*anyopaque, address: *const ionet.IpAddress, options: ionet.IpAddress.ConnectOptions) ionet.IpAddress.ConnectError!ionet.Socket {
+    const s = fromUserdata(userdata);
+    const E = ionet.IpAddress.ConnectError;
+    try s.enter(E);
+    s.secCapability(.net_connect, &.{});
+    if (options.mode != .stream) return error.SocketModeUnsupported;
+    if (options.protocol) |p| if (p != .tcp) return error.ProtocolUnsupportedByAddressFamily;
+    const a = switch (address.*) {
+        .ip4 => |a| a,
+        .ip6 => return error.AddressFamilyUnsupported,
+    };
+    const src = s.currentNode();
+    const dst = s.net.nodeOf(src, a.bytes) orelse return error.NetworkUnreachable;
+    if (s.injected(E, .connect)) |e| return e;
+    const deadline = s.deadlineFrom(options.timeout) orelse s.now_ns + s.config.net.connect_timeout_ns;
+    s.record(.net_connect, src, dst, a.port, "syn");
+    // The SYN and SYN-ACK need both directions; retransmits continue until
+    // the link heals or the deadline passes.
+    while (!s.net.reachable(src, dst) or !s.net.reachable(dst, src)) {
+        if (s.now_ns >= deadline) {
+            s.record(.net_connect, src, dst, a.port, "timeout");
+            return error.Timeout;
+        }
+        s.block(.net, deadline, true);
+        try s.cancelPoint();
+    }
+    s.netDelay(); // SYN
+    const port = s.net.ephemeralPort(src, false) orelse return error.AddressUnavailable;
+    const listener = s.net.findListener(dst, a.port) orelse {
+        s.netDelay(); // RST
+        s.record(.net_connect, src, dst, a.port, "refused");
+        return error.ConnectionRefused;
+    };
+    const c = s.net.establish(src, port, listener) catch |err| switch (err) {
+        error.ConnectionRefused => {
+            s.netDelay();
+            s.record(.net_connect, src, dst, a.port, "backlog full");
+            return error.ConnectionRefused;
+        },
+        error.SystemResources => return error.SystemResources,
+    };
+    s.netWakeAll(); // acceptors
+    s.netDelay(); // SYN-ACK
+    const v = s.net.encode(c);
+    s.record(.net_connect, src, dst, v, "established");
+    return .{ .handle = toHandle(v), .address = ip4(net_mod.Net.nodeAddress(src), port) };
+}
+
+fn netClose(userdata: ?*anyopaque, sockets: []const ionet.Socket) void {
+    const s = fromUserdata(userdata);
+    for (sockets) |sock| {
+        const v = handleValue(sock.handle);
+        const slot = s.net.decode(v) catch continue;
+        const closing = &s.net.sockets[slot];
+        if (closing.kind == .dgram) s.touchInbox(closing.node, closing.local_port) else s.touchGlobal();
+        s.record(.net_close, v, 0, 0, "");
+        s.net.close(slot, s.now_ns, &s.decider, s.config.net);
+    }
+    s.netWakeAll();
+}
+
+fn netShutdown(userdata: ?*anyopaque, handle: ionet.Socket.Handle, how: ionet.ShutdownHow) ionet.ShutdownError!void {
+    const s = fromUserdata(userdata);
+    const E = ionet.ShutdownError;
+    try s.enter(E);
+    const v = handleValue(handle);
+    const slot = s.net.decode(v) catch return error.SocketUnconnected;
+    const sock = &s.net.sockets[slot];
+    if (how != .send) sock.shut_recv = true;
+    if (how != .recv and sock.kind == .stream) s.net.shutdownSend(slot, s.now_ns, &s.decider, s.config.net);
+    s.record(.net_shutdown, v, @backingInt(how), 0, "");
+    s.netWakeAll();
+}
+
+fn netWriteFile(userdata: ?*anyopaque, handle: ionet.Socket.Handle, header: []const u8, file_reader: *Io.File.Reader, limit: Io.Limit) ionet.Stream.Writer.WriteFileError!usize {
+    _ = userdata;
+    _ = handle;
+    _ = header;
+    _ = file_reader;
+    _ = limit;
+    return error.Unimplemented; // the writer falls back to read + write
+}
+
+/// Virtual DNS: `localhost`, `node<N>`, and names added with `addHost`.
+fn netLookup(userdata: ?*anyopaque, host: ionet.HostName, resolved: *Io.Queue(ionet.HostName.LookupResult), options: ionet.HostName.LookupOptions) ionet.HostName.LookupError!void {
+    const s = fromUserdata(userdata);
+    const sio = s.io();
+    defer resolved.close(sio);
+    try s.cancelPoint();
+    s.maybeYield();
+    const name = host.bytes;
+    const found: ?[4]u8 = blk: {
+        if (std.ascii.eqlIgnoreCase(name, "localhost")) break :blk .{ 127, 0, 0, 1 };
+        for (s.hosts[0..s.hosts_len]) |*h| {
+            if (std.ascii.eqlIgnoreCase(name, h.name[0..h.name_len])) break :blk net_mod.Net.nodeAddress(h.node);
+        }
+        if (name.len > 4 and std.ascii.eqlIgnoreCase(name[0..4], "node")) {
+            const n = std.fmt.parseInt(u8, name[4..], 10) catch break :blk null;
+            if (n < s.nodes.len) break :blk net_mod.Net.nodeAddress(n);
+        }
+        break :blk null;
+    };
+    const bytes = found orelse {
+        s.record(.note, 0, 0, 0, "dns: unknown host");
+        return error.UnknownHostName;
+    };
+    if (options.family == .ip6) return error.NoAddressReturned;
+    s.netDelay(); // query
+    s.netDelay(); // answer
+    resolved.putOne(sio, .{ .address = ip4(bytes, options.port) }) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        error.Closed => unreachable,
+    };
+    var canonical = host;
+    if (options.canonical_name_buffer) |buf| {
+        @memcpy(buf[0..name.len], name);
+        canonical = .{ .bytes = buf[0..name.len] };
+    }
+    resolved.putOne(sio, .{ .canonical_name = canonical }) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        error.Closed => unreachable,
+    };
+}
+
+// --- operations: one non-blocking step each -----------------------------------
+//
+// `stepOperate` tries an operation once and returns null if it would block.
+// `operate` repeats the step, waiting for network events in between; the
+// batch entries try every submitted operation and wait until one completes
+// or the timeout passes. Only network operations ever block.
+
+/// Waits until a network event (any socket) or `deadline`, whichever comes
+/// first. Spurious wakeups are fine: callers re-check.
+fn netWait(s: *Sim, deadline: ?u64) Io.Cancelable!void {
+    var wake_at = s.net.nextEventAfter(s.now_ns);
+    if (deadline) |d| wake_at = if (wake_at) |w| @min(w, d) else d;
+    s.block(.net, wake_at, true);
+    try s.cancelPoint();
+}
+
+/// Once-per-operation entry work: a scheduling point and targeted faults.
+fn preOperate(s: *Sim, operation: Io.Operation) ?Io.Operation.Result {
+    switch (operation) {
+        .net_read => {
+            s.maybeYield();
+            if (s.injected(Io.Operation.NetRead.Error, .net_read)) |e| return .{ .net_read = e };
+        },
+        .net_write => {
+            s.maybeYield();
+            if (s.injected(Io.Operation.NetWrite.Error, .net_write)) |e| return .{ .net_write = e };
+        },
+        .net_receive => {
+            s.maybeYield();
+            if (s.injected(Io.Operation.NetReceive.Error, .net_read)) |e| return .{ .net_receive = .{ e, 0 } };
+        },
+        .net_send => {
+            s.maybeYield();
+            if (s.injected(Io.Operation.NetSend.Error, .net_write)) |e| return .{ .net_send = .{ e, 0 } };
+        },
+        else => {},
+    }
+    return null;
+}
+
+fn stepOperate(s: *Sim, operation: Io.Operation) ?Io.Operation.Result {
+    return switch (operation) {
+        .file_read_streaming => |op| .{ .file_read_streaming = s.readStreaming(op) },
+        .file_write_streaming => |op| .{ .file_write_streaming = s.writeStreaming(op) },
+        .net_read => |op| if (s.netReadStep(op)) |r| .{ .net_read = r } else null,
+        .net_write => |op| if (s.netWriteStep(op)) |r| .{ .net_write = r } else null,
+        .net_send => |op| .{ .net_send = s.netSendStep(op) },
+        .net_receive => |op| if (s.netReceiveStep(op)) |r| .{ .net_receive = r } else null,
+        .device_io_control => Io.failingOperate(s, operation) catch unreachable,
+    };
+}
+
+fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Operation.Result {
+    const s = fromUserdata(userdata);
+    try s.cancelPoint();
+    if (s.preOperate(operation)) |r| return r;
+    while (true) {
+        if (s.stepOperate(operation)) |r| return r;
+        try s.netWait(null);
+    }
+}
+
+fn batchRun(s: *Sim, b: *Io.Batch, deadline: ?u64) (Io.Cancelable || Io.Timeout.Error)!void {
+    const none: Io.Operation.OptionalIndex = .none;
+    var first = true;
+    while (true) {
+        var progressed = false;
+        var prev = none;
+        var idx = b.submitted.head;
+        while (idx != .none) {
+            const i = idx.toIndex();
+            const next = b.storage[i].submission.node.next;
+            const op = b.storage[i].submission.operation;
+            const pre = if (first) s.preOperate(op) else null;
+            if (pre orelse s.stepOperate(op)) |result| {
+                // Unlink from `submitted`, append to `completed`.
+                if (prev == .none) b.submitted.head = next else b.storage[prev.toIndex()].submission.node.next = next;
+                if (b.submitted.tail == idx) b.submitted.tail = prev;
+                b.storage[i] = .{ .completion = .{ .node = .{ .next = .none }, .result = result } };
+                if (b.completed.tail == .none) {
+                    b.completed.head = idx;
+                } else {
+                    b.storage[b.completed.tail.toIndex()].completion.node.next = idx;
+                }
+                b.completed.tail = idx;
+                progressed = true;
+            } else {
+                prev = idx;
+            }
+            idx = next;
+        }
+        first = false;
+        if (progressed or b.completed.head != .none or b.submitted.head == .none) return;
+        if (deadline) |d| if (s.now_ns >= d) return error.Timeout;
+        try s.netWait(deadline);
+    }
+}
+
+fn batchAwaitAsync(userdata: ?*anyopaque, b: *Io.Batch) Io.Cancelable!void {
+    const s = fromUserdata(userdata);
+    try s.cancelPoint();
+    s.batchRun(b, null) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        error.Timeout => unreachable,
+    };
+}
+
+fn batchAwaitConcurrent(userdata: ?*anyopaque, b: *Io.Batch, timeout: Io.Timeout) Io.Batch.AwaitConcurrentError!void {
+    const s = fromUserdata(userdata);
+    try s.cancelPoint();
+    return s.batchRun(b, s.deadlineFrom(timeout));
+}
+
+/// Operations not yet complete stay on the `submitted` list (they have no
+/// side effects until they complete), so there is nothing to interrupt.
+fn batchCancel(userdata: ?*anyopaque, b: *Io.Batch) void {
+    _ = userdata;
+    _ = b;
+}
+
+fn netReadStep(s: *Sim, op: Io.Operation.NetRead) ?Io.Operation.NetRead.Result {
+    const E = Io.Operation.NetRead.Error;
+    var total: usize = 0;
+    for (op.data) |d| total += d.len;
+    const slot = s.streamSlot(op.socket_handle) orelse return error.SocketUnconnected;
+    if (total > 0) s.maybeInjectReset(slot);
+    switch (s.net.recv(slot, op.data, s.shortLen(total), s.now_ns)) {
+        .data => |n| {
+            s.secIngress(s.socketSink(.net_stream, slot, s.net.sockets[slot].peer_node), op.data, n);
+            s.record(.net_read, slot, n, 0, "");
+            s.netWakeAll(); // writers waiting for space
+            return .{ .data_len = n };
+        },
+        .eof => {
+            s.record(.net_read, slot, 0, 1, "eof");
+            return .{ .data_len = 0 };
+        },
+        .fault => |f| {
+            s.record(.net_fault, slot, @backingInt(f), 1, @tagName(f));
+            return netFaultError(E, f);
+        },
+        .would_block => return null,
+    }
+}
+
+fn netWriteStep(s: *Sim, op: Io.Operation.NetWrite) ?Io.Operation.NetWrite.Result {
+    const E = Io.Operation.NetWrite.Error;
+    var total: usize = op.header.len;
+    if (op.data.len > 0) {
+        for (op.data[0 .. op.data.len - 1]) |d| total += d.len;
+        total += op.data[op.data.len - 1].len * op.splat;
+    }
+    if (total == 0) return 0;
+    const slot = s.streamSlot(op.socket_handle) orelse return error.SocketUnconnected;
+    s.maybeInjectReset(slot);
+    switch (s.net.checkSend(slot, s.now_ns)) {
+        .fault => |f| {
+            s.record(.net_fault, slot, @backingInt(f), 2, @tagName(f));
+            return netFaultError(E, f);
+        },
+        .shut_down => return error.SocketUnconnected,
+        .peer_gone => {
+            // The bytes vanish; the peer answers with RST a round trip later.
+            s.net.setFault(slot, .reset, s.now_ns + 2 * s.config.net.latency_min_ns);
+            s.record(.net_write, slot, total, 1, "peer closed");
+            return total;
+        },
+        .would_block => return null,
+        .ready => |free| {
+            const limit = @min(free, s.shortLen(total));
+            const segment_count: usize = if (op.data.len == 0) 1 else op.data.len + op.splat;
+            var done: usize = 0;
+            var k: usize = 0;
+            while (k < segment_count and done < limit) : (k += 1) {
+                const seg: []const u8 = if (k == 0) op.header else op.data[@min(k - 1, op.data.len - 1)];
+                const n = @min(seg.len, limit - done);
+                if (n == 0) continue;
+                var bytes: []const u8 = seg[0..n];
+                if (s.sec) |sa| {
+                    const sink = s.socketSink(.net_stream, slot, s.net.sockets[slot].peer_node);
+                    if (n <= s.sec_scratch.len and sa.provider.stream(sa.ctx, sink, bytes, s.sec_scratch)) {
+                        bytes = s.sec_scratch[0..n];
+                        s.record(.net_write, slot, n, 2, "byzantine");
+                    }
+                    s.secEgress(sink, bytes);
+                }
+                s.net.push(slot, bytes);
+                done += n;
+            }
+            s.net.commit(slot, @intCast(done), false, s.now_ns, &s.decider, s.config.net);
+            s.stats.net_bytes += done;
+            s.stats.net_writes += 1;
+            s.record(.net_write, slot, done, 0, "");
+            s.netWakeAll(); // readers
+            return done;
+        },
+    }
+}
+
+// --- datagrams ---------------------------------------------------------------
+
+fn dgramSlot(s: *Sim, handle: ionet.Socket.Handle) ?u16 {
+    const slot = s.net.decode(handleValue(handle)) catch return null;
+    if (s.net.sockets[slot].kind != .dgram) return null;
+    return slot;
+}
+
+fn netBindIp(userdata: ?*anyopaque, address: *const ionet.IpAddress, options: ionet.IpAddress.BindOptions) ionet.IpAddress.BindError!ionet.Socket {
+    const s = fromUserdata(userdata);
+    const E = ionet.IpAddress.BindError;
+    try s.enter(E);
+    s.secCapability(.net_listen, &.{});
+    if (options.mode != .dgram) return error.SocketModeUnsupported;
+    if (options.protocol) |p| if (p != .udp) return error.ProtocolUnsupportedByAddressFamily;
+    const a = switch (address.*) {
+        .ip4 => |a| a,
+        .ip6 => return error.AddressFamilyUnsupported,
+    };
+    const node = s.currentNode();
+    if (!net_mod.Net.isLocal(node, a.bytes)) return error.AddressUnavailable;
+    const port = if (a.port == 0) s.net.ephemeralPort(node, true) orelse return error.AddressInUse else a.port;
+    const slot = try s.net.bind(node, port);
+    const v = s.net.encode(slot);
+    s.touchInbox(node, port);
+    s.record(.net_bind, node, port, v, "");
+    return .{ .handle = toHandle(v), .address = ip4(a.bytes, port) };
+}
+
+/// Core runs no processes: a spawn or an exec fails as on a system without
+/// them, after the security layer has seen the command.
+fn processSpawn(userdata: ?*anyopaque, options: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
+    const s = fromUserdata(userdata);
+    s.secCapability(.process_spawn, options.argv);
+    return error.OperationUnsupported;
+}
+
+fn processReplace(userdata: ?*anyopaque, options: std.process.ReplaceOptions) std.process.ReplaceError {
+    const s = fromUserdata(userdata);
+    s.secCapability(.process_spawn, options.argv);
+    return error.OperationUnsupported;
+}
+
+/// Datagrams never block on send. Each may be lost or duplicated (swarm
+/// class `datagram_loss`), and is dropped across a cut link, when nothing
+/// is bound to the destination port, or when the receive buffer is full.
+fn netSendStep(s: *Sim, op: Io.Operation.NetSend) Io.Operation.NetSend.Result {
+    const slot = s.dgramSlot(op.socket_handle) orelse return .{ error.SocketUnconnected, 0 };
+    const src = s.net.sockets[slot].node;
+    const f = s.config.faults;
+    const loss_on = s.plan.isEnabled(.datagram_loss);
+    for (op.messages, 0..) |*m, i| {
+        const a = switch (m.address.*) {
+            .ip4 => |a| a,
+            .ip6 => return .{ error.AddressFamilyUnsupported, i },
+        };
+        const dst = s.net.nodeOf(src, a.bytes) orelse return .{ error.NetworkUnreachable, i };
+        s.touchInbox(dst, a.port);
+        if (m.data_len > s.net.datagramCapacity()) return .{ error.MessageOversize, i };
+        var payload: []const u8 = m.data_ptr[0..m.data_len];
+        if (s.sec) |sa| {
+            const sink = s.socketSink(.datagram, slot, dst);
+            const cap = s.sec_scratch.len / 2;
+            if (sa.provider.datagram(sa.ctx, sink, payload, s.sec_scratch[0..cap])) |n| {
+                payload = s.sec_scratch[0..n];
+                s.record(.net_send, slot, n, 0, "byzantine");
+            }
+            s.secEgress(sink, payload);
+            if (sa.provider.replay(sa.ctx, sink, payload, s.sec_scratch[cap..])) |n| {
+                // The attacker's copy: no loss decisions, so a replay that
+                // was chosen is one that arrives.
+                const replayed = s.sec_scratch[cap..][0..n];
+                const outcome = s.net.sendDatagram(slot, dst, a.port, replayed, false, false, s.now_ns, &s.decider, s.config.net);
+                s.record(.net_send, slot, n, @backingInt(outcome), "replay");
+            }
+        }
+        const lose = loss_on and s.decider.chance(.fault, f.datagram_loss_ppm);
+        const dup = loss_on and s.decider.chance(.fault, f.datagram_duplicate_ppm);
+        const outcome = s.net.sendDatagram(slot, dst, a.port, payload, lose, dup, s.now_ns, &s.decider, s.config.net);
+        s.stats.datagrams += 1;
+        s.stats.net_bytes += m.data_len;
+        s.record(.net_send, slot, m.data_len, @backingInt(outcome), @tagName(outcome));
+    }
+    s.netWakeAll();
+    return .{ null, op.messages.len };
+}
+
+fn netReceiveStep(s: *Sim, op: Io.Operation.NetReceive) ?Io.Operation.NetReceive.Result {
+    const slot = s.dgramSlot(op.socket_handle) orelse return .{ error.SocketUnconnected, 0 };
+    // Also when nothing is there: an empty read depends on the senders.
+    s.touchInbox(s.net.sockets[slot].node, s.net.sockets[slot].local_port);
+    if (op.message_buffer.len == 0) return .{ null, 0 };
+    var count: usize = 0;
+    var used: usize = 0;
+    while (count < op.message_buffer.len) {
+        const out = op.data_buffer[used..];
+        if (count > 0 and out.len == 0) break;
+        const dg = s.net.recvDatagram(slot, out, s.now_ns) orelse break;
+        const m = &op.message_buffer[count];
+        m.from = ip4(net_mod.Net.nodeAddress(dg.src_node), dg.src_port);
+        m.data = out[0..dg.len];
+        if (s.sec) |a| a.provider.ingress(a.ctx, s.socketSink(.datagram, slot, dg.src_node), m.data);
+        m.control = m.control[0..0];
+        m.flags = .{ .eor = false, .trunc = dg.truncated, .ctrunc = false, .oob = false, .errqueue = false };
+        s.record(.net_receive, slot, dg.len, dg.src_node, "");
+        used += dg.len;
+        count += 1;
+    }
+    if (count == 0) return null;
+    return .{ null, count };
+}
+
+// --- links -------------------------------------------------------------------
+
+fn fileKind(k: vfs_mod.Kind) File.Kind {
+    return switch (k) {
+        .dir => .directory,
+        .symlink => .sym_link,
+        .file, .free => .file,
+    };
+}
+
+fn dirHardLink(userdata: ?*anyopaque, old_dir: Dir, old_sub_path: []const u8, new_dir: Dir, new_sub_path: []const u8, options: Dir.HardLinkOptions) Dir.HardLinkError!void {
+    const s = fromUserdata(userdata);
+    const E = Dir.HardLinkError;
+    try s.enter(E);
+    s.syncClock();
+    if (s.injected(E, .metadata)) |e| return e;
+    const old_parent = s.dirInode(old_dir) catch |err| return vfsError(E, err);
+    const new_parent = s.dirInode(new_dir) catch |err| return vfsError(E, err);
+    const ino = s.vfs.lookupEx(old_parent, old_sub_path, options.follow_symlinks) catch |err| return vfsError(E, err);
+    s.vfs.hardLink(ino, new_parent, new_sub_path) catch |err| return vfsError(E, err);
+    s.record(.fs_link, ino, 0, 0, new_sub_path);
+}
+
+fn fileHardLink(userdata: ?*anyopaque, file: File, new_dir: Dir, new_sub_path: []const u8, options: File.HardLinkOptions) File.HardLinkError!void {
+    _ = options;
+    const s = fromUserdata(userdata);
+    const E = File.HardLinkError;
+    try s.enter(E);
+    s.syncClock();
+    if (s.injected(E, .metadata)) |e| return e;
+    const h = s.fileHandle(file) catch |err| return vfsError(E, err);
+    const ino = h.inode;
+    const new_parent = s.dirInode(new_dir) catch |err| return vfsError(E, err);
+    s.vfs.hardLink(ino, new_parent, new_sub_path) catch |err| return vfsError(E, err);
+    s.record(.fs_link, ino, 1, 0, new_sub_path);
+}
+
+fn dirSymLink(userdata: ?*anyopaque, dir: Dir, target_path: []const u8, sym_link_path: []const u8, flags: Dir.SymLinkFlags) Dir.SymLinkError!void {
+    _ = flags;
+    const s = fromUserdata(userdata);
+    const E = Dir.SymLinkError;
+    try s.enter(E);
+    s.syncClock();
+    if (s.injected(E, .metadata)) |e| return e;
+    const parent = s.dirInode(dir) catch |err| return vfsError(E, err);
+    s.vfs.symLink(parent, target_path, sym_link_path) catch |err| return vfsError(E, err);
+    s.record(.fs_link, 0, 2, 0, sym_link_path);
+}
+
+fn dirReadLink(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, buffer: []u8) Dir.ReadLinkError!usize {
+    const s = fromUserdata(userdata);
+    const E = Dir.ReadLinkError;
+    try s.enter(E);
+    const parent = s.dirInode(dir) catch |err| return vfsError(E, err);
+    return s.vfs.readLink(parent, sub_path, buffer) catch |err| return vfsError(E, err);
+}
+
+/// Adds a coverage feature (guided exploration); no-op otherwise.
+pub fn cover(s: *Sim, feature: u64) void {
+    if (s.coverage) |m| m.set(feature);
+}
+
+/// Ends a deterministic setup phase: from here on the run draws from
+/// `seed`, with a fresh swarm mask. Called by `check` between
+/// `Options.setup` and the body, in the fork server child and in-process
+/// alike, so both produce the same trace.
+pub fn reseed(s: *Sim, seed: u64) void {
+    s.seed = seed;
+    s.decider.reseed(seed);
+    s.plan = .init(s.config.faults);
+    if (s.config.swarm) s.plan.drawSwarm(&s.decider);
+    for (s.nodes) |*n| n.heap.oom_ppm = if (s.plan.isEnabled(.oom)) s.config.faults.oom_ppm else 0;
+    s.record(.note, 0, 0, 0, "reseed");
+}
