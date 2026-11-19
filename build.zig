@@ -204,6 +204,27 @@ pub fn build(b: *std.Build) void {
     }
     test_step.dependOn(examples_step);
 
+    // `zig build bugbench`: the bug benchmark (plan3.md F1): for each
+    // example, what a plain run of the planted bug sees, whether a campaign
+    // finds it, and what the failure shrinks to.
+    const bugbench_mod = b.createModule(.{
+        .root_source_file = b.path("src/cmd/bugbench/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "tardis", .module = mod }},
+    });
+    for ([_][]const u8{ "wal_kv", "counter", "jobs", "replica" }) |name| {
+        bugbench_mod.addImport(name, b.createModule(.{
+            .root_source_file = b.path(b.fmt("examples/{s}.zig", .{name})),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "tardis", .module = mod }},
+        }));
+    }
+    const bugbench = b.addExecutable(.{ .name = "tardis-bugbench", .root_module = bugbench_mod });
+    const bugbench_step = b.step("bugbench", "Run the bug benchmark: planted bugs, found or not, and what they shrink to");
+    bugbench_step.dependOn(&b.addRunArtifact(bugbench).step);
+
     // `zig build run`: demo of a crash-consistency bug found per persona.
     const demo = b.addExecutable(.{
         .name = "tardis-demo",

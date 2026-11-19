@@ -131,11 +131,11 @@ fn scenario(env: *Env, variant: Variant) !void {
     try env.eventually("after the partition heals, the replica catches up", 30 * std.time.ns_per_s, &cluster, agree);
 }
 
-fn buggy(env: *Env) !void {
+pub fn buggy(env: *Env) !void {
     return scenario(env, .buggy);
 }
 
-fn fixed(env: *Env) !void {
+pub fn fixed(env: *Env) !void {
     return scenario(env, .fixed);
 }
 

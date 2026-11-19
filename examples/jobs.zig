@@ -86,11 +86,11 @@ fn scenario(env: *Env, variant: Variant) !void {
     for (seen) |count| try env.always("each job is in the ledger exactly once", count == 1);
 }
 
-fn buggy(env: *Env) !void {
+pub fn buggy(env: *Env) !void {
     return scenario(env, .buggy);
 }
 
-fn fixed(env: *Env) !void {
+pub fn fixed(env: *Env) !void {
     return scenario(env, .fixed);
 }
 

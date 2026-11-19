@@ -60,11 +60,11 @@ fn scenario(env: *Env, variant: Variant) !void {
     try env.always("no increment is lost", !failed and try read(io, env.dir) == tasks);
 }
 
-fn buggy(env: *Env) !void {
+pub fn buggy(env: *Env) !void {
     return scenario(env, .buggy);
 }
 
-fn fixed(env: *Env) !void {
+pub fn fixed(env: *Env) !void {
     return scenario(env, .fixed);
 }
 

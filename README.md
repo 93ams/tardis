@@ -202,6 +202,7 @@ worked example.
 | `zig build test-edges` | guided exploration fed by Zig's edge counters (Linux or macOS targets) |
 | `zig build evidence` | the certification campaigns, bundles in `zig-out/tardis-evidence` |
 | `zig build bench` | throughput benchmarks, always optimized |
+| `zig build bugbench` | the bug benchmark: each example's planted bug, whether a plain run sees it, whether a campaign finds it, what it shrinks to |
 | `zig build run` | the demo |
 
 `scripts/verify.sh` runs the formatting check and the suite in all four

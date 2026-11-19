@@ -92,11 +92,11 @@ fn scenario(env: *Env, variant: Variant) !void {
     }
 }
 
-fn buggy(env: *Env) !void {
+pub fn buggy(env: *Env) !void {
     return scenario(env, .buggy);
 }
 
-fn fixed(env: *Env) !void {
+pub fn fixed(env: *Env) !void {
     return scenario(env, .fixed);
 }
 

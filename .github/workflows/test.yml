@@ -45,6 +45,10 @@ jobs:
         run: zig build test -Doptimize=ReleaseSafe --summary all
       # Numbers that follow from the seed must not move; timings must stay
       # within a generous budget (scripts/bench_budgets.txt).
+      # Every planted bug found, every fix passing (plan3.md F1).
+      - name: Bug benchmark
+        working-directory: tardis
+        run: zig build bugbench
       - name: Benchmarks against their budgets
         if: matrix.os == 'ubuntu-latest'
         working-directory: tardis

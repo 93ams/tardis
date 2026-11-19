@@ -5,6 +5,10 @@ numbers (§) are `plan2.md`'s unless an entry names `plan.md`. Revision 1
 was the first draft of `plan2.md`; the core's earlier history is in
 `plan.md` §9 and §14.
 
+## Revision 66 (a program and CI)
+
+`zig build bugbench` (`src/cmd/bugbench`): the bug benchmark over the four examples, with the plain run as a baseline, and a CI step that fails if a planted bug is missed or a fix fails (`plan3.md` F1, F2).
+
 ## Revision 65 (core and CI)
 
 `TARDIS_CAMPAIGN_SALT` and `TARDIS_ITERATIONS_SCALE` (tests only): other seeds, and more iterations, for every `check` without editing a test. `.github/workflows/campaign.yml` runs a nightly campaign with them on Linux, macOS and Windows and can be called from another repository (`plan3.md` I1).
