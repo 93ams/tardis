@@ -96,7 +96,9 @@ pub const Provider = struct {
     destroy: *const fn (gpa: std.mem.Allocator, ctx: *anyopaque) void,
     /// A run starts with this seed: forget per-run state.
     begin_run: *const fn (ctx: *anyopaque, seed: u64) void,
-    /// `mem` was just handed to the program by node `node`'s heap.
+    /// `mem` was just handed to the program by node `node`'s heap. Empty
+    /// after a shrink in place: `mem.ptr` is the block's new end, where
+    /// its guard now stands.
     alloc: *const fn (ctx: *anyopaque, node: NodeId, mem: []u8) void,
     /// `mem` is about to be freed (or the tail of a shrink). The
     /// `redzone_bytes` after it are its guard, still as the program left

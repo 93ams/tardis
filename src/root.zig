@@ -151,14 +151,15 @@ pub const Options = struct {
     /// system call: it asked the kernel for the time, random bytes, a file
     /// or a socket instead of going through `env.io`, so the run no longer
     /// depends on its seed alone. Linux on x86_64 (syscall user dispatch,
-    /// Linux 5.11); ignored elsewhere, in forked iterations and on worker
-    /// threads' setup. `TARDIS_TRAP_SYSCALLS=1` turns it on for every
+    /// Linux 5.11); ignored elsewhere, in forked iterations, in `sim`'s
+    /// loop form and on worker threads' setup. `TARDIS_TRAP_SYSCALLS=1` turns it on for every
     /// check of a test run.
     trap_syscalls: bool = false,
     /// Answer `rdtsc` and `rdtscp` with the run's virtual time in
     /// nanoseconds (plus the number of reads so far), so code that times
     /// itself with the processor's counter follows the seed. Linux on
-    /// x86_64 (`PR_SET_TSC`); ignored elsewhere and in forked iterations.
+    /// x86_64 (`PR_SET_TSC`); ignored elsewhere, in forked iterations and
+    /// in `sim`'s loop form.
     virtual_tsc: bool = false,
     /// An optional security layer such as `tardis_sec` (plan2.md §2.2).
     /// A violation it reports fails the run with `error.SecurityViolation`.
@@ -2266,6 +2267,7 @@ pub const Simulation = struct {
         if (self.in_progress) {
             const failed_now = self.failure;
             self.failure = null;
+            self.s.secEndRun();
             self.s.endRun();
             self.s.overlay = null;
             self.s.recorder = null;
@@ -2393,6 +2395,7 @@ pub const Simulation = struct {
     /// error an iteration reported with `fail`, if any (after shrinking it).
     pub fn finish(self: *Simulation) !void {
         if (self.in_progress) {
+            self.s.secEndRun();
             self.s.endRun();
             self.s.overlay = null;
             self.s.recorder = null;

@@ -334,3 +334,71 @@ test "lock order: two std.Io.Mutex taken in both orders are CWE-833, with no dea
     // Off, the inverted order passes: no run deadlocks.
     try tardis.check(gpa, lockInverted, sec.withSecurity(.{ .base = .{ .iterations = 20 } }));
 }
+
+// --- revision 57: message order, and the guard after a shrink ----------------
+
+fn announcer(io: Io, dir: Io.Dir, p: *u64) Io.Cancelable!void {
+    sut_bump(p);
+    dir.writeFile(io, .{ .sub_path = "ready", .data = "go" }) catch {};
+}
+
+/// Bumps once the other task's file is there. Only the file orders the two:
+/// the sleeps are woken by timers, which order nothing.
+fn follower(io: Io, dir: Io.Dir, p: *u64) Io.Cancelable!void {
+    var buf: [8]u8 = undefined;
+    while (true) {
+        if (dir.readFile(io, "ready", &buf)) |text| {
+            if (text.len != 0) break;
+        } else |_| {}
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    sut_bump(p);
+}
+
+fn handoff(env: *Env) !void {
+    const p = try env.allocator.create(u64);
+    defer env.allocator.destroy(p);
+    p.* = 0;
+    var group: Io.Group = .init;
+    try group.concurrent(env.io, follower, .{ env.io, env.dir, p });
+    try group.concurrent(env.io, announcer, .{ env.io, env.dir, p });
+    try group.await(env.io);
+    try std.testing.expectEqual(@as(u64, 2), sut_read(p));
+}
+
+test "race: a task that read what another wrote to a file comes after it" {
+    try tardis.check(gpa, handoff, sec.withSecurity(.{ .data_races = true, .base = .{ .iterations = 50 } }));
+}
+
+fn shrunkThenFilled(env: *Env) !void {
+    const buf = try env.allocator.alloc(u8, 64);
+    if (!env.allocator.resize(buf, size)) return error.ResizeRefused;
+    const small = buf[0..size];
+    defer env.allocator.free(small);
+    // Two bytes past the new end: in the guard, not in freed memory.
+    sut_fill(small.ptr, size + 2, 7);
+}
+
+test "shadow: after a shrink in place, the new end has its guard" {
+    const f = try expectFinding(shrunkThenFilled, 787, .write_past_end);
+    try std.testing.expectEqual(@as(u32, 0), f.offset);
+}
+
+fn emptyCopier(dst: [*]u8, src: [*]const u8) Io.Cancelable!void {
+    sut_copy(dst, src, 0);
+}
+
+fn emptyCopies(env: *Env) !void {
+    const dst = try env.allocator.alloc(u8, size);
+    defer env.allocator.free(dst);
+    const src = try env.allocator.alloc(u8, size);
+    defer env.allocator.free(src);
+    var group: Io.Group = .init;
+    try group.concurrent(env.io, emptyCopier, .{ dst.ptr, src.ptr });
+    try group.concurrent(env.io, emptyCopier, .{ dst.ptr, src.ptr });
+    try group.await(env.io);
+}
+
+test "race: a copy of no bytes touches nothing" {
+    try expectNoRace(emptyCopies);
+}

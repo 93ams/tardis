@@ -64,7 +64,31 @@ jobs:
         with:
           name: tardis-evidence
           path: tardis/zig-out/tardis-evidence
-      - uses: github/codeql-action/upload-sarif@v3
+      # One bundle per campaign, each with its own SARIF: the upload job
+      # below sends them one by one, since code scanning takes one run per
+      # category.
+      - name: List the bundles
+        id: bundles
+        working-directory: tardis/zig-out/tardis-evidence
+        run: echo "names=$(ls -d */ | sed 's#/$##' | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
+    outputs:
+      bundles: ${{ steps.bundles.outputs.names }}
+
+  sarif:
+    needs: certify
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        bundle: ${{ fromJson(needs.certify.outputs.bundles) }}
+    steps:
+      # The upload reads the commit from a checkout.
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
         with:
-          sarif_file: tardis/zig-out/tardis-evidence
-          category: tardis-sec
+          name: tardis-evidence
+          path: tardis-evidence
+      - uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: tardis-evidence/${{ matrix.bundle }}
+          category: tardis-sec-${{ matrix.bundle }}

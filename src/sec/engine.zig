@@ -772,8 +772,17 @@ fn onHeapReset(ctx: *anyopaque, node: seam.NodeId) void {
     }
 }
 
+/// The race detector's key for what one node's tasks pass each other
+/// through its files or its sockets (§4.5): a task that reads comes
+/// after every task of the node that wrote before it. Never an address.
+fn messageKey(sink: seam.Sink) usize {
+    const kind: usize = if (sink.kind == .file) 1 else 2;
+    return (@as(usize, 1) << 62) | (kind << 40) | (@as(usize, sink.node) << 1) | 1;
+}
+
 fn onIngress(ctx: *anyopaque, sink: seam.Sink, bytes: []u8) void {
     const e = engineOf(ctx);
+    if (e.race_detector) |*d| if (tardis.Sim.activeOrNull()) |s| d.acquire(s.current, messageKey(sink));
     e.rx_bytes += bytes.len;
     if (sink.kind != .file) {
         e.ledger.rx_bytes += bytes.len;
@@ -842,6 +851,7 @@ fn onCapability(ctx: *anyopaque, node: seam.NodeId, cap: seam.Capability, argv: 
 
 fn onEgress(ctx: *anyopaque, sink: seam.Sink, bytes: []const u8) u16 {
     const e = engineOf(ctx);
+    if (e.race_detector) |*d| if (tardis.Sim.activeOrNull()) |s| d.release(s.current, messageKey(sink));
     if (sink.kind == .file) e.ledger.file_bytes += bytes.len else e.ledger.tx_bytes += bytes.len;
     return e.scan(sink, bytes);
 }
@@ -1056,6 +1066,8 @@ pub fn spectreLoad(addr: usize, value: u64) void {
 /// race, whichever the run has.
 pub fn shadowAccess(addr: usize, len: usize, write: bool) void {
     const e = checking orelse return;
+    // A copy or a fill of no bytes touches nothing.
+    if (len == 0) return;
     heapAccess(e, addr, len, write);
     raceAccess(e, addr, len, write);
 }
@@ -1101,8 +1113,10 @@ fn onTaskSync(ctx: *anyopaque, op: seam.TaskSync, a: usize, b: usize) void {
     }
 }
 
-/// The bytes of a range checked for races one by one; longer ranges
-/// are checked every eighth byte, up to `race_range_max`.
+/// An access of up to this many bytes is checked for races at its first
+/// byte (accesses are matched by start address, `datarace.zig`); a longer
+/// one, a copy or a fill, also at every eighth byte after it, up to
+/// `race_range_max`.
 const race_range_bytes = 16;
 const race_range_max = 4096;
 

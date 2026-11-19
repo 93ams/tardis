@@ -69,7 +69,7 @@ test "WAL survives power loss" {
 
 ### 1.3 Success criteria for M1 (all met in this revision)
 
-1. `zig build test` passes on Windows x86_64 (187 library tests including M2–M5; four Linux-only tests skip; plus the `tardis` program's 6, the termancy suite's 7 (§9.1), and `tardis_sec`'s 116 over the security seam (`plan2.md` §3.7, §4.3, §4.4, §6.1, §7.1, §7.2, §7.5)) in Debug, ReleaseSafe, ReleaseFast and ReleaseSmall, and the same suite cross-compiled for `x86_64-linux-musl` passes all 187 (and the `tardis_sec` module's and Example 2's tests) on Linux (WSL2), including the golden trace hash recorded on Windows. macOS is not yet tested (§10).
+1. `zig build test` passes on Windows x86_64 (187 library tests including M2–M5; four Linux-only tests skip; plus the `tardis` program's 6, the termancy suite's 7 (§9.1), and `tardis_sec`'s 119 over the security seam (`plan2.md` §3.7, §4.3, §4.4, §6.1, §7.1, §7.2, §7.5)) in Debug, ReleaseSafe, ReleaseFast and ReleaseSmall, and the same suite cross-compiled for `x86_64-linux-musl` passes all 187 (and the `tardis_sec` module's and Example 2's tests) on Linux (WSL2), including the golden trace hash recorded on Windows. macOS is not yet tested (§10).
 2. Running the same `(seed, options)` twice produces identical trace hashes. The suite asserts this, `check()` re-verifies every Nth iteration, and a golden trace hash is identical across all four build modes.
 3. The tests in `src/tests/` show:
    - (a) a lost acknowledged write under power loss;

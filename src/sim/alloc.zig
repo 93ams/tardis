@@ -161,6 +161,9 @@ pub const SutAllocator = struct {
         if (new_len < memory.len) s.secFree(memory[new_len..]);
         if (new_len > memory.len) s.secAlloc(memory.ptr[memory.len..new_len]);
         writeGuard(memory.ptr, new_len);
+        // The guard now stands inside what was just dropped: an empty
+        // allocation at the new end says where.
+        if (new_len < memory.len) s.secAlloc(memory.ptr[new_len..new_len]);
     }
 
     fn free(ctx: *anyopaque, memory: []u8, alignment: Alignment, ret_addr: usize) void {

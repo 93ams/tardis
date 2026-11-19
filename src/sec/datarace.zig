@@ -16,14 +16,23 @@
 //! - an atomic operation: a store or read-modify-write publishes the
 //!   task's clock at that address, a load or read-modify-write takes it.
 //!   `std.Io.Mutex` and what `std.Io` builds on it are atomics and wakes,
-//!   so data guarded by a mutex locked in instrumented code is ordered.
+//!   so data guarded by a mutex locked in instrumented code is ordered;
+//! - a message: a task that reads from a file or a socket comes after
+//!   every task of its node that wrote to one before (the engine's
+//!   `messageKey`: one key per node for files, one for sockets).
 //!
 //! Each address remembers its last store and its last load (one of each,
 //! not every reader), so a race may be missed and none is invented by the
-//! shadow itself. Fixed capacities, no allocation after `init`.
+//! shadow itself. The table is indexed by address, and two addresses that
+//! share a cell evict each other: which pairs collide follows where the
+//! process was loaded, so a race found in one process can be missed in
+//! another run of the same seed. Atomic minimum and maximum operations
+//! are left to the processor by the compiler and order nothing. Fixed
+//! capacities, no allocation after `init`.
 
 const std = @import("std");
 
+/// Task slots tracked; at most 255, since a cell names a slot in a byte.
 pub const tasks_max = 128;
 const cells_len = 1 << 16;
 pub const syncs_max = 512;
@@ -38,9 +47,23 @@ const Cell = struct {
     run: u32,
     write_clock: u32,
     read_clock: u32,
+    /// Task slot in the low byte, its node in the high byte: a slot is
+    /// reused by tasks of other nodes, an access keeps the node it had.
     write_task: u16,
     read_task: u16,
 };
+
+fn who(task: usize, node: u8) u16 {
+    return @intCast(task | (@as(usize, node) << 8));
+}
+
+fn slotOf(w: u16) usize {
+    return w & 0xff;
+}
+
+fn nodeOf(w: u16) u8 {
+    return @intCast(w >> 8);
+}
 
 pub const Race = struct {
     /// The earlier access's task, and whether it was a store.
@@ -60,7 +83,6 @@ pub const Detector = struct {
     /// Each slot's next own clock value: never reused within a run, so a
     /// new task in an old slot is not mistaken for the old one.
     next_own: [tasks_max]u32 = @splat(1),
-    node_of: [tasks_max]u8 = @splat(0),
     /// Highest task slot seen this run (what `reset` must clear).
     tasks_high: u16 = 0,
     /// The run outgrew a table: ordering was lost, so nothing more is
@@ -193,20 +215,19 @@ pub const Detector = struct {
     pub fn access(d: *Detector, task: usize, node: u8, addr: usize, write: bool) ?Race {
         if (d.blind or !d.known(task)) return null;
         d.checked += 1;
-        d.node_of[task] = node;
         const me = &d.clocks[task];
         const c = d.cell(addr);
         var found: ?Race = null;
-        if (c.write_task != none and c.write_task != task and d.node_of[c.write_task] == node and c.write_clock > me[c.write_task]) {
-            found = .{ .other = c.write_task, .other_write = true };
-        } else if (write and c.read_task != none and c.read_task != task and d.node_of[c.read_task] == node and c.read_clock > me[c.read_task]) {
-            found = .{ .other = c.read_task, .other_write = false };
+        if (c.write_task != none and slotOf(c.write_task) != task and nodeOf(c.write_task) == node and c.write_clock > me[slotOf(c.write_task)]) {
+            found = .{ .other = @intCast(slotOf(c.write_task)), .other_write = true };
+        } else if (write and c.read_task != none and slotOf(c.read_task) != task and nodeOf(c.read_task) == node and c.read_clock > me[slotOf(c.read_task)]) {
+            found = .{ .other = @intCast(slotOf(c.read_task)), .other_write = false };
         }
         if (write) {
-            c.write_task = @intCast(task);
+            c.write_task = who(task, node);
             c.write_clock = me[task];
         } else {
-            c.read_task = @intCast(task);
+            c.read_task = who(task, node);
             c.read_clock = me[task];
         }
         return found;
@@ -277,6 +298,12 @@ test "an atomic orders what it guards, nodes are apart, and blocks start clean" 
         try std.testing.expectEqual(null, d.access(t, 0, x, true));
         d.release(t, lock);
     }
+    // Another node's task is another process, and stays one when its
+    // slot goes to a task of this node: the store below is node 1's.
+    try std.testing.expectEqual(null, d.access(2, 1, x + 24, true));
+    d.spawn(0, 2);
+    try std.testing.expectEqual(null, d.access(2, 0, x + 32, true));
+    try std.testing.expectEqual(null, d.access(1, 0, x + 24, true));
     // Another node's task is another process.
     try std.testing.expectEqual(null, d.access(2, 1, x + 8, true));
     try std.testing.expectEqual(null, d.access(1, 0, x + 8, true));

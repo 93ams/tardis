@@ -12,9 +12,14 @@ decisions that cause it.
 secret tracking, lock-order checks, Byzantine peers, constant-time checks,
 MC/DC and signed evidence bundles.
 
+New here? The [tutorial](docs/tutorial.md) goes from an empty test to a found,
+shrunk and fixed bug, and [`examples/`](examples) has three small programs,
+each with one planted bug and its fix.
+
 The design and its status are in [plan.md](plan.md) (core) and
 [plan2.md](plan2.md) (security layer). Both say what is verified by tests and
-what is not.
+what is not. [CHANGELOG.md](CHANGELOG.md) lists what each revision changed,
+and [plan3.md](plan3.md) is the proposal for getting to a release.
 
 ## Requirements
 
@@ -182,6 +187,7 @@ worked example.
 |---|---|
 | `zig build test` | the library, the security layer, the `tardis` program and the termancy suite |
 | `zig build test-sec` | the security layer's tests |
+| `zig build test-examples` | the examples: each finds its planted bug and passes its fix |
 | `zig build test-termancy` | the suite that tests the `termancy` library under simulation (needs a sibling checkout) |
 | `zig build test-edges` | guided exploration fed by Zig's edge counters (Linux or macOS targets) |
 | `zig build evidence` | the certification campaigns, bundles in `zig-out/tardis-evidence` |

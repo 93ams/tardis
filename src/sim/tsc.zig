@@ -16,6 +16,10 @@
 //! wrong. Code under test should not be calling it (`trap_syscalls` does
 //! not see it either); the simulator does not.
 //!
+//! The handler runs on the stack of the task that faulted, like Zig's own
+//! crash handler: a fault caused by a stack overflow is not reported by
+//! either. `tardis.sim`'s loop form does not arm it (`check` does).
+//!
 //! Elsewhere `supported` is false and nothing is trapped.
 
 const std = @import("std");
@@ -33,7 +37,16 @@ const sigsegv = 11;
 threadlocal var clock: ?*const u64 = null;
 threadlocal var reads: u64 = 0;
 
-var installed: std.atomic.Value(bool) = .init(false);
+/// 0: not installed, 1: a thread is installing, 2: installed.
+var installed: std.atomic.Value(u8) = .init(0);
+/// Set while the handler reads the faulting instruction: a fault there
+/// is not ours either.
+threadlocal var reading = false;
+/// `si_code` of a fault the kernel raised for a privileged instruction
+/// (a general protection fault), which is what a trapped `rdtsc` is. A
+/// jump to unmapped memory has another code, and its instruction pointer
+/// cannot be read.
+const si_kernel = 0x80;
 /// The SIGSEGV action in place before ours.
 var previous: syscalls.KernelSigaction = undefined;
 
@@ -45,10 +58,18 @@ const reg_rip = 16;
 
 fn onSegv(sig: i32, info: ?*anyopaque, context: ?*anyopaque) callconv(.c) void {
     const gregs: [*]u64 = @ptrFromInt(@intFromPtr(context.?) + gregs_offset);
-    if (clock) |now| {
+    // `siginfo_t` starts with `si_signo`, `si_errno`, `si_code`.
+    const code = @as(*const [3]i32, @ptrCast(@alignCast(info.?)))[2];
+    if (clock != null and code == si_kernel and !reading) {
+        const now = clock.?;
+        // A general protection fault can also come from a jump to a
+        // non-canonical address: reading it faults again, and `reading`
+        // sends that second fault on.
+        reading = true;
         const ip: [*]const u8 = @ptrFromInt(gregs[reg_rip]);
         // `rdtsc` is 0F 31, `rdtscp` 0F 01 F9.
         const len: u64 = if (ip[0] == 0x0f and ip[1] == 0x31) 2 else if (ip[0] == 0x0f and ip[1] == 0x01 and ip[2] == 0xf9) 3 else 0;
+        reading = false;
         if (len != 0) {
             reads += 1;
             const value = now.* +% reads;
@@ -59,6 +80,7 @@ fn onSegv(sig: i32, info: ?*anyopaque, context: ?*anyopaque) callconv(.c) void {
             return;
         }
     }
+    reading = false;
     // Not ours: the earlier handler, or the default action on the retry.
     if (previous.handler > 1) {
         const f: *const fn (i32, ?*anyopaque, ?*anyopaque) callconv(.c) void = @ptrFromInt(previous.handler);
@@ -68,15 +90,25 @@ fn onSegv(sig: i32, info: ?*anyopaque, context: ?*anyopaque) callconv(.c) void {
 }
 
 fn install() bool {
-    if (installed.load(.acquire)) return true;
+    // One thread installs; the others wait for it, so `previous` is
+    // written once and is never this handler.
+    while (true) {
+        switch (installed.cmpxchgStrong(0, 1, .acquire, .acquire) orelse break) {
+            2 => return true,
+            else => std.atomic.spinLoopHint(),
+        }
+    }
     const act: syscalls.KernelSigaction = .{
         .handler = @intFromPtr(&onSegv),
         .flags = 4 | 0x04000000 | 0x40000000, // SA_SIGINFO | SA_RESTORER | SA_NODEFER
         .restorer = @intFromPtr(&syscalls.restorer),
         .mask = 0,
     };
-    if (@as(i64, @bitCast(syscalls.raw6(13, sigsegv, @intFromPtr(&act), @intFromPtr(&previous), @sizeOf(u64), 0, 0))) < 0) return false;
-    installed.store(true, .release);
+    if (@as(i64, @bitCast(syscalls.raw6(13, sigsegv, @intFromPtr(&act), @intFromPtr(&previous), @sizeOf(u64), 0, 0))) < 0) {
+        installed.store(0, .release);
+        return false;
+    }
+    installed.store(2, .release);
     return true;
 }
 
