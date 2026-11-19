@@ -1,0 +1,96 @@
+# A long campaign on new seeds (plan3.md I1): every night here, and
+# callable from another repository's workflow.
+#
+# `TARDIS_CAMPAIGN_SALT` gives every `tardis.check` other seeds than its
+# usual ones, and `TARDIS_ITERATIONS_SCALE` multiplies its iterations, so a
+# test suite written for a quick run becomes a long one without an edit.
+# A failure prints its seed and a replay line that work without either
+# variable; the whole log is kept as an artifact.
+#
+# Only tests that state a property for any seed belong here. A test that
+# expects a planted bug to be found within its usual iterations, or
+# compares against recorded numbers, is tied to its seeds.
+#
+# From another repository:
+#
+#   jobs:
+#     campaign:
+#       uses: 93ams/tardis/.github/workflows/campaign.yml@main
+#       with:
+#         command: zig build test
+#         scale: 50
+name: campaign
+
+on:
+  schedule:
+    - cron: "41 2 * * *"
+  workflow_dispatch:
+    inputs:
+      scale:
+        description: Multiply every check's iterations by this
+        default: "20"
+  workflow_call:
+    inputs:
+      command:
+        description: The test command to run
+        type: string
+        default: zig build test
+      scale:
+        description: Multiply every check's iterations by this
+        type: string
+        default: "20"
+      zig-version:
+        type: string
+        default: 0.17.0
+
+permissions:
+  contents: read
+
+jobs:
+  campaign:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      # A new salt each run: the run's number, so a failure's run page
+      # names the seeds it used.
+      TARDIS_CAMPAIGN_SALT: ${{ github.run_id }}
+      TARDIS_ITERATIONS_SCALE: ${{ inputs.scale || '20' }}
+      # This repository's own campaign: the tests that hold for any seed
+      # (the simulator's self-fuzz and the comparisons with the real
+      # filesystem and network).
+      CAMPAIGN_COMMAND: ${{ inputs.command || 'zig build test -Dtest-filter=self-fuzz -Dtest-filter=diff_fs -Dtest-filter=diff_net' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: project
+      # This repository's build needs termancy beside it; a caller's
+      # checkout simply has one directory it does not use.
+      - uses: actions/checkout@v4
+        if: github.repository == '93ams/tardis'
+        with:
+          repository: 93ams/termancy
+          path: termancy
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ inputs.zig-version || '0.17.0' }}
+      - name: Campaign
+        working-directory: project
+        run: |
+          set -o pipefail
+          echo "salt $TARDIS_CAMPAIGN_SALT, scale $TARDIS_ITERATIONS_SCALE: $CAMPAIGN_COMMAND"
+          $CAMPAIGN_COMMAND 2>&1 | tee campaign.log
+      - name: The replay lines of a failure
+        if: failure()
+        working-directory: project
+        run: grep -E "tardis: (FAILED|replay)" campaign.log || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: campaign-${{ matrix.os }}
+          path: project/campaign.log

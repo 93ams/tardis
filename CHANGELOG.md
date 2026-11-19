@@ -5,6 +5,10 @@ numbers (§) are `plan2.md`'s unless an entry names `plan.md`. Revision 1
 was the first draft of `plan2.md`; the core's earlier history is in
 `plan.md` §9 and §14.
 
+## Revision 65 (core and CI)
+
+`TARDIS_CAMPAIGN_SALT` and `TARDIS_ITERATIONS_SCALE` (tests only): other seeds, and more iterations, for every `check` without editing a test. `.github/workflows/campaign.yml` runs a nightly campaign with them on Linux, macOS and Windows and can be called from another repository (`plan3.md` I1).
+
 ## Revision 64 (scripts and CI only)
 
 A benchmark check (`scripts/bench_check.py`, `scripts/bench_budgets.txt`, a step of the test workflow on Linux): the benchmark numbers that follow from the seed must match exactly, and its timings must stay within generous budgets (`plan3.md` E1).

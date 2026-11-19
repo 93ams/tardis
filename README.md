@@ -91,10 +91,15 @@ events, and prints two ways to run it again:
 |---|---|
 | `TARDIS_SEED=0x… TARDIS_PERSONA=…` | the failing run as it was |
 | `TARDIS_REPLAY=<token>` | the shrunk run: only the decisions that matter keep their value |
+| `TARDIS_CAMPAIGN_SALT=<number>` | nothing: it gives every `check` other seeds than its usual ones, for a long run on new ground |
+| `TARDIS_ITERATIONS_SCALE=<n>` | nothing: it multiplies every `check`'s iterations |
 | `TARDIS_REPLAY_FUZZY=2` | with `TARDIS_REPLAY`: if the token no longer fails because the code now draws a little differently, try it with its decisions moved by up to 2 draws |
 
 `Options.seed`, `Options.replay` and `Options.replay_fuzzy` do the same from
-code. To look at a run instead of reading its last events,
+code. The salt and the scale are for nightly campaigns
+(`.github/workflows/campaign.yml` is one, and other repositories can call
+it); `zig build` does not know they changed, so a cached test result is
+not run again for them. To look at a run instead of reading its last events,
 `tardis.traceJson` writes it as a Chrome trace that Perfetto opens: one track
 per task, in virtual time. `tardis explain <token>` (the `tardis` program in `src/cmd/tardis`)
 decodes a token.

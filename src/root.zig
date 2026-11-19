@@ -618,6 +618,27 @@ pub fn isSimulated(io: std.Io) bool {
 
 const Replay = struct { seed: ?u64, persona: ?Persona };
 
+/// Long campaigns without editing tests (plan3.md I1), in tests only:
+/// `TARDIS_CAMPAIGN_SALT=<number>` gives every `check` other seeds than
+/// its usual ones (a nightly job passes a new number each night), and
+/// `TARDIS_ITERATIONS_SCALE=<n>` multiplies its iterations. A failure's
+/// replay lines name the seed itself, so they work without either.
+fn campaignFromEnv(gpa: Allocator, o: *Options) void {
+    if (!builtin.is_test) return;
+    if (std.testing.environ.getAlloc(gpa, "TARDIS_CAMPAIGN_SALT")) |text| {
+        defer gpa.free(text);
+        if (std.fmt.parseInt(u64, std.mem.trim(u8, text, " \t\r\n"), 0)) |salt| {
+            o.campaign_seed = decide.mix(o.campaign_seed, salt);
+        } else |_| std.debug.print("tardis: ignoring unparsable TARDIS_CAMPAIGN_SALT=\"{s}\"\n", .{text});
+    } else |_| {}
+    if (std.testing.environ.getAlloc(gpa, "TARDIS_ITERATIONS_SCALE")) |text| {
+        defer gpa.free(text);
+        if (std.fmt.parseInt(u32, std.mem.trim(u8, text, " \t\r\n"), 0)) |scale| {
+            o.iterations *|= @max(scale, 1);
+        } else |_| std.debug.print("tardis: ignoring unparsable TARDIS_ITERATIONS_SCALE=\"{s}\"\n", .{text});
+    } else |_| {}
+}
+
 fn replayFromEnv(gpa: Allocator) Replay {
     var r: Replay = .{ .seed = null, .persona = null };
     if (!builtin.is_test) return r;
@@ -1065,12 +1086,13 @@ const Guided = struct {
 /// Runs `body` across `options.iterations` seeds for each persona.
 pub fn check(gpa: Allocator, comptime body: fn (*Env) anyerror!void, options: Options) !void {
     const caller = @returnAddress();
-    const s = try Sim.create(gpa, simConfig(options));
+    var o = options;
+    campaignFromEnv(gpa, &o);
+    const s = try Sim.create(gpa, simConfig(o));
     defer s.destroy();
-    applySetup(s, options);
+    applySetup(s, o);
     // The shrunk token, for a security layer's emitter (seam 4).
     var shrunk: ShrinkReport = .{};
-    var o = options;
     if (o.shrink_report == null) o.shrink_report = &shrunk;
     const result = checkOn(gpa, s, body, o);
     if (options.warm_report) |r| r.* = .{
