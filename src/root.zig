@@ -2494,6 +2494,7 @@ test {
     _ = @import("tests/weak_test.zig");
     _ = @import("tests/syscall_test.zig");
     _ = @import("tests/tsc_test.zig");
+    _ = @import("tests/diff_fs_test.zig");
     _ = syscalls;
     _ = atomic;
     _ = @import("tests/fs_test.zig");

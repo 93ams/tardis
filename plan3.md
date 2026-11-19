@@ -4,7 +4,7 @@
 |---|---|
 | **Scope** | What has to be true before TARDIS can be recommended to people who did not write it, and before it is a better choice than the alternatives for testing Zig programs. |
 | **Relation to the other plans** | `plan.md` (core) and `plan2.md` (security layer) say what is built and verified, at revision 57. This plan is about everything else: trust, packaging, usability, reach, and proof of value. |
-| **Status** | Proposal. Nothing in it is done unless it says so (B5, G1 and G2 are; A1, B4, C1, C2, D1 and H1 say how far they got). |
+| **Status** | Proposal. Nothing in it is done unless it says so (B5, G1 and G2 are; A1, A2, B4, C1, C2, D1 and H1 say how far they got). |
 
 ## 0. The two targets, stated so they can be checked
 
@@ -38,7 +38,7 @@
 | One user | The only program tested with TARDIS besides its own suite is `termancy`, by the same author. |
 | Never run in CI | Both workflows are written and have never run. macOS has never run the suite at all; no BSD has. |
 | aarch64 never run | The fiber switch has an aarch64 path and the suite cross-compiles for `aarch64-macos`, but no aarch64 machine has run it. The syscall trap and the virtual counter are x86_64 Linux only. |
-| The simulator's fidelity is asserted, not measured | The filesystem personas and the network model are written from documentation and experience. Nothing compares them against the real systems they imitate. |
+| The simulator's fidelity is asserted, not measured | The filesystem personas and the network model are written from documentation and experience. Until revision 59 nothing compared them against the real systems they imitate; the first such test found two errors in the filesystem model within minutes (A2). The crash behaviour and the network model are still unmeasured. |
 | Zig 0.17 only | One pinned compiler. No policy for what happens when 0.18 changes `std.Io`. |
 | Only `std.Io` code is simulated | Real threads, direct system calls, C libraries that do their own I/O, and child processes are outside the simulation. |
 | The documentation is a design record | 3,600 lines of plans, a 190-line README, no tutorial, no API reference, no examples directory. The revision history was one 11,000-character table cell until it moved to `CHANGELOG.md`. |
@@ -75,7 +75,7 @@ A test tool that is wrong is worse than no tool: it gives false confidence. This
 | # | Item | Pri | Done when |
 |---|---|---|---|
 | A1 | **Run the suite on every supported platform in CI.** Push; fix what the first macOS run breaks. **First runs done** (commit `890863f`): the evidence workflow's own steps passed and its SARIF upload failed (two bundles under one category; fixed, unrun). The test workflow failed on all three systems, and a local reproduction of the CI checkout shows why: the published `termancy` `master` lacked a durability fix that existed only locally, and the termancy suite found the bug. Whether macOS and Linux have failures beyond that is unknown until a run with the fix. | P0 | `test.yml` and `evidence.yml` are green on Linux, macOS and Windows for a week of commits. |
-| A2 | **Differential tests of the filesystem model.** Run the same operation sequences against the simulated filesystem (no faults) and the real one, and compare results and errors. | P1 | A generated corpus of 100,000 sequences agrees on Linux (ext4), macOS (APFS) and Windows (NTFS), or each difference is listed as deliberate. |
+| A2 | **Differential tests of the filesystem model.** Run the same operation sequences against the simulated filesystem (no faults) and the real one, and compare results and errors. **Started in revision 59** (`src/tests/diff_fs_test.zig`, part of `zig build test`): 400 random sequences of 24 operations (write, read, delete, make and delete a directory, rename, stat) over seven paths, on the host's persona. Its first runs found two model errors, both fixed: NTFS reports a path through a regular file as not found, where the model said not a directory; and POSIX kernels call a rename onto a directory the source lives under not empty, where the model said is a directory. It also found that Zig's std panics on Windows when a directory is renamed into itself, so that case is not generated. Now agrees on Windows (NTFS) and Linux (ext4, under WSL2); APFS waits for a macOS run. Still to do: open handles, positional I/O, links, permissions, longer sequences, and the 100,000-sequence corpus. | P1 | A generated corpus of 100,000 sequences agrees on Linux (ext4), macOS (APFS) and Windows (NTFS), or each difference is listed as deliberate. |
 | A3 | **Ground the crash personas in evidence.** For each persona, cite the kernel behaviour it models, and where possible reproduce it on a real filesystem with a power-cut tool (dm-log-writes or similar). | P1 | Each persona has a short document: source, what it over-approximates, what it misses. |
 | A4 | **Differential tests of the network model** against loopback sockets: ordering, partial reads, close and reset semantics, error codes. | P1 | Same criterion as A2. |
 | A5 | **Mutation testing of the oracles.** Plant known bugs in small programs and require each oracle to catch its class. Most of this exists as paired tests; make it systematic and measured. | P1 | A table of bug classes with detection rate per oracle, published in the documentation. |

@@ -715,8 +715,15 @@ pub const Vfs = struct {
         return dir;
     }
 
+    /// A path that goes through something that is not a directory. NTFS
+    /// reports the path as not found; POSIX systems say which component
+    /// was wrong. Found by the differential test (`diff_fs_test.zig`).
+    fn throughNonDir(v: *const Vfs) Error {
+        return if (v.persona.win32Names()) error.FileNotFound else error.NotDir;
+    }
+
     fn step(v: *Vfs, cur: InodeId, name: []const u8) Error!InodeId {
-        if (v.inodes[cur].kind != .dir) return error.NotDir;
+        if (v.inodes[cur].kind != .dir) return v.throughNonDir();
         if (std.mem.eql(u8, name, ".")) return cur;
         if (std.mem.eql(u8, name, "..")) return v.inodes[cur].parent;
         const canonical = v.canonicalName(name);
@@ -780,7 +787,7 @@ pub const Vfs = struct {
         try v.validateName(name);
         const prefix = path[0 .. @intFromPtr(last_name.ptr) - @intFromPtr(path.ptr)];
         const parent = try v.lookupEx(dir, prefix, true);
-        if (v.inodes[parent].kind != .dir) return error.NotDir;
+        if (v.inodes[parent].kind != .dir) return v.throughNonDir();
         return .{ .parent = parent, .name = name };
     }
 
@@ -1044,6 +1051,10 @@ pub const Vfs = struct {
             if (dst_idx == src_idx) return;
             const victim = v.cur_dentries[dst_idx].inode;
             const vkind = v.inodes[victim].kind;
+            // Onto a directory the source lives under: POSIX kernels find
+            // that before they compare kinds, and call it not empty. Found
+            // by the differential test (`diff_fs_test.zig`).
+            if (!v.persona.win32Names() and vkind == .dir and v.isAncestor(victim, src.parent)) return error.DirNotEmpty;
             if (kind == .file and vkind == .dir) return error.IsDir;
             if (kind == .dir and vkind == .file) return error.NotDir;
             if (vkind == .dir and v.hasChildren(victim)) return error.DirNotEmpty;

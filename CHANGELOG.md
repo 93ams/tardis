@@ -5,6 +5,10 @@ numbers (§) are `plan2.md`'s unless an entry names `plan.md`. Revision 1
 was the first draft of `plan2.md`; the core's earlier history is in
 `plan.md` §9 and §14.
 
+## Revision 59 (core only)
+
+A differential test of the filesystem model against the real filesystem (`src/tests/diff_fs_test.zig`, `plan3.md` A2): random operation sequences run on both, every result compared. Two model errors found and fixed: on NTFS a path that goes through a regular file is not found (the model said not a directory), and on POSIX personas a rename onto a directory the source lives under is not empty (the model said is a directory).
+
 ## Revision 58 (examples and documents)
 
 A fourth example, `replica`: three simulated machines, and a replica left behind by a partition. `docs/stability.md` (what may change between releases, and what a seed is promised to mean), `CONTRIBUTING.md`, and a plain statement at the top of `plan2.md` §1.1 and in the README that the security layer is not certified or qualified under any standard.
