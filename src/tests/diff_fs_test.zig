@@ -182,6 +182,9 @@ fn accepted(kind: Kind, sim: Result, real: Result) bool {
 }
 
 var real_root: Io.Dir = undefined;
+/// `TARDIS_DIFF_TRACE`: a file that holds the operations of the sequence
+/// in progress.
+var trace_path: ?[]const u8 = null;
 var sequences: u32 = 0;
 var operations: u32 = 0;
 var mismatches: u32 = 0;
@@ -197,6 +200,11 @@ fn body(env: *Env) !void {
     try real_root.createDir(real_io, sub_name, .default_dir);
     var real = try real_root.openDir(real_io, sub_name, .{});
     defer real.close(real_io);
+
+    var trace: ?Io.File = null;
+    var trace_len: u64 = 0;
+    defer if (trace) |file| file.close(real_io);
+    if (trace_path) |path| trace = Io.Dir.cwd().createFile(real_io, path, .{}) catch null;
 
     for (0..ops_per_sequence) |step| {
         const op: Op = .{
@@ -216,6 +224,14 @@ fn body(env: *Env) !void {
         // alias of the source, which is the same move into itself.
         if (builtin.os.tag != .windows and op.kind == .rename and std.mem.indexOfScalar(u8, names[op.other], '/') != null and std.mem.indexOfScalar(u8, names[op.name], '/') == null) continue;
         if (builtin.os.tag == .windows and (op.kind == .sym_link or op.kind == .read_link or op.kind == .hard_link)) continue;
+        // A real call that panics inside std takes the process with it:
+        // with `TARDIS_DIFF_TRACE=<file>` the sequence so far is on disk.
+        if (trace) |*file| {
+            var line: [96]u8 = undefined;
+            const text = std.fmt.bufPrint(&line, "{t} {s} -> {s} len {d}\n", .{ op.kind, names[op.name], names[op.other], op.len }) catch unreachable;
+            file.writePositionalAll(real_io, text, trace_len) catch {};
+            trace_len += text.len;
+        }
         const sim_result = apply(env.io, env.dir, op);
         const real_result = apply(real_io, real, op);
         operations += 1;
@@ -237,6 +253,10 @@ test "diff_fs: the simulated filesystem agrees with the real one on random opera
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     real_root = tmp.dir;
+    const trace_env: ?[]u8 = testing.environ.getAlloc(testing.allocator, "TARDIS_DIFF_TRACE") catch null;
+    defer if (trace_env) |t| testing.allocator.free(t);
+    trace_path = trace_env;
+    defer trace_path = null;
     sequences = 0;
     operations = 0;
     mismatches = 0;

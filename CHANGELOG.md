@@ -5,6 +5,10 @@ numbers (§) are `plan2.md`'s unless an entry names `plan.md`. Revision 1
 was the first draft of `plan2.md`; the core's earlier history is in
 `plan.md` §9 and §14.
 
+## Revision 74 (core and CI)
+
+The first CI logs read. On macOS (Apple Silicon, real APFS) and Windows every test passes but the filesystem differential test. Two differences it found on APFS are fixed for the `macos_apfs` persona: a hard link of a directory is refused before the destination is looked at, and a stat through a regular file is not found. The test can keep the sequence in progress in a file (`TARDIS_DIFF_TRACE`), since a real call that panics inside std takes the process with it, as one did on the Windows runner. First use on another of the owner's projects: a missing directory sync in `tigershark`'s checkpoint journal (`plan3.md` F3).
+
 ## Revision 73 (documents and CI)
 
 The licence: BSD Zero Clause (0BSD). A draft report of the Windows register problem for the Zig project, unsent (`docs/disclosures/`). The test workflow publishes its failing lines as annotations; the campaign workflow's inputs are simplified after GitHub rejected the file. The plans record the first CI results on the current code: the evidence workflow and the Ubuntu tests pass, Windows and macOS fail in the test step.

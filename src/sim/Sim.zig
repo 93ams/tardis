@@ -2352,7 +2352,12 @@ fn dirStatFile(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, options: D
     try s.enter(E);
     const parent = s.dirInode(dir) catch |err| return vfsError(E, err);
     s.secVfs(.stat, parent, sub_path);
-    const ino = s.vfs.lookupEx(parent, sub_path, options.follow_symlinks) catch |err| return vfsError(E, err);
+    const ino = s.vfs.lookupEx(parent, sub_path, options.follow_symlinks) catch |err| switch (err) {
+        // On macOS std reports a stat through a regular file as not
+        // found (differential test, first run on real APFS).
+        error.NotDir => return if (s.vfs.persona == .macos_apfs) error.FileNotFound else vfsError(E, err),
+        else => return vfsError(E, err),
+    };
     s.record(.stat, ino, 0, 0, sub_path);
     return s.makeStat(ino);
 }

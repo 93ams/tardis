@@ -1,9 +1,6 @@
 # The whole suite on Linux, macOS and Windows (plan.md §10): the same
 # seeds must give the same traces on each, and the golden trace hash
 # recorded on Windows is checked on all three.
-#
-# termancy is a sibling path dependency (`../termancy`), so both
-# repositories are checked out side by side.
 name: test
 
 on:
@@ -24,10 +21,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: tardis
-      - uses: actions/checkout@v4
-        with:
-          repository: 93ams/termancy
-          path: termancy
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0
@@ -37,6 +30,10 @@ jobs:
       - name: Tests
         working-directory: tardis
         shell: bash
+        env:
+          # If a real filesystem call panics inside std, this file holds
+          # the sequence that did it (diff_fs_test.zig).
+          TARDIS_DIFF_TRACE: diff_fs.trace
         run: |
           set -o pipefail
           zig build test --summary all 2>&1 | tee test.log
@@ -58,6 +55,7 @@ jobs:
         working-directory: tardis
         shell: bash
         run: |
+          if [ -f diff_fs.trace ]; then tail -6 diff_fs.trace | while IFS= read -r line; do echo "::error::diff_fs trace: $line"; done; fi
           grep -aE "^error: '|tardis: (FAILED|always|error\.)|diff_(fs|net): |panic|Segmentation|expected .*, found|error: .*\.zig:" test.log | head -10 | while IFS= read -r line; do
             echo "::error::${line:0:300}"
           done

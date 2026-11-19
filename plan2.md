@@ -8,7 +8,7 @@
 | **Package** | `tardis_sec`, in this repository under `src/sec/` as the module `tardis_sec` (`zig build test-sec`); it imports core only through `tardis`'s public API and can move to its own repository (`tardis-sec/`, §8.1) unchanged |
 | **Toolchain** | Zig `0.17.0`, the same pin as core |
 | **Status** | Design specification with a compiled SDK (§8.3) and a live content engine on core's seam (§3.7). Every claim carries one of the tags below. |
-| **Revision** | 73. Each revision's changes are in [CHANGELOG.md](CHANGELOG.md). |
+| **Revision** | 74. Each revision's changes are in [CHANGELOG.md](CHANGELOG.md). |
 
 **How to read the claims in this document.** It specifies a security layer for a simulator whose core is still being built, so every capability is tagged:
 

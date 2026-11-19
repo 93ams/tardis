@@ -954,9 +954,12 @@ pub const Vfs = struct {
 
     /// Creates a hard link `path` to file `ino`.
     pub fn hardLink(v: *Vfs, ino: InodeId, dir: InodeId, path: []const u8) Error!void {
-        // The destination first: a kernel reports a missing parent or a
-        // name already taken before it objects to linking a directory.
-        // Found by the differential test (`diff_fs_test.zig`).
+        // Linux looks at the destination first: a missing parent or a name
+        // already taken is reported before it objects to linking a
+        // directory. macOS objects to the directory first. Both found by
+        // the differential test (`diff_fs_test.zig`), the second on the
+        // first run on real APFS.
+        if (v.persona == .macos_apfs and v.inodes[ino].kind == .dir) return error.PermissionDenied;
         const pn = try v.resolveParent(dir, path);
         if (v.findCur(pn.parent, pn.name) != null) return error.PathAlreadyExists;
         if (v.inodes[ino].kind == .dir) return error.PermissionDenied;

@@ -32,13 +32,17 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        // termancy (cli, term, sys) for the `tardis` program and for the suite
-        // that tests termancy under simulation. Lazy, and only requested when
-        // TARDIS is the root project, so packages that import the library
-        // never fetch it. A sibling checkout during development; switch to
-        // `zig fetch --save git+https://github.com/93ams/termancy#<tag>` for a
-        // release.
-        .termancy = .{ .path = "../termancy", .lazy = true },
+        // termancy (cli, term, sys, field) for the `tardis` program and for the
+        // suite that tests termancy under simulation. Lazy, and only requested
+        // when TARDIS is the root project, so packages that import the
+        // library never fetch it. Pinned to a commit of its `master`; to work
+        // on both at once, `zig build --fork=../termancy` uses a local
+        // checkout in its place.
+        .termancy = .{
+            .url = "git+https://github.com/93ams/termancy#1146f528dfe855e684109475a5b136220f91f950",
+            .hash = "termancy-0.1.0-8Kvz5jbBTwDFdS31nCAEezbBmZ5RVsjHRGeAxu_R6jwZ",
+            .lazy = true,
+        },
     },
     // Specifies the set of files and directories that are included in this package.
     // Only files and directories listed here are included in the `hash` that

@@ -11,11 +11,10 @@ the security layer attached to every check. It takes a while; `zig build
 test` alone is the quick loop. CI runs the suite on Linux, macOS and
 Windows.
 
-`zig build test` needs a checkout of
-[termancy](https://github.com/93ams/termancy) next to this one, for the
-`tardis` program and the suite that tests termancy. `zig build test-sec`
-and `zig build test-examples` do not run that suite, but the build still
-looks for the checkout.
+The build fetches [termancy](https://github.com/93ams/termancy), pinned to
+a commit, for the `tardis` program and the suite that tests termancy. To
+work on both at once, `zig build test --fork=../termancy` uses a local
+checkout in its place.
 
 ## What a change needs
 
