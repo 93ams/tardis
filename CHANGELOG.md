@@ -5,6 +5,10 @@ numbers (§) are `plan2.md`'s unless an entry names `plan.md`. Revision 1
 was the first draft of `plan2.md`; the core's earlier history is in
 `plan.md` §9 and §14.
 
+## Revision 67 (examples only)
+
+Four more examples in the bug benchmark: `dir_sync` (a missing fsync of a directory), `deadlock` (lock order), `short_write` (a short write taken for a whole one) and `error_leak` (a handle leaked on an error path). An example can name its own campaign options.
+
 ## Revision 66 (a program and CI)
 
 `zig build bugbench` (`src/cmd/bugbench`): the bug benchmark over the four examples, with the plain run as a baseline, and a CI step that fails if a planted bug is missed or a fix fails (`plan3.md` F1, F2).

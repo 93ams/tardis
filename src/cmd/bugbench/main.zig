@@ -23,17 +23,11 @@ fn Run(comptime body: fn (*tardis.Env) anyerror!void) type {
     };
 }
 
-fn row(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    comptime name: []const u8,
-    comptime class: []const u8,
-    comptime module: type,
-    comptime nodes: u8,
-    comptime iterations: u32,
-    comptime shrink: bool,
-) !bool {
-    const base: tardis.Options = .{ .nodes = nodes, .iterations = iterations, .report = false };
+fn row(gpa: std.mem.Allocator, io: std.Io, comptime name: []const u8, comptime class: []const u8, comptime module: type) !bool {
+    // A program's own campaign options (personas, faults, nodes), if it
+    // names any.
+    var base: tardis.Options = if (@hasDecl(module, "options")) module.options else .{ .iterations = 200 };
+    base.report = false;
 
     // An ordinary test: one run, every decision benign.
     var plain = base;
@@ -42,7 +36,6 @@ fn row(
 
     var shrunk: tardis.ShrinkReport = .{};
     var campaign = base;
-    campaign.shrink = shrink;
     campaign.shrink_report = &shrunk;
     const t0 = std.Io.Clock.awake.now(io).nanoseconds;
     const found = if (Run(module.buggy).check(gpa, campaign)) |_| false else |_| true;
@@ -74,10 +67,14 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     std.debug.print("| Program | Bug class | Plain run of the bug | Found by a campaign | Time | Reproduction | The fix |\n|---|---|---|---|---|---|---|\n", .{});
     var ok = true;
-    ok = try row(gpa, io, "wal_kv", "acknowledged before durable", @import("wal_kv"), 1, 200, true) and ok;
-    ok = try row(gpa, io, "counter", "lost update between tasks", @import("counter"), 1, 200, true) and ok;
-    ok = try row(gpa, io, "jobs", "applied twice after a restart", @import("jobs"), 1, 200, true) and ok;
-    ok = try row(gpa, io, "replica", "replica left behind by a partition", @import("replica"), 3, 30, false) and ok;
+    ok = try row(gpa, io, "wal_kv", "acknowledged before durable", @import("wal_kv")) and ok;
+    ok = try row(gpa, io, "dir_sync", "missing fsync of a directory", @import("dir_sync")) and ok;
+    ok = try row(gpa, io, "jobs", "applied twice after a restart", @import("jobs")) and ok;
+    ok = try row(gpa, io, "short_write", "short write taken for a whole one", @import("short_write")) and ok;
+    ok = try row(gpa, io, "error_leak", "resource leaked on an error path", @import("error_leak")) and ok;
+    ok = try row(gpa, io, "counter", "lost update between tasks", @import("counter")) and ok;
+    ok = try row(gpa, io, "deadlock", "deadlock from lock order", @import("deadlock")) and ok;
+    ok = try row(gpa, io, "replica", "replica left behind by a partition", @import("replica")) and ok;
     if (!ok) {
         std.debug.print("\nbugbench: a planted bug was missed, or a fix failed\n", .{});
         std.process.exit(1);

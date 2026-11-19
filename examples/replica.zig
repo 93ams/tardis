@@ -19,6 +19,8 @@ const Env = tardis.Env;
 
 const Variant = enum { buggy, fixed };
 
+pub const options: tardis.Options = .{ .nodes = 3, .iterations = 30, .shrink = false };
+
 const client_node = 0;
 const primary_node = 1;
 const replica_node = 2;
