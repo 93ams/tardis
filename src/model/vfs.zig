@@ -892,11 +892,31 @@ pub const Vfs = struct {
     pub const CreateOptions = struct { exclusive: bool = false, truncate: bool = true };
 
     pub fn createFile(v: *Vfs, dir: InodeId, path: []const u8, options: CreateOptions) Error!InodeId {
+        return v.createFileVia(dir, path, options, 0);
+    }
+
+    /// `links` counts the dangling symlinks followed to get here.
+    fn createFileVia(v: *Vfs, dir: InodeId, path: []const u8, options: CreateOptions, links: u8) Error!InodeId {
         const pn = try v.resolveParent(dir, path);
         if (v.findCur(pn.parent, pn.name)) |idx| {
+            // NTFS says what is in the way when it is a directory; POSIX
+            // says only that something is. Found by the differential test.
+            if (options.exclusive and v.persona.win32Names() and v.inodes[v.cur_dentries[idx].inode].kind == .dir) return error.IsDir;
             if (options.exclusive) return error.PathAlreadyExists;
             var ino = v.cur_dentries[idx].inode;
-            if (v.inodes[ino].kind == .symlink) ino = try v.lookupEx(pn.parent, pn.name, true);
+            if (v.inodes[ino].kind == .symlink) {
+                ino = v.lookupEx(pn.parent, pn.name, true) catch |err| {
+                    // A link to a file that is not there: POSIX creates
+                    // the file the link names. Found by the differential
+                    // test.
+                    if (err != error.FileNotFound or v.persona.win32Names()) return err;
+                    if (links == 8) return error.SymLinkLoop;
+                    var target: [path_bytes_max]u8 = undefined;
+                    const n: usize = @intCast(v.inodes[ino].cur_len_bytes);
+                    _ = v.read(ino, 0, target[0..n]);
+                    return v.createFileVia(pn.parent, target[0..n], options, links + 1);
+                };
+            }
             if (v.inodes[ino].kind == .dir) return error.IsDir;
             if (options.truncate) try v.setLength(ino, 0);
             return ino;
@@ -934,9 +954,12 @@ pub const Vfs = struct {
 
     /// Creates a hard link `path` to file `ino`.
     pub fn hardLink(v: *Vfs, ino: InodeId, dir: InodeId, path: []const u8) Error!void {
-        if (v.inodes[ino].kind == .dir) return error.PermissionDenied;
+        // The destination first: a kernel reports a missing parent or a
+        // name already taken before it objects to linking a directory.
+        // Found by the differential test (`diff_fs_test.zig`).
         const pn = try v.resolveParent(dir, path);
         if (v.findCur(pn.parent, pn.name) != null) return error.PathAlreadyExists;
+        if (v.inodes[ino].kind == .dir) return error.PermissionDenied;
         v.addDentry(try v.freeDentrySlot(), pn.parent, pn.name, ino);
     }
 
@@ -1050,13 +1073,19 @@ pub const Vfs = struct {
         if (v.findCur(dst.parent, dst.name)) |dst_idx| {
             if (dst_idx == src_idx) return;
             const victim = v.cur_dentries[dst_idx].inode;
+            // Two names of one file: POSIX `rename` does nothing and both
+            // names stay. Found by the differential test.
+            if (victim == ino and !v.persona.win32Names()) return;
             const vkind = v.inodes[victim].kind;
             // Onto a directory the source lives under: POSIX kernels find
             // that before they compare kinds, and call it not empty. Found
             // by the differential test (`diff_fs_test.zig`).
             if (!v.persona.win32Names() and vkind == .dir and v.isAncestor(victim, src.parent)) return error.DirNotEmpty;
-            if (kind == .file and vkind == .dir) return error.IsDir;
-            if (kind == .dir and vkind == .file) return error.NotDir;
+            // Anything that is not a directory, a symbolic link included.
+            if (kind != .dir and vkind == .dir) return error.IsDir;
+            // A directory replaces only a directory: not a file, and on
+            // POSIX not a symbolic link either (differential test).
+            if (kind == .dir and (vkind == .file or (vkind == .symlink and !v.persona.win32Names()))) return error.NotDir;
             if (vkind == .dir and v.hasChildren(victim)) return error.DirNotEmpty;
             if (v.persona.sharingViolations() and v.inodes[victim].open_count > 0) return error.FileBusy;
             v.cur_dentries[dst_idx].used = false;

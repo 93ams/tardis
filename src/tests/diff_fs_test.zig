@@ -25,7 +25,27 @@ const host_persona: tardis.Persona = switch (builtin.os.tag) {
 /// a path whose parent does not exist.
 const names = [_][]const u8{ "a", "b", "c", "d", "d/x", "d/y", "e/z" };
 
-const Kind = enum { write, read, delete, make_dir, delete_dir, rename, stat };
+const Kind = enum {
+    write,
+    read,
+    delete,
+    make_dir,
+    delete_dir,
+    rename,
+    stat,
+    /// Through an open handle: write or read at an offset, set the length.
+    write_at,
+    read_at,
+    set_length,
+    /// Create a file that must not exist yet.
+    create_new,
+    access,
+    hard_link,
+    /// POSIX hosts only: making a symbolic link needs a privilege on
+    /// Windows.
+    sym_link,
+    read_link,
+};
 
 const Op = struct {
     kind: Kind,
@@ -83,6 +103,55 @@ fn apply(io: Io, dir: Io.Dir, op: Op) Result {
             dir.rename(name, dir, names[op.other], io) catch |e| return .{ .err = @errorName(e) };
             return .{};
         },
+        .write_at => {
+            var f = dir.openFile(io, name, .{ .mode = .read_write }) catch |e| return .{ .err = @errorName(e) };
+            defer f.close(io);
+            var data: [64]u8 = undefined;
+            @memset(data[0..op.len], op.fill);
+            f.writePositionalAll(io, data[0..op.len], op.other * 7) catch |e| return .{ .err = @errorName(e) };
+            return .{ .len = f.length(io) catch |e| return .{ .err = @errorName(e) } };
+        },
+        .read_at => {
+            var f = dir.openFile(io, name, .{}) catch |e| return .{ .err = @errorName(e) };
+            defer f.close(io);
+            var buf: [48]u8 = undefined;
+            const n = f.readPositionalAll(io, &buf, op.other * 7) catch |e| return .{ .err = @errorName(e) };
+            var sum: u64 = 0;
+            for (buf[0..n]) |b| sum += b;
+            return .{ .len = n, .sum = sum };
+        },
+        .set_length => {
+            var f = dir.openFile(io, name, .{ .mode = .read_write }) catch |e| return .{ .err = @errorName(e) };
+            defer f.close(io);
+            f.setLength(io, op.len) catch |e| return .{ .err = @errorName(e) };
+            return .{ .len = f.length(io) catch |e| return .{ .err = @errorName(e) } };
+        },
+        .create_new => {
+            var f = dir.createFile(io, name, .{ .exclusive = true }) catch |e| return .{ .err = @errorName(e) };
+            f.close(io);
+            return .{};
+        },
+        .access => {
+            dir.access(io, name, .{}) catch |e| return .{ .err = @errorName(e) };
+            return .{};
+        },
+        .hard_link => {
+            dir.hardLink(name, dir, names[op.other], io, .{}) catch |e| return .{ .err = @errorName(e) };
+            return .{};
+        },
+        .sym_link => {
+            // The target is relative to the link's directory; plain names
+            // only, so the same text means the same file on both sides.
+            dir.symLink(io, names[op.other % 3], name, .{}) catch |e| return .{ .err = @errorName(e) };
+            return .{};
+        },
+        .read_link => {
+            var buf: [64]u8 = undefined;
+            const n = dir.readLink(io, name, &buf) catch |e| return .{ .err = @errorName(e) };
+            var sum: u64 = 0;
+            for (buf[0..n]) |b| sum += b;
+            return .{ .len = n, .sum = sum };
+        },
         .stat => {
             const st = dir.statFile(io, name, .{}) catch |e| return .{ .err = @errorName(e) };
             const is_dir = st.kind == .directory;
@@ -116,7 +185,7 @@ var real_root: Io.Dir = undefined;
 var sequences: u32 = 0;
 var operations: u32 = 0;
 var mismatches: u32 = 0;
-const ops_per_sequence = 24;
+const ops_per_sequence = 32;
 
 fn body(env: *Env) !void {
     var prng: std.Random.DefaultPrng = .init(env.seed);
@@ -141,6 +210,12 @@ fn body(env: *Env) !void {
         // INVALID_PARAMETER, which Zig's std treats as a bug in the
         // caller and panics on. Not generated.
         if (op.kind == .rename and std.mem.startsWith(u8, names[op.other], names[op.name]) and names[op.other].len > names[op.name].len) continue;
+        // Zig's std does not make hard links on Windows (it answers
+        // OperationUnsupported); the model's NTFS does, as NTFS does.
+        // On POSIX a symbolic link can make the destination's directory an
+        // alias of the source, which is the same move into itself.
+        if (builtin.os.tag != .windows and op.kind == .rename and std.mem.indexOfScalar(u8, names[op.other], '/') != null and std.mem.indexOfScalar(u8, names[op.name], '/') == null) continue;
+        if (builtin.os.tag == .windows and (op.kind == .sym_link or op.kind == .read_link or op.kind == .hard_link)) continue;
         const sim_result = apply(env.io, env.dir, op);
         const real_result = apply(real_io, real, op);
         operations += 1;
@@ -166,7 +241,7 @@ test "diff_fs: the simulated filesystem agrees with the real one on random opera
     operations = 0;
     mismatches = 0;
     try tardis.check(testing.allocator, body, .{
-        .iterations = 400,
+        .iterations = 2000,
         .personas = &.{host_persona},
         // The model alone: no faults, no latency.
         .faults = .{ .short_io_ppm = 0, .spurious_wakeup_ppm = 0, .io_latency_min_ns = 0, .io_latency_max_ns = 0, .datagram_loss_ppm = 0, .datagram_duplicate_ppm = 0 },

@@ -2364,7 +2364,12 @@ fn dirAccess(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, options: Dir
     try s.enter(E);
     const parent = s.dirInode(dir) catch |err| return vfsError(E, err);
     s.secVfs(.access, parent, sub_path);
-    _ = s.vfs.lookup(parent, sub_path) catch |err| return vfsError(E, err);
+    _ = s.vfs.lookup(parent, sub_path) catch |err| switch (err) {
+        // `access` has no "not a directory": std reports a path through
+        // a file as not found (differential test, `diff_fs_test.zig`).
+        error.NotDir => return error.FileNotFound,
+        else => return vfsError(E, err),
+    };
 }
 
 fn dirCreateFile(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, options: Dir.CreateFileOptions) File.OpenError!File {
