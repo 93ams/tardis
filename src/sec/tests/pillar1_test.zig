@@ -430,3 +430,18 @@ test "seam 4: a failed check writes its SARIF, located at the test's call, with 
         try std.testing.expect(@import("builtin").mode == .small or @import("builtin").mode == .fast);
     }
 }
+
+/// Writes a record whose payload really is a run of 0xAA.
+fn writesFillBytes(env: *Env) !void {
+    var record: [32]u8 = @splat(0xAA);
+    record[0] = 1;
+    try env.dir.writeFile(env.io, .{ .sub_path = "record.bin", .data = &record });
+}
+
+test "undefined fill: a program that writes 0xAA itself is a false alarm unless it says so" {
+    if (!sec.engine.safe_fill) return error.SkipZigTest;
+    try std.testing.expectError(error.SecurityViolation, tardis.check(gpa, writesFillBytes, sec.withSecurity(.{
+        .base = .{ .iterations = 5, .report = false, .shrink = false },
+    })));
+    try tardis.check(gpa, writesFillBytes, sec.withSecurity(.{ .undefined_fill_is_data = true, .base = .{ .iterations = 5 } }));
+}

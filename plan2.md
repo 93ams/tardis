@@ -8,13 +8,13 @@
 | **Package** | `tardis_sec`, in this repository under `src/sec/` as the module `tardis_sec` (`zig build test-sec`); it imports core only through `tardis`'s public API and can move to its own repository (`tardis-sec/`, §8.1) unchanged |
 | **Toolchain** | Zig `0.17.0`, the same pin as core |
 | **Status** | Design specification with a compiled SDK (§8.3) and a live content engine on core's seam (§3.7). Every claim carries one of the tags below. |
-| **Revision** | 61. Each revision's changes are in [CHANGELOG.md](CHANGELOG.md). |
+| **Revision** | 62. Each revision's changes are in [CHANGELOG.md](CHANGELOG.md). |
 
 **How to read the claims in this document.** It specifies a security layer for a simulator whose core is still being built, so every capability is tagged:
 
 | Tag | Meaning |
 |---|---|
-| **[Verified]** | Implemented in `src/sec/` (the SDK in §8.3 and the engine in §3.7), compiled with Zig 0.17.0 against the current core `tardis`, and covered by tests that pass in all four build modes (`zig build test-sec`: 119 tests: 40 in the module (11 SDK, 18 for the engine, the shadow, the race detector, the Spectre detector, race state, amplification, MC/DC, the registry, the bundle and git revisions, 4 for dead edges, 3 for the git object store, 2 that pull the files in), 13 Pillar I (3 of them for seam 4), 19 Pillar II–III and 10 Pillar IV–V simulation tests, 8 for the C shims (with C built against the header), 6 for the C tracer, 15 for shadow memory, data races and lock order (§3.8, §4.5, §4.6), 2 for Example 1, 5 for Example 2, 1 declaration check). |
+| **[Verified]** | Implemented in `src/sec/` (the SDK in §8.3 and the engine in §3.7), compiled with Zig 0.17.0 against the current core `tardis`, and covered by tests that pass in all four build modes (`zig build test-sec`: 120 tests: 40 in the module (11 SDK, 18 for the engine, the shadow, the race detector, the Spectre detector, race state, amplification, MC/DC, the registry, the bundle and git revisions, 4 for dead edges, 3 for the git object store, 2 that pull the files in), 14 Pillar I (3 of them for seam 4), 19 Pillar II–III and 10 Pillar IV–V simulation tests, 8 for the C shims (with C built against the header), 6 for the C tracer, 15 for shadow memory, data races and lock order (§3.8, §4.5, §4.6), 2 for Example 1, 5 for Example 2, 1 declaration check). |
 | **[Design]** | Fully specified here, but needs one of the core seams in §2.1 that core `tardis` does not expose yet. |
 | **[Target]** | A performance or capacity figure that is a requirement, not a measurement. |
 
@@ -411,7 +411,7 @@ Both patterns derive from the run seed, with eight distinct non-zero bytes each,
 
 **What the build mode changes.** In Debug and ReleaseSafe, `std.mem.Allocator.alloc` and `free` overwrite the bytes with `undefined` (0xAA) around the allocator call. Two consequences, both handled:
 
-- In those modes, 8 bytes of 0xAA are also an uninitialized fingerprint. This also catches stack buffers declared `undefined`, struct padding included, when 8 or more of their bytes leave.
+- In those modes, 8 bytes of 0xAA are also an uninitialized fingerprint. A program whose own data holds such a run is reported too; it sets `SecurityConfig.undefined_fill_is_data` (revision 62) and gives up this check. This also catches stack buffers declared `undefined`, struct padding included, when 8 or more of their bytes leave.
 - A secret's bytes are already 0xAA when the free hook sees them. The secret is scrubbed in that build, so there is nothing to report: CWE-226 at free fires only where the bytes survive the free (ReleaseFast, ReleaseSmall, or a direct `rawFree`). The test asserts exactly that per mode.
 
 **Limits, by construction.**

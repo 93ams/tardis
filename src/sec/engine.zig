@@ -182,7 +182,7 @@ const Region = struct {
 };
 
 /// Words in `seam.Params` (`withSecurity` fills them).
-pub const Param = enum(u4) {
+pub const Param = enum(u5) {
     glitch_ppm = 0,
     mode = 1,
     report = 2,
@@ -216,6 +216,9 @@ pub const Param = enum(u4) {
     /// data races (§4.5, bit 0), and its lock-shaped atomics for lock
     /// order (§4.6, bit 1).
     data_races = 15,
+    /// Non-zero: eight bytes of 0xAA leaving the program are not taken
+    /// for undefined memory (`SecurityConfig.undefined_fill_is_data`).
+    undefined_fill_is_data = 16,
 };
 
 pub const paths_max = 8;
@@ -407,7 +410,7 @@ pub const Engine = struct {
         e.addRotations(e.uninit, .{ .kind = .uninit, .tenant = tenant_system });
         e.addRotations(e.freed, .{ .kind = .freed, .tenant = tenant_system });
         e.addRotations(seam.redzone_period, .{ .kind = .redzone, .tenant = tenant_system });
-        if (safe_fill) e.addFingerprint(0xAAAA_AAAA_AAAA_AAAA, .{ .kind = .uninit, .tenant = tenant_system });
+        if (safe_fill and e.param(.undefined_fill_is_data) == 0) e.addFingerprint(0xAAAA_AAAA_AAAA_AAAA, .{ .kind = .uninit, .tenant = tenant_system });
     }
 
     /// Eight bytes, all distinct and non-zero, from the run seed.

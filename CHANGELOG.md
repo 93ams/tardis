@@ -5,6 +5,10 @@ numbers (§) are `plan2.md`'s unless an entry names `plan.md`. Revision 1
 was the first draft of `plan2.md`; the core's earlier history is in
 `plan.md` §9 and §14.
 
+## Revision 62 (security layer; one constant in core)
+
+`SecurityConfig.undefined_fill_is_data`: a program whose own data holds runs of 0xAA turns off the fingerprint that takes them for undefined memory (§3.7). The seam's parameter block grows from 16 words to 24.
+
 ## Revision 61 (tests and documents)
 
 A self-fuzz test of the simulator (`src/tests/self_fuzz_test.zig`, `plan3.md` A6): random programs on every persona, every run executed twice and compared, on one worker and on four, with a durability check after power loss. `SECURITY.md`, and a weekly workflow that runs the suite against Zig's development branch. Under `-Dsec` the self-fuzz programs showed a false alarm of the security layer: eight bytes of 0xAA written by a program are taken for undefined memory (`plan3.md` A7).

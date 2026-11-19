@@ -210,7 +210,7 @@ pub const fork_bytes_max = 64 * 1024;
 
 /// Configuration words the layer interprets (copied by value into every
 /// simulator, so worker threads need no shared state).
-pub const Params = [16]u64;
+pub const Params = [24]u64;
 
 /// `Options.security`: the layer and its configuration.
 pub const Security = struct {

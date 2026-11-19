@@ -827,6 +827,12 @@ pub const SecurityConfig = struct {
     /// non-zero and back, as `std.Io.Mutex` does, is a lock, and taking
     /// two of them in both orders is CWE-833.
     atomic_lock_order: bool = false,
+    /// A safe build fills undefined memory with 0xAA, so eight such bytes
+    /// leaving the program are reported as uninitialized memory (CWE-908,
+    /// §3.7). A program whose own data holds runs of 0xAA sets this, and
+    /// gives up that check: uninitialized heap bytes are then seen only
+    /// where the heap's own fill pattern survives (unsafe builds).
+    undefined_fill_is_data: bool = false,
     /// Amplification checks and steering (§6.1); off unless set, since any
     /// program allocates more than its input in absolute terms.
     amplification: ?AmplificationLimits = null,
@@ -896,6 +902,7 @@ fn paramsOf(c: SecurityConfig) tardis.sec_seam.Params {
     params[@backingInt(engine.Param.toctou_swaps)] = @as(u8, @bitCast(c.vfs_toctou_swaps));
     params[@backingInt(engine.Param.taint_paths)] = @intFromBool(c.taint_paths);
     params[@backingInt(engine.Param.shadow)] = @intFromBool(c.shadow_memory);
+    params[@backingInt(engine.Param.undefined_fill_is_data)] = @intFromBool(c.undefined_fill_is_data);
     params[@backingInt(engine.Param.data_races)] = @as(u64, @intFromBool(c.data_races)) | (@as(u64, @intFromBool(c.atomic_lock_order)) << 1);
     params[@backingInt(engine.Param.double_fetch_ppm)] = c.double_fetch_preempt_ppm;
     params[@backingInt(engine.Param.byzantine_ppm)] = c.byzantine_ppm;
