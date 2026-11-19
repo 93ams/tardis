@@ -5,6 +5,10 @@ numbers (§) are `plan2.md`'s unless an entry names `plan.md`. Revision 1
 was the first draft of `plan2.md`; the core's earlier history is in
 `plan.md` §9 and §14.
 
+## Revision 69 (documents only)
+
+`docs/qualification.md`: the core's requirements traced to their tests, its known limits, the ways a wrong pass could happen and their guards, and the configurations the suite has passed on (`plan3.md` G5).
+
 ## Revision 68 (examples only)
 
 Four more examples in the bug benchmark, twelve in all: `rename_unsynced` (renamed before the data is durable), `check_then_act`, `oom_partial` (a half-finished update when memory runs out) and `lease` (a duration measured with the wall clock).

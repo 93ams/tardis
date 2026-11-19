@@ -16,7 +16,9 @@ New here? The [tutorial](docs/tutorial.md) goes from an empty test to a found,
 shrunk and fixed bug, and [`examples/`](examples) has twelve small programs,
 each with one planted bug and its fix. [docs/stability.md](docs/stability.md)
 says what may change between releases, and what a seed is and is not
-promised to mean.
+promised to mean. [docs/qualification.md](docs/qualification.md) lists what
+the tool is required to do, the tests behind each requirement, and its
+known limits, for anyone who has to justify relying on it.
 
 The design and its status are in [plan.md](plan.md) (core) and
 [plan2.md](plan2.md) (security layer). Both say what is verified by tests and
