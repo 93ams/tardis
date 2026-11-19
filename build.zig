@@ -190,7 +190,7 @@ pub fn build(b: *std.Build) void {
     // `zig build test-examples`: each example plants one class of bug and
     // shows its fix (examples/, plan3.md C2). Part of `test`.
     const examples_step = b.step("test-examples", "Run the examples: each finds its planted bug and passes its fix");
-    for ([_][]const u8{ "examples/wal_kv.zig", "examples/counter.zig", "examples/jobs.zig", "examples/replica.zig", "examples/dir_sync.zig", "examples/deadlock.zig", "examples/short_write.zig", "examples/error_leak.zig", "examples/check_then_act.zig", "examples/rename_unsynced.zig", "examples/oom_partial.zig", "examples/lease.zig" }) |path| {
+    for ([_][]const u8{ "examples/wal_kv.zig", "examples/counter.zig", "examples/jobs.zig", "examples/replica.zig", "examples/dir_sync.zig", "examples/deadlock.zig", "examples/short_write.zig", "examples/error_leak.zig", "examples/check_then_act.zig", "examples/rename_unsynced.zig", "examples/oom_partial.zig", "examples/lease.zig", "examples/in_place_rewrite.zig", "examples/index_before_data.zig", "examples/id_reuse.zig", "examples/short_read.zig" }) |path| {
         const t = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path(path),
@@ -213,7 +213,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "tardis", .module = mod }},
     });
-    for ([_][]const u8{ "wal_kv", "counter", "jobs", "replica", "dir_sync", "deadlock", "short_write", "error_leak", "check_then_act", "rename_unsynced", "oom_partial", "lease" }) |name| {
+    for ([_][]const u8{ "wal_kv", "counter", "jobs", "replica", "dir_sync", "deadlock", "short_write", "error_leak", "check_then_act", "rename_unsynced", "oom_partial", "lease", "in_place_rewrite", "index_before_data", "id_reuse", "short_read" }) |name| {
         bugbench_mod.addImport(name, b.createModule(.{
             .root_source_file = b.path(b.fmt("examples/{s}.zig", .{name})),
             .target = target,

@@ -70,8 +70,12 @@ pub fn main(init: std.process.Init) !void {
     ok = try row(gpa, io, "wal_kv", "acknowledged before durable", @import("wal_kv")) and ok;
     ok = try row(gpa, io, "dir_sync", "missing fsync of a directory", @import("dir_sync")) and ok;
     ok = try row(gpa, io, "rename_unsynced", "renamed before the data is durable", @import("rename_unsynced")) and ok;
+    ok = try row(gpa, io, "in_place_rewrite", "a file rewritten in place", @import("in_place_rewrite")) and ok;
+    ok = try row(gpa, io, "index_before_data", "two files made durable in the wrong order", @import("index_before_data")) and ok;
+    ok = try row(gpa, io, "id_reuse", "identifier handed out twice after a restart", @import("id_reuse")) and ok;
     ok = try row(gpa, io, "jobs", "applied twice after a restart", @import("jobs")) and ok;
     ok = try row(gpa, io, "short_write", "short write taken for a whole one", @import("short_write")) and ok;
+    ok = try row(gpa, io, "short_read", "short read taken for a whole one", @import("short_read")) and ok;
     ok = try row(gpa, io, "error_leak", "resource leaked on an error path", @import("error_leak")) and ok;
     ok = try row(gpa, io, "oom_partial", "half-finished update when memory runs out", @import("oom_partial")) and ok;
     ok = try row(gpa, io, "counter", "lost update between tasks", @import("counter")) and ok;

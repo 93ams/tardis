@@ -47,7 +47,7 @@ build test`; file names are under `src/tests/` unless they say otherwise.
 | R11 | check linearizability and transactional anomalies correctly on recorded histories | `lin_test.zig`, `elle_test.zig` (histories with known verdicts) |
 | R12 | in the exhaustive search, visit every schedule within the stated depth, and with reduction or merging reach the same set of outcomes | `sec/tests/pillar45_test.zig` (the vote model: with reduction and with merging, fewer executions, the same verdicts and the same outcomes); `zig build bench` holds the counts, 9,216 and 3,073, to their recorded values |
 | R13 | never let an unsimulated `std.Io` call reach the real system | by construction: the simulator's call table starts as `std.Io.failing` (`plan.md` §11) |
-| R14 | find each bug in its benchmark of planted bugs, and pass each fix | `zig build bugbench` (twelve programs), run in CI |
+| R14 | find each bug in its benchmark of planted bugs, and pass each fix | `zig build bugbench` (sixteen programs), run in CI |
 
 Requirements R5, R6 and R7 are the ones that carry the tool's fidelity,
 and they are the least complete: see section 3.

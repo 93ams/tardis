@@ -5,6 +5,10 @@ numbers (§) are `plan2.md`'s unless an entry names `plan.md`. Revision 1
 was the first draft of `plan2.md`; the core's earlier history is in
 `plan.md` §9 and §14.
 
+## Revision 70 (examples only)
+
+Four more examples in the bug benchmark, sixteen in all: `in_place_rewrite`, `index_before_data` (two files made durable in the wrong order), `id_reuse` (an identifier handed out twice after a restart) and `short_read`.
+
 ## Revision 69 (documents only)
 
 `docs/qualification.md`: the core's requirements traced to their tests, its known limits, the ways a wrong pass could happen and their guards, and the configurations the suite has passed on (`plan3.md` G5).
