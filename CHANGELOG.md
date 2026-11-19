@@ -5,6 +5,10 @@ numbers (§) are `plan2.md`'s unless an entry names `plan.md`. Revision 1
 was the first draft of `plan2.md`; the core's earlier history is in
 `plan.md` §9 and §14.
 
+## Revision 63 (tests only)
+
+A differential test of the network model against the real loopback interface (`src/tests/diff_net_test.zig`, `plan3.md` A4): five stream scenarios, compared on bytes, end of stream and errors. No model error found; one accepted difference on Windows, where a second listener on a taken port succeeds.
+
 ## Revision 62 (security layer; one constant in core)
 
 `SecurityConfig.undefined_fill_is_data`: a program whose own data holds runs of 0xAA turns off the fingerprint that takes them for undefined memory (§3.7). The seam's parameter block grows from 16 words to 24.

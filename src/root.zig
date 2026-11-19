@@ -2496,6 +2496,7 @@ test {
     _ = @import("tests/tsc_test.zig");
     _ = @import("tests/diff_fs_test.zig");
     _ = @import("tests/self_fuzz_test.zig");
+    _ = @import("tests/diff_net_test.zig");
     _ = syscalls;
     _ = atomic;
     _ = @import("tests/fs_test.zig");
