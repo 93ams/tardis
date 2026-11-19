@@ -82,6 +82,10 @@ pub fn main(init: std.process.Init) !void {
     ok = try row(gpa, io, "check_then_act", "check, then act", @import("check_then_act")) and ok;
     ok = try row(gpa, io, "deadlock", "deadlock from lock order", @import("deadlock")) and ok;
     ok = try row(gpa, io, "lease", "a duration measured with the wall clock", @import("lease")) and ok;
+    ok = try row(gpa, io, "udp_retry", "a retry applied twice", @import("udp_retry")) and ok;
+    ok = try row(gpa, io, "udp_order", "trusting the order of arrival", @import("udp_order")) and ok;
+    ok = try row(gpa, io, "udp_no_timeout", "waiting for ever for a lost message", @import("udp_no_timeout")) and ok;
+    ok = try row(gpa, io, "stale_read", "a stale read from a follower", @import("stale_read")) and ok;
     ok = try row(gpa, io, "replica", "replica left behind by a partition", @import("replica")) and ok;
     if (!ok) {
         std.debug.print("\nbugbench: a planted bug was missed, or a fix failed\n", .{});

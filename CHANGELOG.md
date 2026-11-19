@@ -5,6 +5,10 @@ numbers (§) are `plan2.md`'s unless an entry names `plan.md`. Revision 1
 was the first draft of `plan2.md`; the core's earlier history is in
 `plan.md` §9 and §14.
 
+## Revision 71 (examples only; one open defect recorded)
+
+Four more examples in the bug benchmark, twenty in all, the first over the network besides `replica`: `udp_retry` (a retry applied twice), `udp_order` (trusting the order of arrival), `udp_no_timeout` (waiting for ever for a lost message) and `stale_read` (a stale read from a follower). Writing `udp_no_timeout` found a crash of the simulator on Windows in ReleaseFast after a deadlock with tasks waiting for datagrams; its cause is not established, the test is skipped in that configuration, and `plan.md` records what is known.
+
 ## Revision 70 (examples only)
 
 Four more examples in the bug benchmark, sixteen in all: `in_place_rewrite`, `index_before_data` (two files made durable in the wrong order), `id_reuse` (an identifier handed out twice after a restart) and `short_read`.
