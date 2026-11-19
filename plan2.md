@@ -8,7 +8,7 @@
 | **Package** | `tardis_sec`, in this repository under `src/sec/` as the module `tardis_sec` (`zig build test-sec`); it imports core only through `tardis`'s public API and can move to its own repository (`tardis-sec/`, §8.1) unchanged |
 | **Toolchain** | Zig `0.17.0`, the same pin as core |
 | **Status** | Design specification with a compiled SDK (§8.3) and a live content engine on core's seam (§3.7). Every claim carries one of the tags below. |
-| **Revision** | 57. Each revision's changes are in [CHANGELOG.md](CHANGELOG.md). |
+| **Revision** | 58. Each revision's changes are in [CHANGELOG.md](CHANGELOG.md). |
 
 **How to read the claims in this document.** It specifies a security layer for a simulator whose core is still being built, so every capability is tagged:
 
@@ -46,6 +46,8 @@ Two limits shape the whole design and are stated once here:
 ## 1. Executive Summary, Modular Seam & High-Assurance Certification Matrix
 
 ### 1.1 What `tardis_sec` is
+
+**What it is not.** `tardis_sec` is not certified, qualified or approved under DO-178C, Common Criteria, FIPS 140-3, ISO 26262 or any other standard this document names, and using it certifies nothing. It produces evidence in the shapes those standards ask for (MC/DC tables, requirement traceability, signed bundles). Whether that evidence counts is decided by the organisation that uses it and by its assessors, who would first have to qualify the tool themselves; §7.6 has notes on what that takes. The names of options such as `.certification_eal7` describe a mode of running, not a result.
 
 Core `tardis` runs a program's `std.Io` (scheduling, filesystem, network, clocks, randomness) inside a deterministic simulation, injects faults, and shrinks every failure to a replay token. `tardis_sec` adds **Layer 7**: security oracles that only a deterministic, whole-system simulator can run.
 

@@ -13,8 +13,10 @@ secret tracking, lock-order checks, Byzantine peers, constant-time checks,
 MC/DC and signed evidence bundles.
 
 New here? The [tutorial](docs/tutorial.md) goes from an empty test to a found,
-shrunk and fixed bug, and [`examples/`](examples) has three small programs,
-each with one planted bug and its fix.
+shrunk and fixed bug, and [`examples/`](examples) has four small programs,
+each with one planted bug and its fix. [docs/stability.md](docs/stability.md)
+says what may change between releases, and what a seed is and is not
+promised to mean.
 
 The design and its status are in [plan.md](plan.md) (core) and
 [plan2.md](plan2.md) (security layer). Both say what is verified by tests and
@@ -144,7 +146,10 @@ build without changing the tests. A finding fails the run with
 `error.SecurityViolation`, carries a CWE number, and shrinks and replays like
 any other failure. `sec.certify` runs a campaign that does not stop at the
 first failure and writes a signed evidence bundle (SARIF, requirement
-traceability, MC/DC, replay capsules).
+traceability, MC/DC, replay capsules). The layer is not certified or
+qualified under any standard, and using it certifies nothing: it produces
+evidence in the shapes some standards ask for, which is for your own
+assessors to judge.
 
 C code linked into a test can take part: include `src/sec/c/tardis_sec.h`
 after the system headers and export its functions from the Zig test with

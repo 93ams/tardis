@@ -4,7 +4,7 @@
 |---|---|
 | **Scope** | What has to be true before TARDIS can be recommended to people who did not write it, and before it is a better choice than the alternatives for testing Zig programs. |
 | **Relation to the other plans** | `plan.md` (core) and `plan2.md` (security layer) say what is built and verified, at revision 57. This plan is about everything else: trust, packaging, usability, reach, and proof of value. |
-| **Status** | Proposal. Nothing in it is done unless it says so (B5 and G1 are; A1, C1 and C2 say how far they got). |
+| **Status** | Proposal. Nothing in it is done unless it says so (B5, G1 and G2 are; A1, B4, C1, C2, D1 and H1 say how far they got). |
 
 ## 0. The two targets, stated so they can be checked
 
@@ -90,7 +90,7 @@ A test tool that is wrong is worse than no tool: it gives false confidence. This
 | B1 | **License.** Choose one and add the file. | P0 | `LICENSE` exists and `build.zig.zon` lists it. |
 | B2 | **Make the package fetchable.** `zig fetch --save` from a tagged release works, with no sibling checkout. | P0 | A fresh project on a clean machine builds a test from the README. |
 | B3 | **Resolve the `termancy` dependency.** The `tardis` program needs a sibling checkout today. Publish `termancy`, or split the program into its own package. | P0 | The library and the program each build from a clean clone. |
-| B4 | **Versioning and stability policy.** Semantic versions; which API is stable; a guarantee about replay tokens (a token from version N replays on N, and the release notes say when that breaks). | P0 | Written, and enforced by a golden-hash test per release. |
+| B4 | **Versioning and stability policy.** Semantic versions; which API is stable; a guarantee about replay tokens (a token from version N replays on N, and the release notes say when that breaks). **Drafted:** `docs/stability.md`, for the owner to accept or change. The golden trace hash test already exists. | P0 | Written, and enforced by a golden-hash test per release. |
 | B5 | **Changelog.** Move the revision history out of the plan headers into `CHANGELOG.md`. **Done:** `CHANGELOG.md` has 55 entries (revisions 2 to 56) and the header of `plan2.md` is one line. | P0 | Plan headers are one line; the changelog has an entry per revision. |
 | B6 | **Zig version policy.** Track the current stable Zig; say how long the previous one is supported; test against Zig's master weekly so breakage is seen early. | P1 | A scheduled CI job; a documented policy. |
 | B7 | **Release automation.** Tag, build, run the full verification, publish notes. | P1 | A release takes one command. |
@@ -103,7 +103,7 @@ The Rust libraries in §2 are the bar. A user's first hour decides whether they 
 | # | Item | Pri | Done when |
 |---|---|---|---|
 | C1 | **A tutorial.** From an empty directory to a found, shrunk and fixed bug, in one page. **Drafted:** `docs/tutorial.md`. Not yet timed with a newcomer, and its first step (`zig fetch`) waits on B2. | P0 | Someone who has never seen the project completes it in under ten minutes, timed. |
-| C2 | **An `examples/` directory.** A key-value store with a write-ahead log, a replicated log, an HTTP service: each with a planted bug and its fix. **Three single-node examples done** (`zig build test-examples`, part of `test`): `wal_kv` (acknowledged before durable), `counter` (lost update), `jobs` (applied twice after a restart). A multi-node example is still missing. | P0 | Three examples build and run in CI. |
+| C2 | **An `examples/` directory.** A key-value store with a write-ahead log, a replicated log, an HTTP service: each with a planted bug and its fix. **Four examples done** (`zig build test-examples`, part of `test`): `wal_kv` (acknowledged before durable), `counter` (lost update), `jobs` (applied twice after a restart), and `replica` on three simulated machines (a replica left behind by a partition). No HTTP service. | P0 | Three examples build and run in CI. |
 | C3 | **Split the documentation by reader.** User guide, reference, design record. The plans stay as the design record. | P1 | A new user never needs to open `plan.md`. |
 | C4 | **API reference** generated from doc comments and published. | P1 | Every public declaration has a comment; the site builds in CI. |
 | C5 | **Failure reports a newcomer can read.** Usability-test the report: what happened, in what order, which decision mattered, how to replay. | P1 | Three people unfamiliar with the project explain a report correctly. |
@@ -117,7 +117,7 @@ The Rust libraries in §2 are the bar. A user's first hour decides whether they 
 
 | # | Item | Pri | Done when |
 |---|---|---|---|
-| D1 | **Complete the `std.Io` coverage matrix** (`plan.md` §11): every entry either simulated or documented as refused, with a clear error. | P0 | No entry silently falls through to the real system. |
+| D1 | **Complete the `std.Io` coverage matrix** (`plan.md` §11): every entry either simulated or documented as refused, with a clear error. **Holds by construction:** the simulator's table starts as `std.Io.failing`'s, so an entry it does not fill fails and never reaches the real system. Still to do: the error is std's own, and does not say that TARDIS refused the call or which one. | P0 | No entry silently falls through to the real system. |
 | D2 | **aarch64.** The fiber switch for aarch64 is written and has never run. Run it on Apple Silicon and on aarch64 Linux, and fix what breaks. | P0 | The suite passes on a macOS runner and an aarch64 Linux runner. |
 | D3 | **Fail loudly on escape.** Make the stray-system-call trap available on more targets, and default it on in CI presets where it exists. | P1 | A run that leaves the simulation fails by default on Linux. |
 | D4 | **Child processes.** A model for `std.process` spawn: simulated programs registered by the test. | P1 | A program that shells out can be tested. |
@@ -154,7 +154,7 @@ This is the workstream that turns "better" from a claim into a number.
 | # | Item | Pri | Done when |
 |---|---|---|---|
 | G1 | **Close the documented gaps in the new detectors**: message causality in the race detector, the shrink-in-place label in shadow memory, hold-across-yield for `std.Io.Mutex`. **Done in revision 57**, the last by deciding against it: an `std.Io.Mutex` is meant to be held across I/O. | P1 | The limits lists in `plan2.md` §3.8, §4.5 and §4.6 are shorter. |
-| G2 | **Be precise about certification.** The layer produces evidence in the shape standards ask for (MC/DC, traceability, signed bundles). It is not a qualified tool. Say so in the first paragraph, and list what a real qualification would need. | P0 | No reader can come away thinking the tool is certified. |
+| G2 | **Be precise about certification.** The layer produces evidence in the shape standards ask for (MC/DC, traceability, signed bundles). It is not a qualified tool. Say so in the first paragraph, and list what a real qualification would need. **Done:** the first paragraph of `plan2.md` §1.1 and the README's section on the layer say it; §7.6 has the notes. | P0 | No reader can come away thinking the tool is certified. |
 | G3 | **Make the layer optional in the user's mind.** A user of the core should not have to learn it. | P1 | The tutorial does not mention it; a separate guide does. |
 | G4 | **An independent look at the evidence format** by someone who works with one of the standards it names. | P2 | Feedback incorporated. |
 
@@ -162,7 +162,7 @@ This is the workstream that turns "better" from a claim into a number.
 
 | # | Item | Pri | Done when |
 |---|---|---|---|
-| H1 | **Contribution guide, issue templates, code of conduct.** | P1 | Present. |
+| H1 | **Contribution guide, issue templates, code of conduct.** **Guide done** (`CONTRIBUTING.md`); templates and a code of conduct are not. | P1 | Present. |
 | H2 | **A second maintainer**, or at least a second reviewer. One author is the largest risk to anyone depending on this. | P1 | Someone else has merged a change. |
 | H3 | **Housekeeping.** The build cache reached 59 GB during development; document cleaning it, and keep CI caches bounded. | P1 | Documented. |
 | H4 | **A public roadmap** derived from this plan. | P2 | Issues exist for every P0 and P1 item. |

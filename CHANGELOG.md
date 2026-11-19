@@ -5,6 +5,10 @@ numbers (§) are `plan2.md`'s unless an entry names `plan.md`. Revision 1
 was the first draft of `plan2.md`; the core's earlier history is in
 `plan.md` §9 and §14.
 
+## Revision 58 (examples and documents)
+
+A fourth example, `replica`: three simulated machines, and a replica left behind by a partition. `docs/stability.md` (what may change between releases, and what a seed is promised to mean), `CONTRIBUTING.md`, and a plain statement at the top of `plan2.md` §1.1 and in the README that the security layer is not certified or qualified under any standard.
+
 ## Revision 57
 
 An adversarial review of revisions 52 to 56 and its fixes: the virtual counter's fault handler is installed once however many workers start, looks at the faulting instruction only for the kind of fault `rdtsc` raises, and cannot recurse; the race detector keeps each access's node with the access, so a reused task slot no longer moves old accesses to another node; a copy or fill of no bytes is not an access; `tardis.sim`'s loop form ends the security layer's run. The race detector takes a read from a file or a socket as coming after earlier writes by the same node's tasks (§4.5), and a block shrunk in place has its guard at the new end in the shadow (§3.8). Three examples with planted bugs and fixes (`examples/`, `zig build test-examples`), a tutorial (`docs/tutorial.md`), and `plan3.md`, the plan for getting to a release. The evidence workflow uploads each bundle's SARIF under its own category. The revision history moved from the header of `plan2.md` to this file.

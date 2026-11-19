@@ -190,7 +190,7 @@ pub fn build(b: *std.Build) void {
     // `zig build test-examples`: each example plants one class of bug and
     // shows its fix (examples/, plan3.md C2). Part of `test`.
     const examples_step = b.step("test-examples", "Run the examples: each finds its planted bug and passes its fix");
-    for ([_][]const u8{ "examples/wal_kv.zig", "examples/counter.zig", "examples/jobs.zig" }) |path| {
+    for ([_][]const u8{ "examples/wal_kv.zig", "examples/counter.zig", "examples/jobs.zig", "examples/replica.zig" }) |path| {
         const t = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path(path),
