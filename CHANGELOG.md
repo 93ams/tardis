@@ -5,6 +5,10 @@ numbers (§) are `plan2.md`'s unless an entry names `plan.md`. Revision 1
 was the first draft of `plan2.md`; the core's earlier history is in
 `plan.md` §9 and §14.
 
+## Revision 68 (examples only)
+
+Four more examples in the bug benchmark, twelve in all: `rename_unsynced` (renamed before the data is durable), `check_then_act`, `oom_partial` (a half-finished update when memory runs out) and `lease` (a duration measured with the wall clock).
+
 ## Revision 67 (examples only)
 
 Four more examples in the bug benchmark: `dir_sync` (a missing fsync of a directory), `deadlock` (lock order), `short_write` (a short write taken for a whole one) and `error_leak` (a handle leaked on an error path). An example can name its own campaign options.

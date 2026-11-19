@@ -13,7 +13,7 @@ secret tracking, lock-order checks, Byzantine peers, constant-time checks,
 MC/DC and signed evidence bundles.
 
 New here? The [tutorial](docs/tutorial.md) goes from an empty test to a found,
-shrunk and fixed bug, and [`examples/`](examples) has eight small programs,
+shrunk and fixed bug, and [`examples/`](examples) has twelve small programs,
 each with one planted bug and its fix. [docs/stability.md](docs/stability.md)
 says what may change between releases, and what a seed is and is not
 promised to mean.

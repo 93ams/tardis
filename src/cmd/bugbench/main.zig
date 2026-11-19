@@ -69,11 +69,15 @@ pub fn main(init: std.process.Init) !void {
     var ok = true;
     ok = try row(gpa, io, "wal_kv", "acknowledged before durable", @import("wal_kv")) and ok;
     ok = try row(gpa, io, "dir_sync", "missing fsync of a directory", @import("dir_sync")) and ok;
+    ok = try row(gpa, io, "rename_unsynced", "renamed before the data is durable", @import("rename_unsynced")) and ok;
     ok = try row(gpa, io, "jobs", "applied twice after a restart", @import("jobs")) and ok;
     ok = try row(gpa, io, "short_write", "short write taken for a whole one", @import("short_write")) and ok;
     ok = try row(gpa, io, "error_leak", "resource leaked on an error path", @import("error_leak")) and ok;
+    ok = try row(gpa, io, "oom_partial", "half-finished update when memory runs out", @import("oom_partial")) and ok;
     ok = try row(gpa, io, "counter", "lost update between tasks", @import("counter")) and ok;
+    ok = try row(gpa, io, "check_then_act", "check, then act", @import("check_then_act")) and ok;
     ok = try row(gpa, io, "deadlock", "deadlock from lock order", @import("deadlock")) and ok;
+    ok = try row(gpa, io, "lease", "a duration measured with the wall clock", @import("lease")) and ok;
     ok = try row(gpa, io, "replica", "replica left behind by a partition", @import("replica")) and ok;
     if (!ok) {
         std.debug.print("\nbugbench: a planted bug was missed, or a fix failed\n", .{});
