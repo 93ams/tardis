@@ -141,7 +141,7 @@ The Rust libraries in §2 are the bar. A user's first hour decides whether they 
 
 | # | Item | Pri | Done when |
 |---|---|---|---|
-| E1 | **Benchmarks in CI with regression thresholds.** The benchmarks exist; nothing guards them. | P1 | A change that slows an empty run by 10% fails a check. |
+| E1 | **Benchmarks in CI with regression thresholds.** The benchmarks exist; nothing guards them. **Done, unrun in CI** (revision 64): `scripts/bench_check.py` reads `zig build bench` and `scripts/bench_budgets.txt`. Five numbers that follow from the seed alone (executions explored, what a failure shrinks to, the iteration that finds a bug) must match exactly; five timings must stay under about ten times a developer machine's figure, so a shared runner passes and an order-of-magnitude slowdown does not. A 10% slowdown is not caught: shared runners vary by more than that. | P1 | A change that slows an empty run by 10% fails a check. |
 | E2 | **Multi-core scaling.** Eight workers give about 1.15 times eight processes' throughput today; find what is shared. | P1 | Near-linear to the core count on a 16-core machine. |
 | E3 | **Memory per simulator.** Measure and document; make the large tables lazy (the shadow is 8 MiB, the race detector 2 MiB). | P1 | A table of memory by option. |
 | E4 | **Long campaigns.** Corpus persistence between runs, resumable campaigns, nightly budget control. | P1 | A nightly job continues where the last one stopped. |

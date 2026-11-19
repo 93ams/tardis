@@ -43,3 +43,9 @@ jobs:
       - name: Tests, optimized
         working-directory: tardis
         run: zig build test -Doptimize=ReleaseSafe --summary all
+      # Numbers that follow from the seed must not move; timings must stay
+      # within a generous budget (scripts/bench_budgets.txt).
+      - name: Benchmarks against their budgets
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: tardis
+        run: zig build bench 2>&1 | python3 scripts/bench_check.py

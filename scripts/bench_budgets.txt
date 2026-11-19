@@ -1,0 +1,17 @@
+# Budgets for scripts/bench_check.py: kind | regular expression with one group | value
+#
+# exact: must equal the value. These follow from the seed alone, on every
+# machine. Change one only together with the change that explains it.
+exact | torn rename \(find \+ shrink\)\s+(\d+ -> \d+ decisions, \d+ runs) | 42 -> 3 decisions, 58 runs
+exact | every order\s+(\d+) executions | 9216
+exact | reduce\s+(\d+) executions | 3073
+exact | reduce and merge\s+(\d+) executions | 3073
+exact | open the lock\s+workers=1\s+found at iteration (\d+) | 6117
+
+# under: nanoseconds, at most the value. About ten times what a developer
+# machine measured at revision 64 (685, 2386, 97, 3037, 5516).
+under | empty body\s+workers=1\s+\d+ runs/s\s+(\d+) ns/run | 7000
+under | file: write\+sync\+read\+power loss\s+workers=1\s+\d+ runs/s\s+(\d+) ns/run | 25000
+under | scheduler: 2 tasks x 1000 sleeps\s+workers=1\s+\d+ runs/s\s+(\d+) ns/sleep | 1000
+under | net: loopback echo\s+workers=1\s+\d+ runs/s\s+(\d+) ns/run | 30000
+under | every order\s+\d+ executions,\s+\d+ ms,\s+(\d+) ns/execution | 60000
