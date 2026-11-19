@@ -160,8 +160,51 @@ pub fn initContext(stack: []align(16) u8, entry: *const fn () callconv(.naked) n
 pub fn switchTo(old: *Context, new: *Context, new_bounds: Bounds) void {
     setBounds(new_bounds);
     var s: sf.Switch = .{ .old = old, .new = new };
+    if (!win64_vector_registers) {
+        _ = sf.contextSwitch(&s);
+        return;
+    }
+    // On 64-bit Windows a callee must preserve xmm6 to xmm15. The switch
+    // names them as clobbered, which keeps this function from relying on
+    // them, but the compiler does not save them for the caller: an
+    // optimized caller that kept a value there across a call that
+    // switches fibers got back what another fiber left (found as a crash
+    // in ReleaseFast, plan.md "Open items", revision 72). So they are
+    // saved here, on this fiber's stack, and put back when it resumes.
+    var saved: [10][16]u8 align(16) = undefined;
+    asm volatile (
+        \\ movups %%xmm6, 0(%[p])
+        \\ movups %%xmm7, 16(%[p])
+        \\ movups %%xmm8, 32(%[p])
+        \\ movups %%xmm9, 48(%[p])
+        \\ movups %%xmm10, 64(%[p])
+        \\ movups %%xmm11, 80(%[p])
+        \\ movups %%xmm12, 96(%[p])
+        \\ movups %%xmm13, 112(%[p])
+        \\ movups %%xmm14, 128(%[p])
+        \\ movups %%xmm15, 144(%[p])
+        :
+        : [p] "r" (&saved),
+        : .{ .memory = true });
     _ = sf.contextSwitch(&s);
+    asm volatile (
+        \\ movups 0(%[p]), %%xmm6
+        \\ movups 16(%[p]), %%xmm7
+        \\ movups 32(%[p]), %%xmm8
+        \\ movups 48(%[p]), %%xmm9
+        \\ movups 64(%[p]), %%xmm10
+        \\ movups 80(%[p]), %%xmm11
+        \\ movups 96(%[p]), %%xmm12
+        \\ movups 112(%[p]), %%xmm13
+        \\ movups 128(%[p]), %%xmm14
+        \\ movups 144(%[p]), %%xmm15
+        :
+        : [p] "r" (&saved),
+        : .{ .memory = true });
 }
+
+/// Whether `switchTo` must carry the vector registers a callee preserves.
+const win64_vector_registers = is_windows and builtin.cpu.arch == .x86_64;
 
 pub fn boundsOf(stack: []u8) Bounds {
     return .{ .base = @intFromPtr(stack.ptr) + stack.len, .limit = @intFromPtr(stack.ptr) };
@@ -245,6 +288,61 @@ test "each fiber stack has an inaccessible guard page below it" {
         },
         else => {},
     }
+}
+
+/// A fiber that leaves all ones in the vector registers a Win64 callee
+/// must preserve, then switches back.
+fn testClobberMain() callconv(.c) noreturn {
+    while (true) {
+        if (win64_vector_registers) asm volatile (
+            \\ pcmpeqd %%xmm6, %%xmm6
+            \\ pcmpeqd %%xmm7, %%xmm7
+            \\ pcmpeqd %%xmm8, %%xmm8
+            \\ pcmpeqd %%xmm9, %%xmm9
+            \\ pcmpeqd %%xmm10, %%xmm10
+            \\ pcmpeqd %%xmm11, %%xmm11
+            \\ pcmpeqd %%xmm12, %%xmm12
+            \\ pcmpeqd %%xmm13, %%xmm13
+            \\ pcmpeqd %%xmm14, %%xmm14
+            \\ pcmpeqd %%xmm15, %%xmm15
+            ::: .{ .xmm6 = true, .xmm7 = true, .xmm8 = true, .xmm9 = true, .xmm10 = true, .xmm11 = true, .xmm12 = true, .xmm13 = true, .xmm14 = true, .xmm15 = true });
+        switchTo(&test_fiber, &test_main, test_main_bounds);
+    }
+}
+
+test "a switch keeps the vector registers a Win64 callee must preserve" {
+    if (!win64_vector_registers) return error.SkipZigTest;
+    test_stack = try std.testing.allocator.alignedAlloc(u8, .@"16", 128 * 1024);
+    defer std.testing.allocator.free(test_stack);
+    test_main_bounds = currentBounds();
+    test_fiber = initContext(test_stack, Trampoline(&testClobberMain).entry);
+    // Zero in xmm6 and xmm15, another fiber that fills them with ones, and
+    // what they hold when this one resumes. One piece of assembly, so the
+    // compiler keeps nothing of its own in them meanwhile.
+    var before: [2]u64 = undefined;
+    var after: [2]u64 = undefined;
+    const Call = struct {
+        fn go() callconv(.c) void {
+            switchTo(&test_main, &test_fiber, boundsOf(test_stack));
+        }
+    };
+    asm volatile (
+        \\ pxor %%xmm6, %%xmm6
+        \\ pxor %%xmm15, %%xmm15
+        \\ movq %%xmm6, 0(%[b])
+        \\ movq %%xmm15, 8(%[b])
+        \\ subq $32, %%rsp
+        \\ callq *%[f]
+        \\ addq $32, %%rsp
+        \\ movq %%xmm6, 0(%[a])
+        \\ movq %%xmm15, 8(%[a])
+        :
+        : [b] "{rbx}" (&before),
+          [a] "{rsi}" (&after),
+          [f] "{rdi}" (&Call.go),
+        : .{ .rax = true, .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .xmm0 = true, .xmm1 = true, .xmm2 = true, .xmm3 = true, .xmm4 = true, .xmm5 = true, .xmm6 = true, .xmm15 = true, .memory = true });
+    try std.testing.expectEqual([2]u64{ 0, 0 }, before);
+    try std.testing.expectEqual([2]u64{ 0, 0 }, after);
 }
 
 test "fiber round trips" {

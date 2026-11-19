@@ -96,10 +96,11 @@ ran, no run broke a property the test stated. It does not mean more.
 
 **Known defects and oddities**
 
-- On Windows in ReleaseFast, a run that ends in a deadlock with tasks
-  waiting for datagrams is followed by a crash in a later run of the same
-  process. The cause is not established (`plan.md`, Open items). Other
-  build modes and Linux are not affected, as far as is known.
+- Until revision 72 a fiber switch on 64-bit Windows did not preserve the
+  vector registers a callee must (`xmm6` to `xmm15`), which could corrupt
+  values an optimized build kept in them. It was seen as a crash in
+  ReleaseFast; results from earlier revisions on Windows in an optimized
+  build deserve a re-run.
 - With the security layer attached, a program that writes eight or more
   bytes of 0xAA is reported as leaking undefined memory in safe builds
   (`SecurityConfig.undefined_fill_is_data` turns the check off).

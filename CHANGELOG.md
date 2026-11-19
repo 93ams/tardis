@@ -5,6 +5,10 @@ numbers (§) are `plan2.md`'s unless an entry names `plan.md`. Revision 1
 was the first draft of `plan2.md`; the core's earlier history is in
 `plan.md` §9 and §14.
 
+## Revision 72 (core only)
+
+The defect recorded in revision 71 is found and fixed: on 64-bit Windows a fiber switch did not preserve `xmm6` to `xmm15`, which a callee must. `std.Io.fiber.contextSwitch` names them as clobbered, and the compiler does not save them for the caller, so a value an optimized caller kept in one came back as another fiber's. `fiber.switchTo` saves and restores them; a test fills them from another fiber and fails without the fix. The skipped example test runs again.
+
 ## Revision 71 (examples only; one open defect recorded)
 
 Four more examples in the bug benchmark, twenty in all, the first over the network besides `replica`: `udp_retry` (a retry applied twice), `udp_order` (trusting the order of arrival), `udp_no_timeout` (waiting for ever for a lost message) and `stale_read` (a stale read from a follower). Writing `udp_no_timeout` found a crash of the simulator on Windows in ReleaseFast after a deadlock with tasks waiting for datagrams; its cause is not established, the test is skipped in that configuration, and `plan.md` records what is known.

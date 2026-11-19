@@ -92,10 +92,6 @@ pub fn fixed(env: *Env) !void {
 }
 
 test "udp_no_timeout: a lost datagram leaves the client waiting for ever" {
-    // An open defect of the simulator (plan.md, Open items): on Windows in
-    // ReleaseFast, a run that ends in a deadlock with tasks waiting for
-    // datagrams is followed by a crash in a later run of the same process.
-    if (@import("builtin").os.tag == .windows and @import("builtin").mode == .fast) return error.SkipZigTest;
     var o = options;
     o.report = false;
     try std.testing.expectError(error.Deadlock, tardis.check(std.testing.allocator, buggy, o));
