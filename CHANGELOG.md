@@ -5,6 +5,10 @@ numbers (§) are `plan2.md`'s unless an entry names `plan.md`. Revision 1
 was the first draft of `plan2.md`; the core's earlier history is in
 `plan.md` §9 and §14.
 
+## Revision 73 (documents and CI)
+
+The licence: BSD Zero Clause (0BSD). A draft report of the Windows register problem for the Zig project, unsent (`docs/disclosures/`). The test workflow publishes its failing lines as annotations; the campaign workflow's inputs are simplified after GitHub rejected the file. The plans record the first CI results on the current code: the evidence workflow and the Ubuntu tests pass, Windows and macOS fail in the test step.
+
 ## Revision 72 (core only)
 
 The defect recorded in revision 71 is found and fixed: on 64-bit Windows a fiber switch did not preserve `xmm6` to `xmm15`, which a callee must. `std.Io.fiber.contextSwitch` names them as clobbered, and the compiler does not save them for the caller, so a value an optimized caller kept in one came back as another fiber's. `fiber.switchTo` saves and restores them; a test fills them from another fiber and fails without the fix. The skipped example test runs again.

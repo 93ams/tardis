@@ -27,7 +27,8 @@ on:
   workflow_dispatch:
     inputs:
       scale:
-        description: Multiply every check's iterations by this
+        description: Multiply the iterations of every check by this
+        type: string
         default: "20"
   workflow_call:
     inputs:
@@ -39,9 +40,10 @@ on:
         description: Multiply every check's iterations by this
         type: string
         default: "20"
-      zig-version:
+      zig_version:
+        description: The Zig release to build with
         type: string
-        default: 0.17.0
+        default: "0.17.0"
 
 permissions:
   contents: read
@@ -78,7 +80,7 @@ jobs:
           path: termancy
       - uses: mlugg/setup-zig@v2
         with:
-          version: ${{ inputs.zig-version || '0.17.0' }}
+          version: ${{ inputs.zig_version || '0.17.0' }}
       - name: Campaign
         working-directory: project
         run: |

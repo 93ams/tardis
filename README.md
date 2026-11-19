@@ -25,6 +25,10 @@ The design and its status are in [plan.md](plan.md) (core) and
 what is not. [CHANGELOG.md](CHANGELOG.md) lists what each revision changed,
 and [plan3.md](plan3.md) is the proposal for getting to a release.
 
+## Licence
+
+[0BSD](LICENSE): do anything with it, no conditions.
+
 ## Requirements
 
 - Zig 0.17.

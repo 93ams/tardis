@@ -36,13 +36,31 @@ jobs:
         run: zig fmt --check src build.zig
       - name: Tests
         working-directory: tardis
-        run: zig build test --summary all
+        shell: bash
+        run: |
+          set -o pipefail
+          zig build test --summary all 2>&1 | tee test.log
       - name: Tests with the security layer on every check
         working-directory: tardis
-        run: zig build test -Dsec --summary all
+        shell: bash
+        run: |
+          set -o pipefail
+          zig build test -Dsec --summary all 2>&1 | tee test.log
       - name: Tests, optimized
         working-directory: tardis
-        run: zig build test -Doptimize=ReleaseSafe --summary all
+        shell: bash
+        run: |
+          set -o pipefail
+          zig build test -Doptimize=ReleaseSafe --summary all 2>&1 | tee test.log
+      # The log needs an account to read; annotations do not.
+      - name: Name the failures
+        if: failure()
+        working-directory: tardis
+        shell: bash
+        run: |
+          grep -aE "^error: '|tardis: (FAILED|always|error\.)|diff_(fs|net): |panic|Segmentation|expected .*, found|error: .*\.zig:" test.log | head -10 | while IFS= read -r line; do
+            echo "::error::${line:0:300}"
+          done
       # Numbers that follow from the seed must not move; timings must stay
       # within a generous budget (scripts/bench_budgets.txt).
       # Every planted bug found, every fix passing (plan3.md F1).

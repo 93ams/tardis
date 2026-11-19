@@ -74,7 +74,7 @@ A test tool that is wrong is worse than no tool: it gives false confidence. This
 
 | # | Item | Pri | Done when |
 |---|---|---|---|
-| A1 | **Run the suite on every supported platform in CI.** Push; fix what the first macOS run breaks. **First runs done** (commit `890863f`): the evidence workflow's own steps passed and its SARIF upload failed (two bundles under one category; fixed, unrun). The test workflow failed on all three systems, and a local reproduction of the CI checkout shows why: the published `termancy` `master` lacked a durability fix that existed only locally, and the termancy suite found the bug. Whether macOS and Linux have failures beyond that is unknown until a run with the fix. | P0 | `test.yml` and `evidence.yml` are green on Linux, macOS and Windows for a week of commits. |
+| A1 | **Run the suite on every supported platform in CI.** Push; fix what the first macOS run breaks. **Partly green** (commit `e66ee33`, after `termancy`'s fix was published): the evidence workflow passes end to end, uploads included, which closes that open item of `plan.md`; the test workflow passes on Ubuntu, with the bug benchmark and the benchmark budgets. It fails in the test step on Windows and on macOS, for reasons not yet read: the logs need an account, so from revision 73 the workflow publishes the failing lines as annotations. The campaign workflow was rejected as invalid when pushed; its inputs are simplified, cause unconfirmed. The first macOS run has therefore happened, and failed. | P0 | `test.yml` and `evidence.yml` are green on Linux, macOS and Windows for a week of commits. |
 | A2 | **Differential tests of the filesystem model.** Run the same operation sequences against the simulated filesystem (no faults) and the real one, and compare results and errors. **Revisions 59 and 60** (`src/tests/diff_fs_test.zig`, part of `zig build test`): 2,000 random sequences of 32 operations over seven paths, on the host's persona: write, read, delete, make and delete a directory, rename, stat, write and read at an offset and set the length through an open handle, exclusive create, access, and on POSIX hosts hard links, symbolic links and reading a link. It found eight errors in the model, all fixed:
 
   1. NTFS reports a path through a regular file as not found; the model said not a directory.
@@ -98,9 +98,9 @@ A test tool that is wrong is worse than no tool: it gives false confidence. This
 
 | # | Item | Pri | Done when |
 |---|---|---|---|
-| B1 | **License.** Choose one and add the file. | P0 | `LICENSE` exists and `build.zig.zon` lists it. |
+| B1 | **License.** Choose one and add the file. **Done** (revision 73): the BSD Zero Clause License (0BSD), the most permissive of the common ones: no conditions, not even attribution. | P0 | `LICENSE` exists and `build.zig.zon` lists it. |
 | B2 | **Make the package fetchable.** `zig fetch --save` from a tagged release works, with no sibling checkout. | P0 | A fresh project on a clean machine builds a test from the README. |
-| B3 | **Resolve the `termancy` dependency.** The `tardis` program needs a sibling checkout today. Publish `termancy`, or split the program into its own package. | P0 | The library and the program each build from a clean clone. |
+| B3 | **Resolve the `termancy` dependency.** The `tardis` program needs a sibling checkout today. Publish `termancy`, or split the program into its own package. **In progress** (revision 73): the decision is to fetch `termancy` from GitHub at a pinned commit. It cannot be done yet: `termancy`'s build script opens a `docs/` directory that its package does not ship, so a fetched copy fails to configure. The fix exists on a `termancy` branch and is being merged there; the pin follows. | P0 | The library and the program each build from a clean clone. |
 | B4 | **Versioning and stability policy.** Semantic versions; which API is stable; a guarantee about replay tokens (a token from version N replays on N, and the release notes say when that breaks). **Drafted:** `docs/stability.md`, for the owner to accept or change. The golden trace hash test already exists. | P0 | Written, and enforced by a golden-hash test per release. |
 | B5 | **Changelog.** Move the revision history out of the plan headers into `CHANGELOG.md`. **Done:** `CHANGELOG.md` has 55 entries (revisions 2 to 56) and the header of `plan2.md` is one line. | P0 | Plan headers are one line; the changelog has an entry per revision. |
 | B6 | **Zig version policy.** Track the current stable Zig; say how long the previous one is supported; test against Zig's master weekly so breakage is seen early. **Done, unrun:** the policy is in `docs/stability.md`, the weekly job is `.github/workflows/zig-master.yml`. | P1 | A scheduled CI job; a documented policy. |
@@ -174,7 +174,7 @@ This is the workstream that turns "better" from a claim into a number.
 | # | Item | Pri | Done when |
 |---|---|---|---|
 | H1 | **Contribution guide, issue templates, code of conduct.** **Guide done** (`CONTRIBUTING.md`); templates and a code of conduct are not. | P1 | Present. |
-| H2 | **A second maintainer**, or at least a second reviewer. One author is the largest risk to anyone depending on this. | P1 | Someone else has merged a change. |
+| H2 | **A second maintainer**, or at least a second reviewer. One author is the largest risk to anyone depending on this. **Not available** (owner, 2026-11-19): there is one maintainer. The risk stands and is the owner's to carry; the periodic adversarial reviews (revision 57 onward) are the substitute for a second reviewer. | P1 | Someone else has merged a change. |
 | H3 | **Housekeeping.** The build cache reached 59 GB during development; document cleaning it, and keep CI caches bounded. | P1 | Documented. |
 | H4 | **A public roadmap** derived from this plan. | P2 | Issues exist for every P0 and P1 item. |
 
