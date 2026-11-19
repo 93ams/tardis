@@ -5,6 +5,10 @@ numbers (§) are `plan2.md`'s unless an entry names `plan.md`. Revision 1
 was the first draft of `plan2.md`; the core's earlier history is in
 `plan.md` §9 and §14.
 
+## Revision 61 (tests and documents)
+
+A self-fuzz test of the simulator (`src/tests/self_fuzz_test.zig`, `plan3.md` A6): random programs on every persona, every run executed twice and compared, on one worker and on four, with a durability check after power loss. `SECURITY.md`, and a weekly workflow that runs the suite against Zig's development branch. Under `-Dsec` the self-fuzz programs showed a false alarm of the security layer: eight bytes of 0xAA written by a program are taken for undefined memory (`plan3.md` A7).
+
 ## Revision 60 (core only)
 
 The differential test of the filesystem model covers open handles (writes and reads at an offset, setting the length), exclusive create, `access`, and on POSIX hosts hard and symbolic links, over 2,000 sequences. Six more model errors found and fixed: an exclusive create onto a directory on NTFS, the order of a hard link's checks, creating a file through a dangling symbolic link, a directory renamed onto a symbolic link, a symbolic link renamed onto a directory, and a rename between two names of one file; and `access` on a path through a file now reports not found, as std does (`plan3.md` A2).
