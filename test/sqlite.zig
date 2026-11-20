@@ -28,6 +28,14 @@
 //! it, or the same seed gives two different runs, which `check` reports as
 //! `error.NonDeterministic`: so the program resets the generator first.
 //!
+//! The fourth test drives SQLite from two tasks at once, each with its own
+//! database. SQLite holds process-wide mutexes across file calls (its
+//! Unix VFS holds one across the `open` and `fstat` that find a file's
+//! inode), and an emulated call can let the other task run: the other
+//! task's wait for that mutex is a `futex` call, which system-call mode
+//! answers in the simulation (revision 76). Before, it was a real wait on
+//! the one thread every fiber shares, and the run hung.
+//!
 //! Run with `zig build test-sqlite -Dsqlite` on Linux x86_64.
 
 const std = @import("std");
@@ -46,8 +54,12 @@ extern fn sqlite3_exec(db: ?*Db, sql: [*:0]const u8, callback: ?Callback, ctx: ?
 extern fn sqlite3_randomness(len: c_int, buf: ?*anyopaque) void;
 
 fn open() !*Db {
+    return openPath("app.db");
+}
+
+fn openPath(path: [*:0]const u8) !*Db {
     var db: ?*Db = null;
-    if (sqlite3_open("app.db", &db) != 0) {
+    if (sqlite3_open(path, &db) != 0) {
         _ = sqlite3_close(db);
         return error.SqliteOpenFailed;
     }
@@ -194,4 +206,32 @@ test "sqlite: with synchronous=FULL, the default, a lost unlink of the journal r
     var kind = options;
     kind.faults.metadata_loss = false;
     try tardis.check(testing.allocator, syncFull, kind);
+}
+
+/// One task's database: created, written and read back while the other
+/// task does the same to its own.
+fn ownDatabase(path: [*:0]const u8) !void {
+    const db = try openPath(path);
+    defer _ = sqlite3_close(db);
+    try exec(db, "CREATE TABLE kv(k INTEGER PRIMARY KEY, v TEXT)");
+    try exec(db, "INSERT INTO kv VALUES(1, 'one')");
+    try exec(db, "INSERT INTO kv VALUES(2, 'two')");
+    const n = try query(db, "SELECT count(*) FROM kv");
+    try testing.expectEqualStrings("2", n.text());
+}
+
+fn ownDatabaseTask(path: [*:0]const u8) void {
+    ownDatabase(path) catch @panic("the second task's database failed");
+}
+
+fn twoTasks(env: *Env) !void {
+    sqlite3_randomness(0, null);
+    var other = try env.io.concurrent(ownDatabaseTask, .{"b.db"});
+    try ownDatabase("a.db");
+    other.await(env.io);
+}
+
+test "sqlite: two tasks, two databases, SQLite's own mutexes between them" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try tardis.check(testing.allocator, twoTasks, options);
 }

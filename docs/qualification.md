@@ -66,9 +66,11 @@ ran, no run broke a property the test stated. It does not mean more.
   `Options.mode = .syscalls` (revision 75) answers the file, clock, sleep
   and random-byte calls from the simulation; on other platforms nothing
   does either.
-- In system-call mode: a C library that holds a pthread mutex across a
-  file or sleep call, driven from more than one task, can hang the run
-  (every task shares one thread). Use C libraries from one task only.
+- In system-call mode: every task shares one thread, so a recursive
+  mutex (owned by the thread) does not exclude a second task. Do not share
+  an object behind a recursive lock (a SQLite connection) between tasks.
+  A crash or the end of a run that drops a task holding a C library's
+  mutex leaves it held, into the next run (C statics are the process's).
 - In system-call mode: a clock read that libc answers through the vDSO
   (`time`, `gettimeofday`, `clock_gettime`) is not a system call, returns
   the host's time, and is not reported. Sockets, pipes, `mmap` of a file,

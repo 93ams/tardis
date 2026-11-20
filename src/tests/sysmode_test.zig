@@ -359,6 +359,100 @@ fn randomBytes(env: *Env) !void {
     try testing.expectEqual(@as(usize, drawn.len), linux.getrandom(&drawn, drawn.len, 0));
 }
 
+/// A lock as a C library builds one (Drepper's three-state mutex): an
+/// atomic fast path, and `futex` system calls only when contended.
+const CLock = struct {
+    state: u32 = 0, // 0 free, 1 held, 2 held with waiters
+
+    fn lock(l: *CLock) void {
+        if (@cmpxchgStrong(u32, &l.state, 0, 1, .acquire, .monotonic) == null) return;
+        while (@atomicRmw(u32, &l.state, .Xchg, 2, .acquire) != 0) {
+            const rc = sys(.futex, @intFromPtr(&l.state), 128, 2, 0); // FUTEX_WAIT_PRIVATE
+            if (rc == 0) clock_waits += 1;
+        }
+    }
+
+    fn unlock(l: *CLock) void {
+        if (@atomicRmw(u32, &l.state, .Xchg, 0, .release) == 2)
+            _ = sys(.futex, @intFromPtr(&l.state), 129, 1, 0); // FUTEX_WAKE_PRIVATE
+    }
+};
+
+threadlocal var clock_waits: u32 = 0;
+threadlocal var guarded: u32 = 0;
+var c_lock: CLock = .{};
+
+/// Holds the lock across emulated file calls, each of which may let the
+/// other task run, and checks nobody else got in meanwhile.
+fn lockedAppend(name: [*:0]const u8) !void {
+    for (0..3) |_| {
+        c_lock.lock();
+        defer c_lock.unlock();
+        const before = guarded;
+        const fd = try open(name, o_creat | o_wronly | o_append);
+        _ = sys(.write, fd, @intFromPtr("x"), 1, 0);
+        _ = sys(.fsync, fd, 0, 0, 0);
+        _ = sys(.close, fd, 0, 0, 0);
+        try testing.expectEqual(before, guarded);
+        guarded = before + 1;
+    }
+}
+
+fn lockedWorker(name: [*:0]const u8) void {
+    lockedAppend(name) catch @panic("lockedAppend");
+}
+
+fn twoTasksOneCLock(env: *Env) !void {
+    c_lock = .{};
+    guarded = 0;
+    var other = try env.io.concurrent(lockedWorker, .{"b"});
+    try lockedAppend("a");
+    other.await(env.io);
+    try testing.expectEqual(@as(u32, 6), guarded);
+}
+
+var wake_word: u32 = 0;
+
+fn wakeAfter(ms: i64) void {
+    const req: Timespec = .{ .sec = 0, .nsec = ms * std.time.ns_per_ms };
+    _ = sys(.nanosleep, @intFromPtr(&req), 0, 0, 0);
+    @atomicStore(u32, &wake_word, 1, .release);
+    _ = sys(.futex, @intFromPtr(&wake_word), 129, 1, 0); // FUTEX_WAKE_PRIVATE
+}
+
+fn timedWait(env: *Env) !void {
+    // A timed wait that a wake ends is woken, not timed out.
+    wake_word = 0;
+    var waker = try env.io.concurrent(wakeAfter, .{1});
+    const long: Timespec = .{ .sec = 1, .nsec = 0 };
+    while (@atomicLoad(u32, &wake_word, .acquire) == 0) {
+        const rc = sys(.futex, @intFromPtr(&wake_word), 128, 0, @intFromPtr(&long));
+        try testing.expect(rc == 0 or rc == errOf(.AGAIN));
+    }
+    waker.await(env.io);
+
+    var word: u32 = 7;
+    const t0 = try monotonicNs();
+    const rel: Timespec = .{ .sec = 0, .nsec = 5 * std.time.ns_per_ms };
+    // Nobody wakes it: it times out, in virtual time.
+    try testing.expectEqual(errOf(.TIMEDOUT), sys(.futex, @intFromPtr(&word), 128, 7, @intFromPtr(&rel)));
+    try testing.expect(try monotonicNs() - t0 >= 5 * std.time.ns_per_ms);
+    // A value that already changed: no wait at all.
+    try testing.expectEqual(errOf(.AGAIN), sys(.futex, @intFromPtr(&word), 128, 8, 0));
+    // A wake with no waiter wakes nobody.
+    try testing.expectEqual(@as(isize, 0), sys(.futex, @intFromPtr(&word), 129, 1, 0));
+}
+
+test "system-call mode: a C library's lock held across file calls by two tasks waits in the simulation, not on the thread" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    clock_waits = 0;
+    // Before revision 76 the second task's wait was a real `futex` wait,
+    // and the run hung for good the first time the lock was contended.
+    try tardis.check(gpa, twoTasksOneCLock, .{ .iterations = 200, .mode = .syscalls });
+    try testing.expect(clock_waits > 0); // it was contended, and the wait was woken
+    try tardis.check(gpa, timedWait, .{ .iterations = 5, .mode = .syscalls });
+}
+
 test "system-call mode: getrandom follows the seed" {
     if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
     const options: tardis.Options = .{ .mode = .syscalls };

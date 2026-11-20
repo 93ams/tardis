@@ -111,7 +111,10 @@ fn onSigsys(_: i32, _: ?*anyopaque, context: ?*anyopaque) callconv(.c) void {
     // not the allocator's `mmap`: the kernel has no such file.
     const maps_simulated = number == 9 and gregs[@backingInt(Reg.r10)] & 0x20 == 0 and // MAP_ANONYMOUS
         gregs[@backingInt(Reg.r8)] & 0xC000_0000 == 0x4000_0000;
-    if (maps_simulated or !expected(number, a)) {
+    // In system-call mode a futex is the code under test's lock, and a
+    // real wait would stop every fiber (`sysemu.futex`).
+    const emulated_futex = number == 202 and emulator != null;
+    if (maps_simulated or emulated_futex or !expected(number, a)) {
         if (emulator) |emulate| {
             const args: [6]u64 = .{
                 a,

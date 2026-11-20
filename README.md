@@ -167,9 +167,11 @@ and `env.crashAndReboot` treats both alike.
 try tardis.check(gpa, body, .{ .mode = .syscalls });
 ```
 
-One limit to know before using it: every task runs on one thread, so a C
-library that holds a mutex across a file or sleep call can hang a run that
-drives it from more than one task. Drive a C library from one task.
+A C library's locks work across tasks: its `futex` waits block the task,
+not the thread, so two tasks may each drive their own SQLite database. One
+limit to know: every task runs on one thread, so a recursive mutex (whose
+owner is the thread) does not keep a second task out. Do not share one
+SQLite connection, or anything else behind a recursive lock, between tasks.
 
 `examples/syscall_rename.zig` is a planted bug in a program that only
 makes system calls; `test/sqlite.zig` runs SQLite, built as it ships, and

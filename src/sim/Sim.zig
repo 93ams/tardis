@@ -2216,6 +2216,18 @@ fn futexWaitImpl(s: *Sim, ptr: *const u32, expected: u32, deadline_ns: ?u64, can
     s.block(.{ .futex = @intFromPtr(ptr) }, deadline_ns, cancelable);
 }
 
+/// A `futex` wait made by system call (`sysemu.zig`): never a cancelation
+/// point (the kernel's is not one, and a cancel spent on a libc that loops
+/// on `EINTR` would be lost), and it says whether its deadline ended it,
+/// as the kernel does: a task a wake picked returns woken even if its
+/// deadline has also passed.
+pub fn futexWaitSyscall(s: *Sim, ptr: *const u32, expected: u32, timeout: Io.Timeout) enum { woken, timed_out } {
+    const deadline_ns = s.deadlineFrom(timeout);
+    s.tasks[s.current].woke_by_timeout = false;
+    s.futexWaitImpl(ptr, expected, deadline_ns, false);
+    return if (s.tasks[s.current].woke_by_timeout) .timed_out else .woken;
+}
+
 fn futexWait(userdata: ?*anyopaque, ptr: *const u32, expected: u32, timeout: Io.Timeout) Io.Cancelable!void {
     const s = fromUserdata(userdata);
     try s.cancelPoint();

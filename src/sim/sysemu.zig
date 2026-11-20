@@ -23,7 +23,7 @@
 //! `getdents64`, `getcwd`, `fcntl` (descriptor flags and record locks),
 //! `chmod`, `fchmod`, `fchown`, `getuid` and its three relatives, `clock_gettime`,
 //! `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`,
-//! `getrandom`.
+//! `getrandom`, and `futex` (waits and wakes, below).
 //!
 //! Not modelled, and answered as a single-user, single-process system
 //! would: owners and permission bits (every file is 0644 and every
@@ -233,6 +233,7 @@ pub fn emulate(number: u64, a: *const [6]u64) ?u64 {
         96 => gettimeofday(s, a[0]),
         201 => time(s, a[0]),
         204 => schedGetaffinity(a[1], a[2]),
+        202 => futex(s, a),
         35 => sleep(s, 1, 0, a[0], a[1]),
         230 => sleep(s, @truncate(a[0]), @truncate(a[1]), a[2], a[3]),
         318 => getrandom(s, a[0], a[1]),
@@ -837,6 +838,89 @@ fn getdents(s: *Sim, fd: i32, buf_ptr: u64, len: u64) u64 {
     }
     h.pos = h.list[0];
     return used;
+}
+
+// --- futexes -------------------------------------------------------------------
+
+/// `futex`: the waits and wakes of a C library's locks and condition
+/// variables. Every fiber runs on one thread, so a real wait would stop
+/// the whole simulation (the task holding the lock could never run to
+/// release it). Here a wait blocks only the calling task, on the
+/// simulator's futex for that address, and a wake wakes simulated
+/// waiters. A deadlock between C locks is then the simulator's reported
+/// deadlock, not a hang.
+///
+/// Emulated: `FUTEX_WAIT`, `FUTEX_WAKE`, `FUTEX_WAIT_BITSET`,
+/// `FUTEX_WAKE_BITSET`, `FUTEX_REQUEUE`, `FUTEX_CMP_REQUEUE`, private or
+/// not, with `FUTEX_CLOCK_REALTIME`. A bitset is not compared and a
+/// requeue wakes instead of moving: both only add wakeups, which every
+/// futex caller must tolerate. Other operations (priority inheritance,
+/// `FUTEX_WAKE_OP`) are not emulated.
+fn futex(s: *Sim, a: *const [6]u64) ?u64 {
+    const futex_private = 128;
+    const futex_clock_realtime = 256;
+    const op: u32 = @truncate(a[1]);
+    const cmd = op & ~@as(u32, futex_private | futex_clock_realtime);
+    if (a[0] % 4 != 0) return fail(.INVAL);
+    const val: u32 = @truncate(a[2]);
+    if (a[0] == 0) return switch (cmd) {
+        0, 9, 4 => fail(.FAULT), // the kernel reads the word: it faults
+        1, 10, 3 => 0, // a private wake looks for waiters and finds none
+        else => null,
+    };
+    const ptr: *const u32 = @ptrFromInt(a[0]);
+    return switch (cmd) {
+        0, 9 => { // FUTEX_WAIT, FUTEX_WAIT_BITSET
+            if (cmd == 9 and @as(u32, @truncate(a[5])) == 0) return fail(.INVAL);
+            // WAIT: a relative time on the monotonic clock. WAIT_BITSET:
+            // an absolute one, on the real clock if asked.
+            const clock: Io.Clock = if (cmd == 9 and op & futex_clock_realtime != 0) .real else .awake;
+            var deadline: ?i128 = null;
+            if (a[3] != 0) {
+                const t = @as(*align(1) const Timespec, @ptrFromInt(a[3])).*;
+                if (t.sec < 0 or t.nsec < 0 or t.nsec >= std.time.ns_per_s) return fail(.INVAL);
+                const ns: i128 = @as(i128, t.sec) * std.time.ns_per_s + t.nsec;
+                deadline = if (cmd == 9) ns else nowNs(s, clock) + ns;
+            }
+            return futexWait(s, ptr, val, clock, deadline);
+        },
+        1, 10 => futexWake(s, ptr, val), // FUTEX_WAKE, FUTEX_WAKE_BITSET
+        3, 4 => { // FUTEX_REQUEUE, FUTEX_CMP_REQUEUE
+            if (cmd == 4 and @atomicLoad(u32, ptr, .seq_cst) != @as(u32, @truncate(a[5]))) return fail(.AGAIN);
+            // The waiters it would move to the second address are woken.
+            const more: u32 = @truncate(@min(a[3], std.math.maxInt(u32)));
+            return futexWake(s, ptr, val +| more);
+        },
+        else => null,
+    };
+}
+
+fn futexWait(s: *Sim, ptr: *const u32, val: u32, clock: Io.Clock, deadline: ?i128) u64 {
+    if (@atomicLoad(u32, ptr, .seq_cst) != val) return fail(.AGAIN);
+    var timeout: Io.Timeout = .none;
+    if (deadline) |d| {
+        if (nowNs(s, clock) >= d) return fail(.TIMEDOUT);
+        timeout = .{ .deadline = .{ .raw = .{ .nanoseconds = @intCast(d) }, .clock = clock } };
+    }
+    // Timed out only if the deadline ended the wait: a waiter a wake
+    // picked returns 0, as in the kernel, or the wake would be lost (a
+    // timed lock that reports a timeout does not pass the wake on).
+    return switch (s.futexWaitSyscall(ptr, val, timeout)) {
+        .woken => 0,
+        .timed_out => fail(.TIMEDOUT),
+    };
+}
+
+/// Wakes up to `max` simulated waiters on `ptr`: the number woken.
+fn futexWake(s: *Sim, ptr: *const u32, max: u32) u64 {
+    if (max == 0) return 0;
+    var waiting: u32 = 0;
+    for (s.tasks) |*t| {
+        if (t.state == .blocked and t.block == .futex and t.block.futex == @intFromPtr(ptr)) waiting += 1;
+    }
+    const io = s.io();
+    io.vtable.futexWake(io.userdata, ptr, max);
+    return @min(waiting, max);
 }
 
 // --- time and randomness -------------------------------------------------------
