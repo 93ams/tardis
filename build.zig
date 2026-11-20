@@ -190,7 +190,7 @@ pub fn build(b: *std.Build) void {
     // `zig build test-examples`: each example plants one class of bug and
     // shows its fix (examples/, plan3.md C2). Part of `test`.
     const examples_step = b.step("test-examples", "Run the examples: each finds its planted bug and passes its fix");
-    for ([_][]const u8{ "examples/wal_kv.zig", "examples/counter.zig", "examples/jobs.zig", "examples/replica.zig", "examples/dir_sync.zig", "examples/deadlock.zig", "examples/short_write.zig", "examples/error_leak.zig", "examples/check_then_act.zig", "examples/rename_unsynced.zig", "examples/oom_partial.zig", "examples/lease.zig", "examples/in_place_rewrite.zig", "examples/index_before_data.zig", "examples/id_reuse.zig", "examples/short_read.zig", "examples/udp_retry.zig", "examples/udp_order.zig", "examples/udp_no_timeout.zig", "examples/stale_read.zig" }) |path| {
+    for ([_][]const u8{ "examples/wal_kv.zig", "examples/counter.zig", "examples/jobs.zig", "examples/replica.zig", "examples/dir_sync.zig", "examples/deadlock.zig", "examples/short_write.zig", "examples/error_leak.zig", "examples/check_then_act.zig", "examples/rename_unsynced.zig", "examples/oom_partial.zig", "examples/lease.zig", "examples/in_place_rewrite.zig", "examples/index_before_data.zig", "examples/id_reuse.zig", "examples/short_read.zig", "examples/udp_retry.zig", "examples/udp_order.zig", "examples/udp_no_timeout.zig", "examples/stale_read.zig", "examples/syscall_rename.zig" }) |path| {
         const t = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path(path),
@@ -213,7 +213,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "tardis", .module = mod }},
     });
-    for ([_][]const u8{ "wal_kv", "counter", "jobs", "replica", "dir_sync", "deadlock", "short_write", "error_leak", "check_then_act", "rename_unsynced", "oom_partial", "lease", "in_place_rewrite", "index_before_data", "id_reuse", "short_read", "udp_retry", "udp_order", "udp_no_timeout", "stale_read" }) |name| {
+    for ([_][]const u8{ "wal_kv", "counter", "jobs", "replica", "dir_sync", "deadlock", "short_write", "error_leak", "check_then_act", "rename_unsynced", "oom_partial", "lease", "in_place_rewrite", "index_before_data", "id_reuse", "short_read", "udp_retry", "udp_order", "udp_no_timeout", "stale_read", "syscall_rename" }) |name| {
         bugbench_mod.addImport(name, b.createModule(.{
             .root_source_file = b.path(b.fmt("examples/{s}.zig", .{name})),
             .target = target,
@@ -263,6 +263,28 @@ pub fn build(b: *std.Build) void {
     const run_bench = b.addRunArtifact(bench);
     const bench_step = b.step("bench", "Run the simulator benchmarks (ReleaseFast)");
     bench_step.dependOn(&run_bench.step);
+
+    // `zig build test-sqlite -Dsqlite`: SQLite's amalgamation, built as it
+    // ships with its own Unix VFS, run under system-call mode (plan3.md
+    // D9). Linux on x86_64. Behind an option, so that nothing else fetches
+    // SQLite's source.
+    const with_sqlite = b.option(bool, "sqlite", "With `test-sqlite`: fetch SQLite and test it under system-call mode (Linux x86_64)") orelse false;
+    const sqlite_step = b.step("test-sqlite", "Run SQLite under system-call mode (needs -Dsqlite; Linux x86_64)");
+    if (!with_sqlite) {
+        sqlite_step.dependOn(&b.addFail("test-sqlite needs -Dsqlite, which fetches SQLite's source").step);
+    } else if (target.result.os.tag != .linux or target.result.cpu.arch != .x86_64) {
+        sqlite_step.dependOn(&b.addFail("test-sqlite needs Linux on x86_64: system-call mode exists nowhere else").step);
+    } else if (b.lazyDependency("sqlite", .{})) |sqlite| {
+        const sqlite_mod = b.createModule(.{
+            .root_source_file = b.path("test/sqlite.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "tardis", .module = mod }},
+            .link_libc = true,
+        });
+        sqlite_mod.addCSourceFile(.{ .file = sqlite.path("sqlite3.c"), .flags = &.{"-DSQLITE_OMIT_LOAD_EXTENSION"} });
+        sqlite_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = sqlite_mod, .filters = test_filters })).step);
+    }
 
     // The `tardis` program and the termancy suite need termancy. Only when
     // TARDIS is the root project: a package importing the library never

@@ -14,6 +14,13 @@
 //! kernel is told to let through, so the thread is back to "blocked" before
 //! it runs another instruction of the program.
 //!
+//! In system-call mode (`Options.mode = .syscalls`, plan §9.2) the handler
+//! first offers a call that is not the harness's own to an emulator
+//! (`sysemu.zig`), which answers it from the simulator; only what the
+//! emulator declines is stray. The emulator may switch fibers, so SIGSYS is
+//! not blocked inside its handler (`SA_NODEFER`), and the selector byte
+//! belongs to the fiber: `Sim.switchToTask` saves and restores it.
+//!
 //! What it does not see: calls the kernel answers in user space through the
 //! vDSO (`clock_gettime`, `gettimeofday`, `getcpu`) are not system calls,
 //! and `rdtsc` is an instruction (`tsc.zig` answers that one). Other
@@ -35,6 +42,13 @@ threadlocal var selector: u8 = allow;
 threadlocal var armed = false;
 threadlocal var stray_count: u32 = 0;
 threadlocal var stray_first: u64 = 0;
+/// True between `begin` and `end`.
+threadlocal var active = false;
+threadlocal var emulator: ?Emulator = null;
+
+/// Answers a system call from the simulation: the value for `rax`, or
+/// null for a call it does not emulate.
+pub const Emulator = *const fn (number: u64, args: *const [6]u64) ?u64;
 var handler_installed: std.atomic.Value(bool) = .init(false);
 
 /// The calls a run makes without leaving the simulation, by x86_64 number.
@@ -44,6 +58,11 @@ fn expected(number: u64, arg0: u64) bool {
         9, 10, 11, 12, 25, 28 => true, // mmap, mprotect, munmap, brk, mremap, madvise
         // Reports and test output, to the terminal only.
         1, 20 => arg0 == 1 or arg0 == 2, // write, writev
+        // What libc asks about the terminal before its first output
+        // (glibc `fstat(1)`, musl `ioctl(1, TIOCGWINSZ)`): it reads, and
+        // only about the standard descriptors.
+        5, 16 => arg0 <= 2, // fstat, ioctl
+        262 => arg0 <= 2, // newfstatat with AT_EMPTY_PATH on one of them
         // Locks inside the harness.
         202 => true, // futex
         // Signals, and the ways out of the process.
@@ -88,9 +107,38 @@ fn onSigsys(_: i32, _: ?*anyopaque, context: ?*anyopaque) callconv(.c) void {
     const gregs: [*]u64 = @ptrFromInt(@intFromPtr(context.?) + gregs_offset);
     const number = gregs[@backingInt(Reg.rax)];
     const a = gregs[@backingInt(Reg.rdi)];
-    if (!expected(number, a)) {
+    // A file mapping of a simulated descriptor (bit 30, `sysemu.zig`) is
+    // not the allocator's `mmap`: the kernel has no such file.
+    const maps_simulated = number == 9 and gregs[@backingInt(Reg.r10)] & 0x20 == 0 and // MAP_ANONYMOUS
+        gregs[@backingInt(Reg.r8)] & 0xC000_0000 == 0x4000_0000;
+    if (maps_simulated or !expected(number, a)) {
+        if (emulator) |emulate| {
+            const args: [6]u64 = .{
+                a,
+                gregs[@backingInt(Reg.rsi)],
+                gregs[@backingInt(Reg.rdx)],
+                gregs[@backingInt(Reg.r10)],
+                gregs[@backingInt(Reg.r8)],
+                gregs[@backingInt(Reg.r9)],
+            };
+            // May switch fibers and come back much later, on this stack.
+            if (emulate(number, &args)) |answer| {
+                gregs[@backingInt(Reg.rax)] = answer;
+                @atomicStore(u8, &selector, block, .seq_cst);
+                return;
+            }
+        }
         if (stray_count == 0) stray_first = number;
         stray_count +|= 1;
+        // With the emulator on, the code under test believes it has no
+        // other world: a call it was not answered must not reach the real
+        // one (a rename or a truncation of a host file). It fails as an
+        // unimplemented call, and the run fails with `StraySyscall`.
+        if (emulator != null) {
+            gregs[@backingInt(Reg.rax)] = @bitCast(@as(i64, -@as(i64, @backingInt(linux.E.NOSYS))));
+            @atomicStore(u8, &selector, block, .seq_cst);
+            return;
+        }
     }
     // Make the call for the thread: it sees what it would have seen.
     gregs[@backingInt(Reg.rax)] = raw6(
@@ -120,7 +168,9 @@ fn arm() bool {
     if (!handler_installed.load(.acquire)) {
         const act: KernelSigaction = .{
             .handler = @intFromPtr(&onSigsys),
-            .flags = 4 | 0x04000000, // SA_SIGINFO | SA_RESTORER
+            // SA_NODEFER: a fiber may be switched out inside the handler,
+            // and the next fiber's calls must still trap.
+            .flags = 4 | 0x04000000 | 0x40000000, // SA_SIGINFO | SA_RESTORER | SA_NODEFER
             .restorer = @intFromPtr(&restorer),
             .mask = 0,
         };
@@ -135,11 +185,13 @@ fn arm() bool {
 
 /// A run starts: from here on the thread's system calls are trapped.
 /// False where they cannot be.
-pub fn begin() bool {
+pub fn begin(emulate: ?Emulator) bool {
     if (!supported) return false;
     if (!arm()) return false;
     stray_count = 0;
     stray_first = 0;
+    emulator = emulate;
+    active = true;
     @atomicStore(u8, &selector, block, .seq_cst);
     return true;
 }
@@ -150,8 +202,32 @@ pub const Stray = struct { number: u64, count: u32 };
 pub fn end() ?Stray {
     if (!supported or !armed) return null;
     @atomicStore(u8, &selector, allow, .seq_cst);
+    active = false;
+    emulator = null;
     if (stray_count == 0) return null;
     return .{ .number = stray_first, .count = stray_count };
+}
+
+/// Whether this thread can trap its system calls (the kernel has syscall
+/// user dispatch).
+pub fn available() bool {
+    return supported and arm();
+}
+
+/// The selector is the running fiber's: one inside the handler runs the
+/// simulator untrapped, one in the code under test is trapped. The
+/// scheduler saves it before a switch and restores it after.
+pub inline fn selectorSave() u8 {
+    return if (supported) selector else allow;
+}
+
+pub inline fn selectorRestore(value: u8) void {
+    if (supported) @atomicStore(u8, &selector, value, .seq_cst);
+}
+
+/// A new fiber starts in the code under test.
+pub inline fn fiberEntry() void {
+    if (supported and active) @atomicStore(u8, &selector, block, .seq_cst);
 }
 
 /// The call's name on x86_64 Linux, for the ones a test is likely to hit.
@@ -161,7 +237,24 @@ pub fn name(number: u64) []const u8 {
         1 => "write",
         2 => "open",
         3 => "close",
+        4 => "stat",
+        5 => "fstat",
+        7 => "poll",
         8 => "lseek",
+        9 => "mmap",
+        16 => "ioctl",
+        19 => "readv",
+        20 => "writev",
+        21 => "access",
+        22 => "pipe",
+        32 => "dup",
+        72 => "fcntl",
+        73 => "flock",
+        79 => "getcwd",
+        82 => "rename",
+        87 => "unlink",
+        217 => "getdents64",
+        293 => "pipe2",
         17 => "pread64",
         18 => "pwrite64",
         35 => "nanosleep",

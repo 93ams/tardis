@@ -157,6 +157,12 @@ pub const Handle = struct {
     readable: bool,
     writable: bool,
     lock: LockKind = .none,
+    /// System-call mode (`sysemu.zig`): opened with `O_APPEND`, so every
+    /// write goes to the end of the file.
+    append: bool = false,
+    /// System-call mode: where a `getdents64` listing has got to (entries
+    /// passed, first slot, stride).
+    list: [3]u32 = @splat(0),
 };
 
 pub const LockKind = enum(u8) { none, shared, exclusive };

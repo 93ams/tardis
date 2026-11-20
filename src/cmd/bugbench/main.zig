@@ -24,6 +24,12 @@ fn Run(comptime body: fn (*tardis.Env) anyerror!void) type {
 }
 
 fn row(gpa: std.mem.Allocator, io: std.Io, comptime name: []const u8, comptime class: []const u8, comptime module: type) !bool {
+    // A program that needs a mode this system does not have (system-call
+    // mode is Linux on x86_64) is listed, not run.
+    if (@hasDecl(module, "supported") and (!module.supported or !tardis.syscallModeAvailable())) {
+        std.debug.print("| `{s}` | {s} | not run: no system-call mode on this system | | | | |\n", .{ name, class });
+        return true;
+    }
     // A program's own campaign options (personas, faults, nodes), if it
     // names any.
     var base: tardis.Options = if (@hasDecl(module, "options")) module.options else .{ .iterations = 200 };
@@ -70,6 +76,7 @@ pub fn main(init: std.process.Init) !void {
     ok = try row(gpa, io, "wal_kv", "acknowledged before durable", @import("wal_kv")) and ok;
     ok = try row(gpa, io, "dir_sync", "missing fsync of a directory", @import("dir_sync")) and ok;
     ok = try row(gpa, io, "rename_unsynced", "renamed before the data is durable", @import("rename_unsynced")) and ok;
+    ok = try row(gpa, io, "syscall_rename", "renamed before the data is durable, by system call", @import("syscall_rename")) and ok;
     ok = try row(gpa, io, "in_place_rewrite", "a file rewritten in place", @import("in_place_rewrite")) and ok;
     ok = try row(gpa, io, "index_before_data", "two files made durable in the wrong order", @import("index_before_data")) and ok;
     ok = try row(gpa, io, "id_reuse", "identifier handed out twice after a restart", @import("id_reuse")) and ok;

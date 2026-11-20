@@ -43,6 +43,14 @@
             .hash = "termancy-0.1.0-8Kvz5jbBTwDFdS31nCAEezbBmZ5RVsjHRGeAxu_R6jwZ",
             .lazy = true,
         },
+        // SQLite 3.46.0's amalgamation, for `zig build test-sqlite -Dsqlite`
+        // (SQLite under system-call mode, plan3.md D9). Lazy: fetched only
+        // when that option is given.
+        .sqlite = .{
+            .url = "https://www.sqlite.org/2024/sqlite-amalgamation-3460000.zip",
+            .hash = "N-V-__8AAMS2owAizDnIyqrH9UeU4ZO0vAF7sYU7x7vbOpgT",
+            .lazy = true,
+        },
     },
     // Specifies the set of files and directories that are included in this package.
     // Only files and directories listed here are included in the `hash` that

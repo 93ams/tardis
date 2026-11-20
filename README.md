@@ -13,7 +13,7 @@ secret tracking, lock-order checks, Byzantine peers, constant-time checks,
 MC/DC and signed evidence bundles.
 
 New here? The [tutorial](docs/tutorial.md) goes from an empty test to a found,
-shrunk and fixed bug, and [`examples/`](examples) has twenty small programs,
+shrunk and fixed bug, and [`examples/`](examples) has twenty-one small programs,
 each with one planted bug and its fix. [docs/stability.md](docs/stability.md)
 says what may change between releases, and what a seed is and is not
 promised to mean. [docs/qualification.md](docs/qualification.md) lists what
@@ -144,6 +144,54 @@ Two other entry points:
   `.reduce = true` it skips orders of steps that cannot differ; read the
   assumption on `ExhaustiveOptions.reduce` first.
 
+## Choosing a mode
+
+There are two ways for the code under test to reach the simulation, chosen
+with `Options.mode`.
+
+| | `.std_io` (the default) | `.syscalls` |
+|---|---|---|
+| The code does its I/O through | `std.Io` (`env.io`, `env.dir`) | its own system calls: `std.os.linux`, `std.posix`, a C library |
+| Platforms | every one TARDIS runs on | Linux on x86_64, kernel 5.11 or later |
+| What is simulated | everything `std.Io` offers: files, the network, the clock, tasks | files, clock reads, sleeping and random bytes (the list is at the top of `src/sim/sysemu.zig`) |
+| A call outside that | cannot be made through `env.io` | fails the run with `error.StraySyscall`, naming the call |
+
+Use `.std_io` when the code takes an `Io`: it is the complete simulation,
+and the only one on Windows and macOS. Use `.syscalls` for code that cannot
+take one: a C library, or Zig code written against the kernel. In that mode
+the body still has `env.io` and `env.dir`, on the same simulated files, so
+a test can write through a C library and check the result through `env.dir`,
+and `env.crashAndReboot` treats both alike.
+
+```zig
+try tardis.check(gpa, body, .{ .mode = .syscalls });
+```
+
+One limit to know before using it: every task runs on one thread, so a C
+library that holds a mutex across a file or sleep call can hang a run that
+drives it from more than one task. Drive a C library from one task.
+
+`examples/syscall_rename.zig` is a planted bug in a program that only
+makes system calls; `test/sqlite.zig` runs SQLite, built as it ships, and
+loses an acknowledged commit to a power loss when its `synchronous` setting
+allows that (`zig build test-sqlite -Dsqlite`).
+
+What to know before relying on it:
+
+- No sockets, pipes, `mmap` of a file, `dup` or `poll` yet: each is a stray
+  call.
+- A clock read that libc answers through the vDSO (`time`,
+  `gettimeofday`, `clock_gettime` on most systems) is not a system call:
+  it returns the host's time and nothing reports it.
+- Owners, permission bits and record locks are not modelled.
+- State a library keeps for the life of the process is carried from one
+  run to the next. `check` re-runs every 16th iteration and fails with
+  `error.NonDeterministic` when that changes a run; reset such state at
+  the start of the body.
+- Where the mode does not exist, `check` returns
+  `error.SyscallModeUnsupported`; `tardis.syscall_mode_supported` says so
+  at compile time.
+
 ## The security layer
 
 ```zig
@@ -205,6 +253,7 @@ worked example.
 | `zig build test-sec` | the security layer's tests |
 | `zig build test-examples` | the examples: each finds its planted bug and passes its fix |
 | `zig build test-termancy` | the suite that tests the `termancy` library under simulation |
+| `zig build test-sqlite -Dsqlite` | SQLite under system-call mode (Linux x86_64; fetches SQLite's source) |
 | `zig build test-edges` | guided exploration fed by Zig's edge counters (Linux or macOS targets) |
 | `zig build evidence` | the certification campaigns, bundles in `zig-out/tardis-evidence` |
 | `zig build bench` | throughput benchmarks, always optimized |
@@ -221,11 +270,13 @@ Useful flags: `-Dtest-filter=<text>`, `-Doptimize=<mode>`, `-Dsec`,
 
 ## Limits
 
-- Only code that goes through `std.Io` is simulated. A direct system call
-  escapes the simulation. On Linux x86_64, `TARDIS_TRAP_SYSCALLS=1` (or
-  `Options.trap_syscalls`) fails the run that makes one and names the
-  call. `Options.virtual_tsc` (same platform) answers `rdtsc` with the
-  run's virtual time.
+- In the default mode only code that goes through `std.Io` is simulated. A
+  direct system call escapes the simulation. On Linux x86_64,
+  `TARDIS_TRAP_SYSCALLS=1` (or `Options.trap_syscalls`) fails the run that
+  makes one and names the call, and `Options.mode = .syscalls` answers the
+  file, clock, sleep and random-byte calls from the simulation instead
+  ("Choosing a mode"). `Options.virtual_tsc` (same platform) answers
+  `rdtsc` with the run's virtual time.
 - A fiber stack is 256 KiB by default. An overflow faults on the guard page
   below the stack; raise `limits.fiber_stack_bytes` if a test needs more.
 - Shadow memory and the race detector check only code built as a separate

@@ -27,6 +27,7 @@ const fuzz = @import("../search/fuzz.zig");
 const net_mod = @import("../model/net.zig");
 const explore = @import("../search/explore.zig");
 const seam = @import("sec_seam.zig");
+const syscalls = @import("syscalls.zig");
 const ionet = Io.net;
 
 pub const TaskId = sched.TaskId;
@@ -66,6 +67,9 @@ pub const Config = struct {
     report: bool = true,
     /// Fail a run whose code makes a real system call (`syscalls.zig`).
     trap_syscalls: bool = false,
+    /// Answer the code's own system calls from the simulation
+    /// (`sysemu.zig`, plan §9.2).
+    emulate_syscalls: bool = false,
     /// Answer `rdtsc` with virtual time (`tsc.zig`).
     virtual_tsc: bool = false,
     /// An optional security layer (plan2.md §2.2), one instance per `Sim`.
@@ -1063,7 +1067,10 @@ fn switchToTask(s: *Sim, next: TaskId) void {
     s.vfs = &s.nodes[s.tasks[next].node].vfs;
     s.decider.ctx = &s.tasks[next].keys;
     s.record(.switch_to, prev, next, 0, "");
+    // The system-call trap's selector is this fiber's (`syscalls.zig`).
+    const selector = syscalls.selectorSave();
     fiber.switchTo(&s.tasks[prev].ctx, &s.tasks[next].ctx, s.boundsOf(next));
+    syscalls.selectorRestore(selector);
     // Resumed: whoever switched back to us set `current`.
     assert(s.current == prev);
 }
@@ -1356,6 +1363,7 @@ fn spawn(s: *Sim, start: Start, context: []const u8, group: ?*Io.Group, result_l
 }
 
 fn fiberMain() callconv(.c) noreturn {
+    syscalls.fiberEntry();
     const s = tls_sim.?;
     const id = s.current;
     const t = &s.tasks[id];
@@ -2629,8 +2637,11 @@ fn fileWritePositional(userdata: ?*anyopaque, file: File, header: []const u8, da
     const ino = h.inode;
     if (s.injected(E, .write)) |e| return e;
     s.syncClock();
-    const n = try s.writeVectors(E, ino, header, data, splat, offset);
-    s.record(.write, ino, offset, n, "");
+    // An appending descriptor (system-call mode) writes at the end
+    // whatever offset it is given, as `pwrite` does on Linux.
+    const at = if (h.append) s.vfs.inodes[ino].cur_len_bytes else offset;
+    const n = try s.writeVectors(E, ino, header, data, splat, at);
+    s.record(.write, ino, at, n, "");
     return n;
 }
 
@@ -2742,7 +2753,7 @@ fn writeStreaming(s: *Sim, op: Io.Operation.FileWriteStreaming) Io.Operation.Fil
     const ino = h.inode;
     if (s.injected(E, .write)) |e| return e;
     s.syncClock();
-    const pos = h.pos;
+    const pos = if (h.append) s.vfs.inodes[ino].cur_len_bytes else h.pos;
     const n = try s.writeVectors(E, ino, op.header, op.data, op.splat, pos);
     h.pos = pos + n;
     s.record(.write, ino, pos, n, "stream");

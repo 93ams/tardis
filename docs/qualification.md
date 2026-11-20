@@ -47,7 +47,8 @@ build test`; file names are under `src/tests/` unless they say otherwise.
 | R11 | check linearizability and transactional anomalies correctly on recorded histories | `lin_test.zig`, `elle_test.zig` (histories with known verdicts) |
 | R12 | in the exhaustive search, visit every schedule within the stated depth, and with reduction or merging reach the same set of outcomes | `sec/tests/pillar45_test.zig` (the vote model: with reduction and with merging, fewer executions, the same verdicts and the same outcomes); `zig build bench` holds the counts, 9,216 and 3,073, to their recorded values |
 | R13 | never let an unsimulated `std.Io` call reach the real system | by construction: the simulator's call table starts as `std.Io.failing` (`plan.md` §11) |
-| R14 | find each bug in its benchmark of planted bugs, and pass each fix | `zig build bugbench` (twenty programs), run in CI |
+| R14 | find each bug in its benchmark of planted bugs, and pass each fix | `zig build bugbench` (twenty-one programs), run in CI |
+| R15 | in system-call mode (`Options.mode = .syscalls`, Linux x86_64), answer the file, clock, sleep and random-byte system calls from the simulation as the kernel would answer them with no fault, and fail the run that makes any other call | `sysmode_test.zig`: random sequences of file calls compared with the real kernel (ext4); the same program by system call and by `std.Io` gives one trace and one result after a crash; a call that is not emulated fails the run. `test/sqlite.zig` (not part of `zig build test`) |
 
 Requirements R5, R6 and R7 are the ones that carry the tool's fidelity,
 and they are the least complete: see section 3.
@@ -61,8 +62,19 @@ ran, no run broke a property the test stated. It does not mean more.
 
 - Code that does not go through `std.Io`: a C library doing its own I/O, a
   direct system call, a child process, real threads. On Linux x86_64
-  `Options.trap_syscalls` turns a stray system call into a failure; on
-  other platforms nothing does.
+  `Options.trap_syscalls` turns a stray system call into a failure, and
+  `Options.mode = .syscalls` (revision 75) answers the file, clock, sleep
+  and random-byte calls from the simulation; on other platforms nothing
+  does either.
+- In system-call mode: a C library that holds a pthread mutex across a
+  file or sleep call, driven from more than one task, can hang the run
+  (every task shares one thread). Use C libraries from one task only.
+- In system-call mode: a clock read that libc answers through the vDSO
+  (`time`, `gettimeofday`, `clock_gettime`) is not a system call, returns
+  the host's time, and is not reported. Sockets, pipes, `mmap` of a file,
+  `dup` and `poll` are not emulated (each fails the run). Owners,
+  permission bits and record locks are not modelled. State a library keeps
+  for the life of the process is carried from one run to the next.
 - Shared memory between tasks, except through `tardis.atomic.Value`.
 - A property the test did not state.
 - Liveness in general: `eventually` covers convergence after a fault
@@ -119,7 +131,7 @@ ran, no run broke a property the test stated. It does not mean more.
 | The oracle is wrong (a linearizability or anomaly check passes a bad history) | R11 | Histories unlike the tested ones |
 | The shrinker changes the failure into a different one | R4 | None known |
 | A reduction in the exhaustive search skips a schedule that matters | R12 | Programs that break the reduction's stated assumption |
-| The code under test leaves the simulation | R13; `trap_syscalls` on Linux x86_64 | Other platforms; C code; threads |
+| The code under test leaves the simulation | R13; `trap_syscalls` on Linux x86_64; R15 for code that makes system calls | Other platforms; threads; clock reads through the vDSO |
 | The test passes for want of coverage | `env.sometimes` fails a campaign that never reached a stated situation | Situations the test did not name |
 
 ## 5. Verified configurations
@@ -131,8 +143,10 @@ The suite has passed on:
 | Windows 11, x86_64 | 0.17.0 | Debug, ReleaseSafe, ReleaseFast, ReleaseSmall | run natively |
 | Linux (Debian under WSL2), x86_64 | 0.17.0 | Debug | cross-compiled for `x86_64-linux-musl`, run natively |
 
+System-call mode (R15) has run only on the second row, on kernel 6.18.
+
 It compiles for `aarch64-macos` and has **not** been run there, nor on any
-aarch64 machine, nor on a BSD. This table was last checked at revision 69
+aarch64 machine, nor on a BSD. This table was last checked at revision 75
 (`CHANGELOG.md`). The workflows in `.github/workflows/` are written to run
 the suite on Linux, macOS and Windows; when this was written they had not
 yet passed.

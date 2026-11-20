@@ -34,6 +34,7 @@ const oracle = @import("check/oracle.zig");
 const forkserver = @import("sim/forkserver.zig");
 const syscalls = @import("sim/syscalls.zig");
 const tsc = @import("sim/tsc.zig");
+const sysemu = @import("sim/sysemu.zig");
 
 /// Whether `Options.virtual_tsc` answers `rdtsc` on this target (Linux
 /// x86_64).
@@ -41,6 +42,36 @@ pub const virtual_tsc_supported = tsc.supported;
 
 /// Whether `Options.trap_syscalls` traps on this target (Linux x86_64).
 pub const trap_syscalls_supported = syscalls.supported;
+
+/// Whether `Options.mode = .syscalls` exists on this target (Linux x86_64).
+/// The kernel must also have syscall user dispatch (Linux 5.11): where it
+/// does not, `check` returns `error.SyscallModeUnsupported`.
+pub const syscall_mode_supported = syscalls.supported;
+
+/// Whether system-call mode works here and now: the target has it and the
+/// running kernel has syscall user dispatch. For a test to skip on.
+pub fn syscallModeAvailable() bool {
+    return syscalls.available();
+}
+
+/// How the code under test reaches the simulation.
+pub const SimMode = enum {
+    /// Through `env.io`: the code does its I/O with `std.Io`. Every
+    /// platform; the default.
+    std_io,
+    /// Through its own system calls as well: direct `std.os.linux` calls,
+    /// `std.posix`, a C library. The simulator answers the file, clock,
+    /// sleep and randomness calls of `src/sim/sysemu.zig`; any other call
+    /// that is not the harness's own fails the run with
+    /// `error.StraySyscall`. `env.io` and `env.dir` work as before, on the
+    /// same simulated files. Linux on x86_64 (`syscall_mode_supported`);
+    /// elsewhere `check` returns `error.SyscallModeUnsupported`.
+    syscalls,
+};
+
+/// The root directory as a descriptor for system-call mode: what
+/// `AT_FDCWD` also means there.
+pub const syscall_root_fd: i32 = 0x7FFF_FFFF;
 
 /// Whether `Options.fork` forks on this target (Linux; macOS and the BSDs
 /// with libc). Elsewhere the same iterations run in-process.
@@ -155,6 +186,12 @@ pub const Options = struct {
     /// loop form and on worker threads' setup. `TARDIS_TRAP_SYSCALLS=1` turns it on for every
     /// check of a test run.
     trap_syscalls: bool = false,
+    /// How the code under test reaches the simulation: through `env.io`
+    /// alone (`.std_io`, the default), or through its own system calls as
+    /// well (`.syscalls`, Linux on x86_64). See `SimMode`. System-call mode
+    /// implies `trap_syscalls`, runs iterations in this process whatever
+    /// `fork` says, and does not apply to `sim`'s loop form.
+    mode: SimMode = .std_io,
     /// Answer `rdtsc` and `rdtscp` with the run's virtual time in
     /// nanoseconds (plus the number of reads so far), so code that times
     /// itself with the processor's counter follows the seed. Linux on
@@ -240,7 +277,8 @@ fn simConfig(o: Options) Sim.Config {
         .preempt_ppm = o.preempt_ppm,
         .async_inline_ppm = o.async_inline_ppm,
         .swarm = o.swarm,
-        .trap_syscalls = o.trap_syscalls or trapSyscallsFromEnv(),
+        .trap_syscalls = o.trap_syscalls or o.mode == .syscalls or trapSyscallsFromEnv(),
+        .emulate_syscalls = o.mode == .syscalls,
         .virtual_tsc = o.virtual_tsc,
         .faults = o.faults,
         .limits = o.limits,
@@ -264,6 +302,8 @@ pub const Error = error{
     SometimesNeverTrue,
     AssertionFailed,
     FibersUnsupported,
+    StraySyscall,
+    SyscallModeUnsupported,
 };
 
 /// The simulated world handed to a test body.
@@ -705,7 +745,16 @@ fn runOnce(s: *Sim, comptime body: fn (*Env) anyerror!void, seed: u64, persona: 
     env.seed = seed;
     // The counter first and last: arming it is a system call.
     const virtual_counter = s.config.virtual_tsc and tsc.begin(&s.now_ns);
-    const trapping = s.config.trap_syscalls and syscalls.begin();
+    const emulator: ?syscalls.Emulator = if (syscalls.supported and s.config.emulate_syscalls) &sysemu.emulate else null;
+    const trapping = s.config.trap_syscalls and syscalls.begin(emulator);
+    if (s.config.emulate_syscalls and !trapping) {
+        // No trap, no system-call mode: the body's calls would reach the
+        // real kernel and the real disk, so it is not run.
+        if (virtual_counter) _ = tsc.end();
+        s.secEndRun();
+        s.endRun();
+        return .{ .result = error.SyscallModeUnsupported, .trace_hash = 0, .finding = 0 };
+    }
     const r = s.drive(BodyThunk(body).call, &env);
     const stray = if (trapping) syscalls.end() else null;
     if (virtual_counter) _ = tsc.end();
@@ -713,7 +762,9 @@ fn runOnce(s: *Sim, comptime body: fn (*Env) anyerror!void, seed: u64, persona: 
     var result = r.outcome;
     if (stray) |call| {
         if (s.config.report) std.debug.print("tardis: the code under test made {d} real system call(s), the first one {s} (number {d}): it left the simulation, so the run does not depend on its seed alone\n", .{ call.count, syscalls.name(call.number), call.number });
-        if (result) |_| result = error.StraySyscall else |_| {}
+        // A run that left the simulation proves nothing, whether it passed
+        // or failed: its outcome does not follow from its seed.
+        result = error.StraySyscall;
     }
     if (result) |_| {
         if (s.daemon_error) |err| {
@@ -1088,6 +1139,11 @@ pub fn check(gpa: Allocator, comptime body: fn (*Env) anyerror!void, options: Op
     const caller = @returnAddress();
     var o = options;
     campaignFromEnv(gpa, &o);
+    if (o.mode == .syscalls) {
+        if (!syscalls.available()) return error.SyscallModeUnsupported;
+        // A forked child is not trapped.
+        o.fork = false;
+    }
     const s = try Sim.create(gpa, simConfig(o));
     defer s.destroy();
     applySetup(s, o);
@@ -2456,6 +2512,8 @@ pub const Simulation = struct {
 /// `Options.seed`/`TARDIS_SEED` or a replay token (`Options.replay`,
 /// `TARDIS_REPLAY`) when given.
 pub fn sim(gpa: Allocator, options: Options) !Simulation {
+    // The loop form has no run for the trap to cover.
+    if (options.mode == .syscalls) return error.SyscallModeUnsupported;
     const s = try Sim.create(gpa, simConfig(options));
     errdefer s.destroy();
     const env_replay = replayFromEnv(gpa);
@@ -2515,6 +2573,7 @@ test {
     _ = @import("tests/scheduler_test.zig");
     _ = @import("tests/weak_test.zig");
     _ = @import("tests/syscall_test.zig");
+    _ = @import("tests/sysmode_test.zig");
     _ = @import("tests/tsc_test.zig");
     _ = @import("tests/diff_fs_test.zig");
     _ = @import("tests/self_fuzz_test.zig");
