@@ -34,7 +34,7 @@
 //! without `O_CREAT` is an open and then a truncation, two steps another
 //! task can come between. A sleep that is canceled returns `EINTR` and the
 //! cancellation is spent. `O_TMPFILE`, `mmap` of a simulated file, `dup`,
-//! pipes, `poll` and sockets are not emulated: they are stray, as is any
+//! pipes and `poll` are not emulated (sockets are, `sysnet.zig`): they are stray, as is any
 //! path under `/proc`, `/sys` or `/dev` (but `/dev/urandom`) and any call
 //! relative to a directory descriptor the simulator did not issue. The
 //! root descriptor (`root_fd`) serves as a directory to be relative to,
@@ -45,6 +45,7 @@ const Io = std.Io;
 const linux = std.os.linux;
 const Sim = @import("Sim.zig");
 const vfs_mod = @import("../model/vfs.zig");
+const sysnet = @import("sysnet.zig");
 
 /// Set in every simulated descriptor.
 pub const fd_bit: u32 = 0x4000_0000;
@@ -177,12 +178,26 @@ fn dirOf(s: *Sim, dirfd: i32, path: []const u8) DirOf {
     return .{ .dir = .{ .handle = @intCast(valueOf(dirfd)) } };
 }
 
+/// A run begins: no socket is open (`sysnet.zig`).
+pub fn resetRun() void {
+    sysnet.reset();
+}
+
 /// Entry point for `syscalls.zig`: the value for `rax`, or null for a
 /// call that is not emulated.
 pub fn emulate(number: u64, a: *const [6]u64) ?u64 {
     const s = Sim.activeOrNull() orelse return null;
     if (!s.config.emulate_syscalls) return null;
     const fd = fdOf(a[0]);
+    // Sockets, and any call on a socket descriptor (`sysnet.zig`).
+    if ((number >= 41 and number <= 55) or number == 288) return sysnet.emulate(s, number, a);
+    // Only a call whose first argument is a descriptor: in another, it is
+    // a pointer or a number that may happen to fall in the range.
+    const on_descriptor = switch (number) {
+        0, 1, 3, 5, 8, 16, 17, 18, 19, 20, 72, 74, 75, 77, 91, 93, 217, 295, 296 => true,
+        else => false,
+    };
+    if (on_descriptor and sysnet.isSocketFd(fd)) return sysnet.emulate(s, number, a);
     return switch (number) {
         2 => open(s, at_fdcwd, a[0], @truncate(a[1])),
         85 => open(s, at_fdcwd, a[0], o_creat | o_wronly | o_trunc), // creat

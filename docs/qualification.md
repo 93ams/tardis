@@ -71,9 +71,9 @@ ran, no run broke a property the test stated. It does not mean more.
   an object behind a recursive lock (a SQLite connection) between tasks.
   A crash or the end of a run that drops a task holding a C library's
   mutex leaves it held, into the next run (C statics are the process's).
-- In system-call mode: a clock read that libc answers through the vDSO
-  (`time`, `gettimeofday`, `clock_gettime`) is not a system call, returns
-  the host's time, and is not reported. Sockets, pipes, `mmap` of a file,
+- In system-call mode: clock reads through the vDSO are answered from
+  the simulation (revision 78); a thread inside the vDSO when a run
+  begins makes that run fail with `StraySyscall`. Non-blocking sockets, `poll`, `epoll`, pipes, `mmap` of a file,
   `dup` and `poll` are not emulated (each fails the run). Owners,
   permission bits and record locks are not modelled. State a library keeps
   for the life of the process is carried from one run to the next.
@@ -133,7 +133,7 @@ ran, no run broke a property the test stated. It does not mean more.
 | The oracle is wrong (a linearizability or anomaly check passes a bad history) | R11 | Histories unlike the tested ones |
 | The shrinker changes the failure into a different one | R4 | None known |
 | A reduction in the exhaustive search skips a schedule that matters | R12 | Programs that break the reduction's stated assumption |
-| The code under test leaves the simulation | R13; `trap_syscalls` on Linux x86_64; R15 for code that makes system calls | Other platforms; threads; clock reads through the vDSO |
+| The code under test leaves the simulation | R13; `trap_syscalls` on Linux x86_64; R15 for code that makes system calls | Other platforms; threads; clock reads through the vDSO outside system-call mode |
 | The test passes for want of coverage | `env.sometimes` fails a campaign that never reached a stated situation | Situations the test did not name |
 
 ## 5. Verified configurations

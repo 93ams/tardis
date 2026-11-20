@@ -28,6 +28,7 @@ const net_mod = @import("../model/net.zig");
 const explore = @import("../search/explore.zig");
 const seam = @import("sec_seam.zig");
 const syscalls = @import("syscalls.zig");
+const sysnet = @import("sysnet.zig");
 const ionet = Io.net;
 
 pub const TaskId = sched.TaskId;
@@ -117,6 +118,9 @@ const Task = struct {
     woke_by_timeout: bool,
     cancel_requested: bool,
     cancel_protection: Io.CancelProtection,
+    /// Parked inside an emulated system call (system-call mode): dropping
+    /// it may leave a C library's lock held (`noteDropped`).
+    in_call: bool = false,
     awaiter: ?TaskId,
     group: ?*Io.Group,
     start: Start,
@@ -498,6 +502,11 @@ pub fn beginRun(s: *Sim, seed: u64, persona: Persona) void {
 
 pub fn endRun(s: *Sim) void {
     assert(s.current == 0);
+    // A daemon parked in `accept` or `read` when a run ends is normal for
+    // a server, so these drops are not noted (`noteDropped`): only a
+    // crash's are. What such a daemon's C library holds is still the
+    // process's.
+    for (s.tasks) |*t| t.in_call = false;
     s.abandonAllExcept(0, 0);
     s.plan.clearTargeted();
 }
@@ -511,6 +520,7 @@ fn resetTask(s: *Sim, id: TaskId) void {
     t.deadline_ns = null;
     t.woke_by_timeout = false;
     t.cancel_requested = false;
+    t.in_call = false;
     t.cancel_protection = .unblocked;
     t.awaiter = null;
     t.group = null;
@@ -537,10 +547,23 @@ fn abandonAllExcept(s: *Sim, keep_a: TaskId, keep_b: TaskId) void {
     for (s.tasks, 0..) |*t, i| {
         if (i == keep_a or i == keep_b) continue;
         if (t.state == .free) continue;
+        s.noteDropped(t);
         t.state = .free;
         s.runq.remove(@intCast(i));
     }
     s.rebuildFreeList();
+}
+
+/// A task is dropped without running further. If it was inside an
+/// emulated system call, the C library that made the call may hold a
+/// lock or be half way through changing its own state, and that state is
+/// the process's: later runs inherit it (plan §9.2).
+fn noteDropped(s: *Sim, t: *const Task) void {
+    if (t.state == .finished or !t.in_call) return;
+    if (syscalls.dropped_in_call_seed == null) {
+        syscalls.dropped_in_call_seed = s.seed;
+        if (s.config.report) std.debug.print("tardis: a task was dropped inside a system call (seed=0x{x}): a C library it was in may keep a lock or half-changed state into later runs\n", .{s.seed});
+    }
 }
 
 fn recordDecision(ctx: *anyopaque, stream: decide.Stream, key: u64, forced: bool) void {
@@ -1069,6 +1092,7 @@ fn switchToTask(s: *Sim, next: TaskId) void {
     s.record(.switch_to, prev, next, 0, "");
     // The system-call trap's selector is this fiber's (`syscalls.zig`).
     const selector = syscalls.selectorSave();
+    s.tasks[prev].in_call = syscalls.parkedInCall(selector);
     fiber.switchTo(&s.tasks[prev].ctx, &s.tasks[next].ctx, s.boundsOf(next));
     syscalls.selectorRestore(selector);
     // Resumed: whoever switched back to us set `current`.
@@ -1474,6 +1498,7 @@ pub fn crashAndReboot(s: *Sim, mode: CrashMode) void {
     for (s.nodes, 0..) |*n, i| s.crashVfs(&n.vfs, @intCast(i), mode);
     s.dropTasks(null);
     s.net.reset();
+    sysnet.dropNode(null);
     for (s.nodes) |*n| n.heap.reset();
     s.plan.clearTargeted();
     s.boot_count += 1;
@@ -1519,6 +1544,7 @@ fn dropTasks(s: *Sim, node: ?NodeId) void {
         if (i == 0 or i == s.current) continue;
         if (t.state == .free) continue;
         if (node) |n| if (t.node != n) continue;
+        s.noteDropped(t);
         t.state = .free;
         s.runq.remove(@intCast(i));
     }
@@ -1537,6 +1563,7 @@ pub fn crashNode(s: *Sim, node: NodeId, mode: CrashMode) void {
     }
     s.crashVfs(&s.nodes[node].vfs, node, mode);
     s.dropTasks(node);
+    sysnet.dropNode(node);
     s.nodes[node].heap.reset();
     const freed = s.net.crashNode(node, s.now_ns, &s.decider, s.config.net);
     s.record(.net_fault, node, freed, 0, "node crash");

@@ -22,9 +22,10 @@
 //! belongs to the fiber: `Sim.switchToTask` saves and restores it.
 //!
 //! What it does not see: calls the kernel answers in user space through the
-//! vDSO (`clock_gettime`, `gettimeofday`, `getcpu`) are not system calls,
-//! and `rdtsc` is an instruction (`tsc.zig` answers that one). Other
-//! threads are not trapped.
+//! vDSO (`clock_gettime`, `gettimeofday`, `getcpu`) are not system calls
+//! (in system-call mode `vdso.zig` makes them fault and answers them,
+//! through `answerFromVdso`), and `rdtsc` is an instruction (`tsc.zig`
+//! answers that one). Other threads are not trapped.
 //!
 //! Elsewhere `supported` is false and nothing is trapped.
 
@@ -211,6 +212,29 @@ pub fn end() ?Stray {
     return .{ .number = stray_first, .count = stray_count };
 }
 
+/// A vDSO function the code under test called (`vdso.zig`): answered as
+/// the system call it stands for would be. From the simulator when the
+/// caller is the code under test of a system-call-mode run; otherwise
+/// (the harness, another thread) from the kernel.
+pub fn answerFromVdso(number: u64, args: *const [6]u64) u64 {
+    const saved = selector;
+    @atomicStore(u8, &selector, allow, .seq_cst);
+    defer @atomicStore(u8, &selector, saved, .seq_cst);
+    if (saved == block and active) if (emulator) |emulate| {
+        if (number == 309) { // getcpu: processor 0, node 0, on every machine
+            if (args[0] != 0) @as(*align(1) u32, @ptrFromInt(args[0])).* = 0;
+            if (args[1] != 0) @as(*align(1) u32, @ptrFromInt(args[1])).* = 0;
+            return 0;
+        }
+        if (emulate(number, args)) |answer| return answer;
+        // Declined: stray, refused as one by system call would be.
+        if (stray_count == 0) stray_first = number;
+        stray_count +|= 1;
+        return @bitCast(-@as(i64, @backingInt(linux.E.NOSYS)));
+    };
+    return raw6(number, args[0], args[1], args[2], 0, 0, 0);
+}
+
 /// Whether this thread can trap its system calls (the kernel has syscall
 /// user dispatch).
 pub fn available() bool {
@@ -227,6 +251,17 @@ pub inline fn selectorSave() u8 {
 pub inline fn selectorRestore(value: u8) void {
     if (supported) @atomicStore(u8, &selector, value, .seq_cst);
 }
+
+/// Whether a fiber parked with this selector is inside an emulated
+/// system call (system-call mode): in the middle of whatever library made
+/// it, which may hold that library's locks.
+pub inline fn parkedInCall(saved: u8) bool {
+    return supported and emulator != null and saved == allow;
+}
+
+/// The seed of a run that dropped a task inside an emulated system call,
+/// if one has. The process's, as a C library's state is: it outlives runs.
+pub var dropped_in_call_seed: ?u64 = null;
 
 /// A new fiber starts in the code under test.
 pub inline fn fiberEntry() void {

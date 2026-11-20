@@ -5,20 +5,39 @@
 # usual ones, and `TARDIS_ITERATIONS_SCALE` multiplies its iterations, so a
 # test suite written for a quick run becomes a long one without an edit.
 # A failure prints its seed and a replay line that work without either
-# variable; the whole log is kept as an artifact.
+# variable.
+#
+# Each system's job keeps an artifact `campaign-<os>`: the whole log, one
+# file per failure (its report, with the last events of its trace, and
+# its replay line), every replay token in `replay-tokens.txt`, and
+# `failures.json`. When issues are on, a last job opens one issue per new
+# failure, or comments on the open one with the same key (the test's name
+# and its error), labelled `tardis-campaign`.
+#
+# Between runs each system keeps a directory in the Actions cache,
+# `campaign-corpus`, and names it in `TARDIS_CORPUS_DIR`. Today it holds
+# the history of the runs (salt, scale, outcome) and the failures seen
+# with their replay tokens; the library does not read it yet, so the
+# guided explorer's corpus still starts empty each run (plan3.md E4).
 #
 # Only tests that state a property for any seed belong here. A test that
 # expects a planted bug to be found within its usual iterations, or
 # compares against recorded numbers, is tied to its seeds.
 #
-# From another repository:
+# From another repository (issues are off unless asked for; the calling
+# job must grant `issues: write` either way, since a called workflow
+# cannot ask for more than its caller gives):
 #
 #   jobs:
 #     campaign:
+#       permissions:
+#         contents: read
+#         issues: write
 #       uses: 93ams/tardis/.github/workflows/campaign.yml@main
 #       with:
 #         command: zig build test
-#         scale: 50
+#         scale: "50"
+#         open_issues: true
 name: campaign
 
 on:
@@ -30,6 +49,10 @@ on:
         description: Multiply the iterations of every check by this
         type: string
         default: "20"
+      open_issues:
+        description: Open or update an issue for each failure
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       command:
@@ -44,6 +67,10 @@ on:
         description: The Zig release to build with
         type: string
         default: "0.17.0"
+      open_issues:
+        description: Open or update an issue for each failure
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -63,6 +90,9 @@ jobs:
       # names the seeds it used.
       TARDIS_CAMPAIGN_SALT: ${{ github.run_id }}
       TARDIS_ITERATIONS_SCALE: ${{ inputs.scale || '20' }}
+      # Kept between runs (actions/cache). Not read by the library yet.
+      TARDIS_CORPUS_DIR: ${{ github.workspace }}/campaign-corpus
+      CAMPAIGN_REPORT_DIR: ${{ github.workspace }}/campaign-report
       # This repository's own campaign: the tests that hold for any seed
       # (the simulator's self-fuzz and the comparisons with the real
       # filesystem and network).
@@ -74,18 +104,208 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: ${{ inputs.zig_version || '0.17.0' }}
+      # The newest corpus this system saved; a unique key per run, so each
+      # run saves its own and the next restores it by prefix.
+      - name: Restore the corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: campaign-corpus
+          key: tardis-campaign-corpus-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: tardis-campaign-corpus-${{ runner.os }}-
       - name: Campaign
+        id: campaign
         working-directory: project
         run: |
           set -o pipefail
+          mkdir -p "$TARDIS_CORPUS_DIR"
+          if [ -f "$TARDIS_CORPUS_DIR/history.tsv" ]; then
+            echo "corpus: $(wc -l < "$TARDIS_CORPUS_DIR/history.tsv") earlier runs on this system"
+          fi
           echo "salt $TARDIS_CAMPAIGN_SALT, scale $TARDIS_ITERATIONS_SCALE: $CAMPAIGN_COMMAND"
           $CAMPAIGN_COMMAND 2>&1 | tee campaign.log
       - name: The replay lines of a failure
         if: failure()
         working-directory: project
-        run: grep -E "tardis: (FAILED|replay)" campaign.log || true
+        run: |
+          grep -E "tardis: (FAILED|replay)" campaign.log || true
+      # Splits the log into one report per failure, the way `tardis scan`
+      # does (src/cmd/tardis/main.zig), and records the run in the corpus.
+      # In JavaScript, so it runs on all three systems with no setup.
+      - name: The failure reports
+        if: ${{ !cancelled() }}
+        uses: actions/github-script@v7
+        env:
+          CAMPAIGN_OUTCOME: ${{ steps.campaign.outcome }}
+          CAMPAIGN_LOG: ${{ github.workspace }}/project/campaign.log
+          MATRIX_OS: ${{ matrix.os }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const crypto = require('crypto');
+            const env = process.env;
+            const out = env.CAMPAIGN_REPORT_DIR;
+            const corpus = env.TARDIS_CORPUS_DIR;
+            fs.mkdirSync(out, { recursive: true });
+            fs.mkdirSync(corpus, { recursive: true });
+            const log = fs.existsSync(env.CAMPAIGN_LOG) ? fs.readFileSync(env.CAMPAIGN_LOG, 'utf8') : '';
+            if (log) fs.copyFileSync(env.CAMPAIGN_LOG, path.join(out, 'campaign.log'));
+            const lines = log.split('\n').map((l) => l.replace(/\r$/, ''));
+            const after = (line, prefix) => {
+              const i = line.indexOf(prefix);
+              return i < 0 ? null : line.slice(i + prefix.length).match(/^[^ \t]*/)[0];
+            };
+            const found = [];
+            let open = false;
+            for (const line of lines) {
+              if (line.includes('tardis: FAILED')) {
+                found.push({ test: '', error: '', iteration: after(line, 'iteration ') || '', persona: after(line, 'persona=') || '', seed: after(line, 'seed=') || '', replay: '', shrunk: false, report: [line] });
+                open = true;
+                continue;
+              }
+              if (found.length === 0) continue;
+              const cur = found[found.length - 1];
+              if (open && cur.report.length < 400) cur.report.push(line);
+              const e = line.indexOf('tardis: error.');
+              const tok = after(line, 'TARDIS_REPLAY=');
+              const seed = after(line, 'TARDIS_SEED=');
+              if (e >= 0) {
+                if (!cur.error) cur.error = line.slice(e + 'tardis: '.length).trim();
+              } else if (tok) {
+                cur.replay = tok;
+                cur.shrunk = true;
+              } else if (seed) {
+                if (!cur.shrunk) cur.replay = `${cur.persona}:${seed}:*`;
+              } else if (open && line.trimStart().startsWith("error: '")) {
+                const start = line.indexOf("'") + 1;
+                const end = line.indexOf("'", start);
+                const name = line.slice(start, end < 0 ? line.length : end);
+                const t = name.indexOf('.test.');
+                const short = t >= 0 ? name.slice(t + '.test.'.length) : name;
+                for (let k = found.length; k > 0 && !found[k - 1].test; k--) found[k - 1].test = short;
+                open = false;
+              }
+            }
+            // A failure with no TARDIS report (a build error, a crash):
+            // one entry with the end of the log.
+            if (found.length === 0 && env.CAMPAIGN_OUTCOME === 'failure') {
+              found.push({ test: '(no tardis report)', error: 'the campaign command failed', iteration: '', persona: '', seed: '', replay: '', shrunk: false, report: lines.slice(-80) });
+            }
+            const known = new Set();
+            const knownFile = path.join(corpus, 'failures.tsv');
+            if (fs.existsSync(knownFile)) for (const l of fs.readFileSync(knownFile, 'utf8').split('\n')) if (l) known.add(l.split('\t')[0]);
+            const failures = found.map((f, i) => {
+              const test = f.test || '(unnamed test)';
+              const error = f.error || '(no error name)';
+              const key = crypto.createHash('sha256').update(`${test}|${error}`).digest('hex').slice(0, 16);
+              const file = `failure-${i + 1}.txt`;
+              const replay = f.replay ? `TARDIS_REPLAY=${f.replay} zig build test` : '';
+              const header = [`test: ${test}`, `error: ${error}`, `system: ${env.MATRIX_OS}`, `persona: ${f.persona}`, `seed: ${f.seed}`, `iteration: ${f.iteration}`, `campaign salt: ${env.TARDIS_CAMPAIGN_SALT}, scale: ${env.TARDIS_ITERATIONS_SCALE}`, `replay: ${replay || '(none printed)'}`, ''];
+              fs.writeFileSync(path.join(out, file), header.concat(f.report).join('\n') + '\n');
+              return { key, test, error, os: env.MATRIX_OS, persona: f.persona, seed: f.seed, iteration: f.iteration, replay: f.replay, shrunk: f.shrunk, known: known.has(key), file };
+            });
+            fs.writeFileSync(path.join(out, 'failures.json'), JSON.stringify({ salt: env.TARDIS_CAMPAIGN_SALT, scale: env.TARDIS_ITERATIONS_SCALE, os: env.MATRIX_OS, outcome: env.CAMPAIGN_OUTCOME, failures }, null, 2) + '\n');
+            fs.writeFileSync(path.join(out, 'replay-tokens.txt'), failures.filter((f) => f.replay).map((f) => `${f.test}\t${f.error}\tTARDIS_REPLAY=${f.replay}`).join('\n') + '\n');
+            // The corpus: this run, and each failure the first time seen.
+            const date = new Date().toISOString();
+            fs.appendFileSync(path.join(corpus, 'history.tsv'), `${env.TARDIS_CAMPAIGN_SALT}\t${env.TARDIS_ITERATIONS_SCALE}\t${env.CAMPAIGN_OUTCOME}\t${failures.length}\t${date}\n`);
+            for (const f of failures) {
+              if (known.has(f.key)) continue;
+              known.add(f.key);
+              fs.appendFileSync(knownFile, `${f.key}\t${f.test}\t${f.error}\t${f.replay}\t${env.TARDIS_CAMPAIGN_SALT}\n`);
+            }
+            await core.summary
+              .addHeading(`Campaign on ${env.MATRIX_OS}: ${failures.length} failure(s)`, 3)
+              .addTable([[{ data: 'test', header: true }, { data: 'error', header: true }, { data: 'persona', header: true }, { data: 'seen before', header: true }, { data: 'replay token', header: true }]]
+                .concat(failures.map((f) => [f.test, f.error, f.persona, f.known ? 'yes' : 'no', f.replay])))
+              .write();
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: ${{ !cancelled() }}
         with:
           name: campaign-${{ matrix.os }}
-          path: project/campaign.log
+          path: campaign-report
+          if-no-files-found: warn
+      - name: Save the corpus
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@v4
+        with:
+          path: campaign-corpus
+          key: tardis-campaign-corpus-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+  # One issue per failure key (the test's name and its error), across the
+  # three systems: a new key opens an issue, a key with an open issue gets
+  # a comment. On by default for this repository's nightly run; off when
+  # called or run by hand unless `open_issues` is true. (`inputs` is empty
+  # on a schedule, so `toJSON` tells "not given" from "false".)
+  issues:
+    needs: campaign
+    if: ${{ !cancelled() && needs.campaign.result == 'failure' && (toJSON(inputs.open_issues) == 'true' || (github.event_name == 'schedule' && toJSON(inputs.open_issues) == 'null')) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: campaign-*
+          path: reports
+      - name: Open or update the issues
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const { owner, repo } = context.repo;
+            const label = 'tardis-campaign';
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            // Never notify anyone: no `@name` outside code, no fences
+            // broken by the log's own backticks.
+            const plain = (s) => String(s).replace(/@/g, '@​').replace(/`/g, "'");
+            const code = (s) => String(s).replace(/@/g, '@​').replace(/```/g, "'''");
+            const groups = new Map();
+            let salt = '', scale = '';
+            for (const dir of fs.existsSync('reports') ? fs.readdirSync('reports') : []) {
+              const file = path.join('reports', dir, 'failures.json');
+              if (!fs.existsSync(file)) continue;
+              const run = JSON.parse(fs.readFileSync(file, 'utf8'));
+              salt = run.salt; scale = run.scale;
+              for (const f of run.failures) {
+                const reportFile = path.join('reports', dir, f.file);
+                f.report = fs.existsSync(reportFile) ? fs.readFileSync(reportFile, 'utf8') : '';
+                if (!groups.has(f.key)) groups.set(f.key, []);
+                groups.get(f.key).push(f);
+              }
+            }
+            if (groups.size === 0) { core.info('No failure reports.'); return; }
+            try {
+              await github.rest.issues.getLabel({ owner, repo, name: label });
+            } catch {
+              await github.rest.issues.createLabel({ owner, repo, name: label, color: 'b60205', description: 'A failure found by the nightly TARDIS campaign' });
+            }
+            const issues = await github.paginate(github.rest.issues.listForRepo, { owner, repo, labels: label, state: 'all', per_page: 100 });
+            const marker = (key) => `<!-- tardis-campaign-key: ${key} -->`;
+            const describe = (fs_) => fs_.map((f) => {
+              const replay = f.replay ? `TARDIS_REPLAY=${f.replay} zig build test` : '(no replay line printed)';
+              const report = f.report.length > 12000 ? f.report.slice(0, 12000) + '\n... (cut; the whole report is in the artifact)' : f.report;
+              return [`#### ${plain(f.os)}${f.persona ? `, persona ${plain(f.persona)}` : ''}${f.seed ? `, seed ${plain(f.seed)}` : ''}`, '', 'Replay:', '', '```', code(replay), '```', '', '<details><summary>Report and trace</summary>', '', '```', code(report), '```', '', '</details>', ''].join('\n');
+            }).join('\n');
+            let opened = 0;
+            for (const [key, fs_] of groups) {
+              const { test, error } = fs_[0];
+              const intro = `The campaign run ${runUrl} (salt ${plain(salt)}, scale ${plain(scale)}) failed in \`${plain(test)}\` with \`${plain(error)}\` on ${fs_.map((f) => plain(f.os)).join(', ')}. The artifacts \`campaign-<os>\` of that run hold the whole log, this report and the replay tokens.`;
+              const body = [marker(key), intro, '', describe(fs_)].join('\n').slice(0, 60000);
+              const same = issues.filter((i) => !i.pull_request && (i.body || '').includes(marker(key)));
+              const live = same.find((i) => i.state === 'open');
+              if (live) {
+                await github.rest.issues.createComment({ owner, repo, issue_number: live.number, body });
+                core.info(`${key}: commented on #${live.number}`);
+                continue;
+              }
+              if (opened >= 10) { core.warning(`${key}: not opened, ten issues already opened by this run`); continue; }
+              const closed = same.map((i) => `#${i.number}`);
+              const title = plain(`Campaign failure: ${test} (${error})`).slice(0, 250);
+              const full = closed.length ? `${body}\n\nThe same failure was reported before in ${closed.join(', ')} (closed).` : body;
+              const made = await github.rest.issues.create({ owner, repo, title, body: full, labels: [label] });
+              opened++;
+              core.info(`${key}: opened #${made.data.number}`);
+            }

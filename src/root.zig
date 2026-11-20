@@ -34,6 +34,7 @@ const oracle = @import("check/oracle.zig");
 const forkserver = @import("sim/forkserver.zig");
 const syscalls = @import("sim/syscalls.zig");
 const tsc = @import("sim/tsc.zig");
+const vdso = @import("sim/vdso.zig");
 const sysemu = @import("sim/sysemu.zig");
 
 /// Whether `Options.virtual_tsc` answers `rdtsc` on this target (Linux
@@ -52,6 +53,15 @@ pub const syscall_mode_supported = syscalls.supported;
 /// running kernel has syscall user dispatch. For a test to skip on.
 pub fn syscallModeAvailable() bool {
     return syscalls.available();
+}
+
+/// The seed of the first run of the latest `check` whose crash dropped a
+/// task inside a system call in system-call mode, if any. A C library's
+/// state outlives runs: later runs may inherit a lock or state that run
+/// left behind, and a failure report says so. (A daemon parked when a
+/// run ends is normal for a server, and not counted.)
+pub fn droppedInCallSeed() ?u64 {
+    return syscalls.dropped_in_call_seed;
 }
 
 /// How the code under test reaches the simulation.
@@ -746,10 +756,14 @@ fn runOnce(s: *Sim, comptime body: fn (*Env) anyerror!void, seed: u64, persona: 
     // The counter first and last: arming it is a system call.
     const virtual_counter = s.config.virtual_tsc and tsc.begin(&s.now_ns);
     const emulator: ?syscalls.Emulator = if (syscalls.supported and s.config.emulate_syscalls) &sysemu.emulate else null;
+    // In system-call mode the vDSO's clocks are answered too (`vdso.zig`).
+    const vdso_trapped = emulator != null and tsc.install() and vdso.begin();
+    if (emulator != null) sysemu.resetRun();
     const trapping = s.config.trap_syscalls and syscalls.begin(emulator);
     if (s.config.emulate_syscalls and !trapping) {
         // No trap, no system-call mode: the body's calls would reach the
         // real kernel and the real disk, so it is not run.
+        if (vdso_trapped) _ = vdso.end();
         if (virtual_counter) _ = tsc.end();
         s.secEndRun();
         s.endRun();
@@ -757,9 +771,14 @@ fn runOnce(s: *Sim, comptime body: fn (*Env) anyerror!void, seed: u64, persona: 
     }
     const r = s.drive(BodyThunk(body).call, &env);
     const stray = if (trapping) syscalls.end() else null;
+    const vdso_lifted = vdso_trapped and vdso.end();
     if (virtual_counter) _ = tsc.end();
     s.secEndRun();
     var result = r.outcome;
+    if (vdso_lifted) {
+        if (s.config.report) std.debug.print("tardis: the vDSO could not stay trapped (a thread was inside it when the run began, the code read its image, or it called a vDSO function tardis does not answer): the run's later clock reads may have been the host's\n", .{});
+        result = error.StraySyscall;
+    }
     if (stray) |call| {
         if (s.config.report) std.debug.print("tardis: the code under test made {d} real system call(s), the first one {s} (number {d}): it left the simulation, so the run does not depend on its seed alone\n", .{ call.count, syscalls.name(call.number), call.number });
         // A run that left the simulation proves nothing, whether it passed
@@ -792,6 +811,10 @@ fn reportFailure(s: *Sim, err: anyerror, iteration: u32, iterations: u32, seed: 
         \\
     , .{ iteration + 1, iterations, @tagName(persona), seed, @errorName(err) });
     s.trace.dump(16);
+    if (syscalls.dropped_in_call_seed) |earlier| if (earlier != seed) std.debug.print(
+        "tardis: an earlier run (seed=0x{x}) dropped a task inside a system call, and a C library's state outlives a run: if this failure does not come back on replay, that run's leftovers are the likely cause\n",
+        .{earlier},
+    );
     if (forced.len == 0) {
         std.debug.print("tardis: replay with:  TARDIS_SEED=0x{x:0>16} TARDIS_PERSONA={s} zig build test\n\n", .{ seed, @tagName(persona) });
         return;
@@ -1173,6 +1196,8 @@ pub fn check(gpa: Allocator, comptime body: fn (*Env) anyerror!void, options: Op
 }
 
 fn checkOn(gpa: Allocator, s: *Sim, comptime body: fn (*Env) anyerror!void, options: Options) anyerror!void {
+    // Notes on C state left behind are about this check's own runs.
+    syscalls.dropped_in_call_seed = null;
     if (options.replay) |text| return runToken(gpa, s, body, text, options);
     if (replayTokenFromEnv(gpa)) |text| {
         defer gpa.free(text);

@@ -14,7 +14,11 @@
 //! The kernel's vDSO reads the counter too: a real `clock_gettime` made
 //! during such a run computes its answer from the virtual counter, and is
 //! wrong. Code under test should not be calling it (`trap_syscalls` does
-//! not see it either); the simulator does not.
+//! not see it either, but system-call mode answers it, `vdso.zig`); the
+//! simulator does not.
+//!
+//! The same handler answers calls into the vDSO while system-call mode
+//! has it protected (`vdso.zig`): it offers every fault there first.
 //!
 //! The handler runs on the stack of the task that faulted, like Zig's own
 //! crash handler: a fault caused by a stack overflow is not reported by
@@ -25,6 +29,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const syscalls = @import("syscalls.zig");
+const vdso = @import("vdso.zig");
 
 pub const supported = builtin.os.tag == .linux and builtin.cpu.arch == .x86_64;
 
@@ -60,6 +65,9 @@ fn onSegv(sig: i32, info: ?*anyopaque, context: ?*anyopaque) callconv(.c) void {
     const gregs: [*]u64 = @ptrFromInt(@intFromPtr(context.?) + gregs_offset);
     // `siginfo_t` starts with `si_signo`, `si_errno`, `si_code`.
     const code = @as(*const [3]i32, @ptrCast(@alignCast(info.?)))[2];
+    // A call into the protected vDSO (system-call mode, `vdso.zig`).
+    const fault_address = @as(*const usize, @ptrFromInt(@intFromPtr(info.?) + 16)).*; // si_addr
+    if (!reading and vdso.onFault(fault_address, gregs)) return;
     if (clock != null and code == si_kernel and !reading) {
         const now = clock.?;
         // A general protection fault can also come from a jump to a
@@ -89,7 +97,8 @@ fn onSegv(sig: i32, info: ?*anyopaque, context: ?*anyopaque) callconv(.c) void {
     _ = syscalls.raw6(13, sigsegv, @intFromPtr(&previous), 0, @sizeOf(u64), 0, 0);
 }
 
-fn install() bool {
+/// Installs the SIGSEGV handler (shared with `vdso.zig`).
+pub fn install() bool {
     // One thread installs; the others wait for it, so `previous` is
     // written once and is never this handler.
     while (true) {
@@ -98,9 +107,17 @@ fn install() bool {
             else => std.atomic.spinLoopHint(),
         }
     }
+    // The handler before this one, first: if it runs on an alternate
+    // signal stack (to report a stack overflow), so does this one, and a
+    // fault that is not ours reaches it on that stack.
+    if (@as(i64, @bitCast(syscalls.raw6(13, sigsegv, 0, @intFromPtr(&previous), @sizeOf(u64), 0, 0))) < 0) {
+        installed.store(0, .release);
+        return false;
+    }
+    const sa_onstack = 0x08000000;
     const act: syscalls.KernelSigaction = .{
         .handler = @intFromPtr(&onSegv),
-        .flags = 4 | 0x04000000 | 0x40000000, // SA_SIGINFO | SA_RESTORER | SA_NODEFER
+        .flags = (4 | 0x04000000 | 0x40000000) | (previous.flags & sa_onstack), // SA_SIGINFO | SA_RESTORER | SA_NODEFER
         .restorer = @intFromPtr(&syscalls.restorer),
         .mask = 0,
     };

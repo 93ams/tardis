@@ -180,11 +180,13 @@ allows that (`zig build test-sqlite -Dsqlite`).
 
 What to know before relying on it:
 
-- No sockets, pipes, `mmap` of a file, `dup` or `poll` yet: each is a stray
-  call.
-- A clock read that libc answers through the vDSO (`time`,
-  `gettimeofday`, `clock_gettime` on most systems) is not a system call:
-  it returns the host's time and nothing reports it.
+- IPv4 sockets are emulated, blocking ones only: a non-blocking socket,
+  `poll`, `epoll`, pipes, `mmap` of a file and `dup` are stray calls.
+- Clock reads that libc answers through the vDSO are answered from the
+  simulation too, by making the vDSO's code fault during a run.
+- A task dropped (by a crash, or the end of a run) inside a C library
+  call can leave that library's lock or state behind for later runs; the
+  run says so, and so do later failure reports.
 - Owners, permission bits and record locks are not modelled.
 - State a library keeps for the life of the process is carried from one
   run to the next. `check` re-runs every 16th iteration and fails with
