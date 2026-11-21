@@ -218,10 +218,13 @@ pub const Options = struct {
     /// system call: it asked the kernel for the time, random bytes, a file
     /// or a socket instead of going through `env.io`, so the run no longer
     /// depends on its seed alone. Linux on x86_64 (syscall user dispatch,
-    /// Linux 5.11); ignored elsewhere, in forked iterations, in `sim`'s
-    /// loop form and on worker threads' setup. `TARDIS_TRAP_SYSCALLS=1` turns it on for every
-    /// check of a test run.
-    trap_syscalls: bool = false,
+    /// Linux 5.11); ignored elsewhere, in forked iterations and in `sim`'s
+    /// loop form. Left null, the environment
+    /// decides: `TARDIS_TRAP_SYSCALLS=1` turns it on for every check of a
+    /// test run that did not say. `false` keeps it off whatever the
+    /// environment says, for a check whose body makes real calls on
+    /// purpose (system-call mode traps regardless).
+    trap_syscalls: ?bool = null,
     /// How the code under test reaches the simulation: through `env.io`
     /// alone (`.std_io`, the default), or through its own system calls as
     /// well (`.syscalls`, Linux on x86_64). See `SimMode`. System-call mode
@@ -379,7 +382,7 @@ fn simConfig(o: Options) Sim.Config {
         .preempt_ppm = o.preempt_ppm,
         .async_inline_ppm = o.async_inline_ppm,
         .swarm = o.swarm,
-        .trap_syscalls = o.trap_syscalls or o.mode == .syscalls or trapSyscallsFromEnv(),
+        .trap_syscalls = o.mode == .syscalls or (o.trap_syscalls orelse trapSyscallsFromEnv()),
         .emulate_syscalls = o.mode == .syscalls,
         .virtual_tsc = o.virtual_tsc,
         .faults = o.faults,
@@ -577,6 +580,15 @@ pub const Env = struct {
     /// Ends the watch on `name` (the work it watched is done).
     pub fn progressDone(env: *Env, comptime name: []const u8) void {
         env.sim.watchDisarm(explore.labelHash(name));
+    }
+
+    /// The `std.Io` operations this run has called that the simulator does
+    /// not model (the first four distinct names, as `std.Io.VTable` spells
+    /// them). Such a call gets the answer `std.Io.failing` gives it (an
+    /// error; setting timestamps does nothing and succeeds) and never
+    /// reaches the real system; a failure report lists them.
+    pub fn refusedCalls(env: *const Env) []const []const u8 {
+        return env.sim.refusedCalls();
     }
 
     /// Cost counters for this run so far.
@@ -983,6 +995,7 @@ fn reportFailure(s: *Sim, err: anyerror, iteration: u32, iterations: u32, seed: 
         \\
     , .{ iteration + 1, iterations, @tagName(persona), seed, @errorName(err) });
     s.trace.dump(16);
+    s.printRefused();
     if (syscalls.dropped_in_call_seed) |earlier| if (earlier != seed) std.debug.print(
         "tardis: an earlier run (seed=0x{x}) dropped a task inside a system call, and a C library's state outlives a run: if this failure does not come back on replay, that run's leftovers are the likely cause\n",
         .{earlier},

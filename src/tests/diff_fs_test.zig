@@ -263,6 +263,8 @@ test "diff_fs: the simulated filesystem agrees with the real one on random opera
     try tardis.check(testing.allocator, body, .{
         .iterations = 2000,
         .personas = &.{host_persona},
+        // The body calls the real filesystem, which is the point.
+        .trap_syscalls = false,
         // The model alone: no faults, no latency.
         .faults = .{ .short_io_ppm = 0, .spurious_wakeup_ppm = 0, .io_latency_min_ns = 0, .io_latency_max_ns = 0, .datagram_loss_ppm = 0, .datagram_duplicate_ppm = 0 },
         // The real calls run on the task's stack, and Windows' path

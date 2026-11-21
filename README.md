@@ -13,12 +13,18 @@ secret tracking, lock-order checks, Byzantine peers, constant-time checks,
 MC/DC and signed evidence bundles.
 
 New here? The [tutorial](docs/tutorial.md) goes from an empty test to a found,
-shrunk and fixed bug, and [`examples/`](examples) has twenty-four small programs,
+shrunk and fixed bug, and [`examples/`](examples) has twenty-six small programs,
 each with one planted bug and its fix. [docs/stability.md](docs/stability.md)
 says what may change between releases, and what a seed is and is not
 promised to mean. [docs/qualification.md](docs/qualification.md) lists what
 the tool is required to do, the tests behind each requirement, and its
 known limits, for anyone who has to justify relying on it.
+
+Three shorter guides: [docs/reproducing.md](docs/reproducing.md) takes a
+failure from a CI log to your machine, [docs/trace.md](docs/trace.md)
+reads a run as a timeline in Perfetto, and
+[docs/threads.md](docs/threads.md) says why real threads are outside the
+simulation and what to use instead.
 
 The design and its status are in [plan.md](plan.md) (core) and
 [plan2.md](plan2.md) (security layer). Both say what is verified by tests and
@@ -110,8 +116,9 @@ code. The salt and the scale are for nightly campaigns
 it); `zig build` does not know they changed, so a cached test result is
 not run again for them. To look at a run instead of reading its last events,
 `tardis.traceJson` writes it as a Chrome trace that Perfetto opens: one track
-per task, in virtual time. `tardis explain <token>` (the `tardis` program in `src/cmd/tardis`)
-decodes a token.
+per task, in virtual time ([docs/trace.md](docs/trace.md)). `tardis explain <token>` (the `tardis` program in `src/cmd/tardis`)
+decodes a token. [docs/reproducing.md](docs/reproducing.md) has the whole
+path from a failed CI run to a local replay, and what must match.
 
 ## Options worth knowing
 
@@ -272,7 +279,8 @@ worked example.
 
 `scripts/verify.sh` runs the formatting check and the suite in all four
 build modes and with `-Dsec`; `.github/workflows/test.yml` runs the suite
-on Linux, macOS and Windows.
+on Linux, macOS and Windows. The build cache grows without bound;
+[docs/housekeeping.md](docs/housekeeping.md) says how to clean it.
 
 Useful flags: `-Dtest-filter=<text>`, `-Doptimize=<mode>`, `-Dsec`,
 `-Dlibc` (link libc; the fork server then uses libc's `fork`),
@@ -287,6 +295,10 @@ Useful flags: `-Dtest-filter=<text>`, `-Doptimize=<mode>`, `-Dsec`,
   file, clock, sleep and random-byte calls from the simulation instead
   ("Choosing a mode"). `Options.virtual_tsc` (same platform) answers
   `rdtsc` with the run's virtual time.
+- Real threads are not simulated. Code that calls `std.Thread.spawn` runs
+  outside the simulation and is not made deterministic; use `io.async`,
+  `io.concurrent` and `std.Io.Mutex` instead
+  ([docs/threads.md](docs/threads.md)).
 - A fiber stack is 256 KiB by default. An overflow faults on the guard page
   below the stack; raise `limits.fiber_stack_bytes` if a test needs more.
 - Shadow memory and the race detector check only code built as a separate

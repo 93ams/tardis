@@ -28,6 +28,8 @@ any bug.
 | `oom_partial` | half-finished update when memory runs out | `always` | 7/20 | 18/20 | 20/20 |
 | `counter` | lost update between tasks | `always` | 20/20 | 20/20 | 20/20 |
 | `check_then_act` | check, then act | `always` | 19/20 | 20/20 | 20/20 |
+| `lin_register` | a compare-and-swap that is not atomic | `tardis.lin` | 13/20 | 19/20 | 20/20 |
+| `write_skew` | write skew between transactions | `tardis.elle` | 20/20 | 20/20 | 20/20 |
 | `deadlock` | deadlock from lock order | deadlock | 20/20 | 20/20 | 20/20 |
 | `livelock` | livelock from retrying in step | `expectProgress` | 19/20 | 20/20 | 20/20 |
 | `hidden_state` | state that survives a run | determinism check | 20/20 | 20/20 | 20/20 |
@@ -39,7 +41,7 @@ any bug.
 | `stale_read` | a stale read from a follower | `always` | 20/20 | 20/20 | 20/20 |
 | `replica` | replica left behind by a partition | `always` | 20/20 | 20/20 | 20/20 |
 
-Measured on Windows at revision 85. `syscall_rename` (system-call mode,
+Measured on Windows at revision 87. `syscall_rename` (system-call mode,
 Linux on x86_64) is not in this run; its bug is caught by `always`.
 
 How to read it:
@@ -48,14 +50,12 @@ How to read it:
   allocation that fails, an I/O error on one path) are the ones a campaign
   of 10 iterations can miss. The default campaign is 100.
 - These oracles have a row: `always`, `sometimes`, the deadlock and
-  livelock detectors, the leak check and the determinism check.
+  livelock detectors, the leak check, the determinism check, and the two
+  history checkers (`tardis.lin`, `tardis.elle`).
 - No row yet: the stray-system-call trap (Linux; its tests are in
   `syscall_test.zig`).
-- Not in the table: the linearizability and transaction-anomaly checkers
-  (`tardis.lin`, `tardis.elle`). They judge recorded histories, and their
-  tests feed them histories with known verdicts (`lin_test.zig`,
-  `elle_test.zig`); no example program plants a bug for them yet. The
-  security layer has its own campaigns (`zig build evidence`).
+- Not in the table: the security layer's oracles, which have their own
+  campaigns (`zig build evidence`).
 
 ## 2. Memory one simulator takes
 
@@ -66,18 +66,19 @@ reservation and the largest single allocations. The first of those:
 
 | Options | Most memory live at once |
 |---|---|
-| defaults (`.{}`) | 2.4 MiB |
-| `nodes = 3` | 4.8 MiB |
-| `nodes = 8` | 10.6 MiB |
-| `limits.tasks_max = 1024` | 4.7 MiB |
-| `explore = .guided` | 2.7 MiB |
-| `workers = 4` (four simulators and the caller's) | 12.2 MiB |
-| `limits.trace_ring_len = 4096` | 2.8 MiB |
-| security layer (`tardis_sec`, its defaults) | 3.2 MiB |
-| security layer with `shadow_memory` | 11.3 MiB |
-| security layer with `data_races` | 5.0 MiB |
+| defaults (`.{}`) | 1.4 MiB |
+| `nodes = 3` | 3.8 MiB |
+| `nodes = 8` | 9.6 MiB |
+| `nodes = 32` (the most there can be) | 37.6 MiB |
+| `limits.tasks_max = 1024` | 3.7 MiB |
+| `explore = .guided` | 1.7 MiB |
+| `workers = 4` (four simulators and the caller's) | 7.2 MiB |
+| `limits.trace_ring_len = 4096` | 1.8 MiB |
+| security layer (`tardis_sec`, its defaults) | 2.2 MiB |
+| security layer with `shadow_memory` | 10.3 MiB |
+| security layer with `data_races` | 4.0 MiB |
 
-Measured on Windows at revision 85.
+Measured on Windows at revision 86.
 
 What the numbers are made of:
 
@@ -88,8 +89,10 @@ What the numbers are made of:
   `limits.vfs.pages_max` (8 MiB by default), and keeps what the fullest
   run of the campaign used. Before revision 84 every node took the whole
   8 MiB at the start: 10.2 MiB for the defaults and 72.6 MiB for 8 nodes.
-- **Once, 1 MiB:** the network's receive buffers (`limits.net.sockets_max`
-  times `rx_buffer_bytes`), whether or not the test opens a socket.
+- **Once, 1 MiB, from the first socket:** the network's receive buffers
+  (`limits.net.sockets_max` times `rx_buffer_bytes`). The benchmark's body
+  opens no socket, so the table does not include them. Before revision 86
+  they were allocated at the start (a default simulator took 2.4 MiB).
 - **Fiber stacks are not in the count.** They are reserved address space,
   `limits.tasks_max` times `limits.fiber_stack_bytes` (16 MiB by default,
   256 MiB with 1024 tasks), and only the pages a task touches become

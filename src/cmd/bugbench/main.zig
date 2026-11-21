@@ -85,6 +85,8 @@ fn oracleOf(err: anyerror) []const u8 {
         error.NonDeterministic => "determinism check",
         error.StraySyscall => "stray system call",
         error.SecurityViolation => "security layer",
+        error.NotLinearizable => "`tardis.lin`",
+        error.TransactionalAnomaly => "`tardis.elle`",
         else => "the body's own error",
     };
 }
@@ -164,6 +166,8 @@ fn all(gpa: std.mem.Allocator, io: std.Io, comptime each: anytype) !bool {
     ok = try each(gpa, io, "oom_partial", "half-finished update when memory runs out", @import("oom_partial")) and ok;
     ok = try each(gpa, io, "counter", "lost update between tasks", @import("counter")) and ok;
     ok = try each(gpa, io, "check_then_act", "check, then act", @import("check_then_act")) and ok;
+    ok = try each(gpa, io, "lin_register", "a compare-and-swap that is not atomic", @import("lin_register")) and ok;
+    ok = try each(gpa, io, "write_skew", "write skew between transactions", @import("write_skew")) and ok;
     ok = try each(gpa, io, "deadlock", "deadlock from lock order", @import("deadlock")) and ok;
     ok = try each(gpa, io, "livelock", "livelock from retrying in step", @import("livelock")) and ok;
     ok = try each(gpa, io, "hidden_state", "state that survives a run", @import("hidden_state")) and ok;

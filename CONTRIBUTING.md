@@ -11,6 +11,10 @@ the security layer attached to every check. It takes a while; `zig build
 test` alone is the quick loop. CI runs the suite on Linux, macOS and
 Windows.
 
+The build cache grows with every mode and flag and is never trimmed. If a
+build fails with an error named `Unexpected`, or WSL with `E_FAIL`, check
+free disk space first: [docs/housekeeping.md](docs/housekeeping.md).
+
 The build fetches [termancy](https://github.com/93ams/termancy), pinned to
 a commit, for the `tardis` program and the suite that tests termancy. To
 work on both at once, `zig build test --fork=../termancy` uses a local
@@ -44,10 +48,23 @@ checkout in its place.
 - `src/sec`: the security layer, a separate module over the core's seam.
 - `src/cmd`: the programs (`tardis`, the benchmarks, the demo).
 - `examples/`, `docs/`: what a new user reads first.
+- `.github/workflows`: CI. [docs/reproducing.md](docs/reproducing.md)
+  says what each workflow keeps when it fails.
 
 ## Reporting a bug
 
 A failing seed is the best report: the `tardis: replay with:` line from
-the failure, the Zig version, and the platform. If the simulator itself
-misbehaves (a run that is not deterministic, a model that differs from
-the real system), say what the real system does and how you know.
+the failure, the Zig version, the platform, and the options of the
+failing check. The bug report template asks for each, and
+[docs/reproducing.md](docs/reproducing.md) says where to find the line in
+a CI log. If the simulator itself misbehaves (a run that is not
+deterministic, a model that differs from the real system), say what the
+real system does and how you know.
+
+A vulnerability in TARDIS itself goes through the private route in
+[SECURITY.md](SECURITY.md), not a public issue.
+
+## Conduct
+
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) says how people here are
+expected to treat each other. It is a draft until the owner accepts it.

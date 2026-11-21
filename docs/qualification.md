@@ -47,7 +47,7 @@ build test`; file names are under `src/tests/` unless they say otherwise.
 | R11 | check linearizability and transactional anomalies correctly on recorded histories | `lin_test.zig`, `elle_test.zig` (histories with known verdicts) |
 | R12 | in the exhaustive search, visit every schedule within the stated depth, and with reduction or merging reach the same set of outcomes | `sec/tests/pillar45_test.zig` (the vote model: with reduction and with merging, fewer executions, the same verdicts and the same outcomes); `zig build bench` holds the counts, 9,216 and 3,073, to their recorded values |
 | R13 | never let an unsimulated `std.Io` call reach the real system | by construction: the simulator's call table starts as `std.Io.failing` (`plan.md` §11) |
-| R14 | find each bug in its benchmark of planted bugs, and pass each fix | `zig build bugbench` (twenty-four programs), run in CI; how often by campaign size: `docs/measurements.md` |
+| R14 | find each bug in its benchmark of planted bugs, and pass each fix | `zig build bugbench` (twenty-six programs), run in CI; how often by campaign size: `docs/measurements.md` |
 | R15 | in system-call mode (`Options.mode = .syscalls`, Linux x86_64), answer the file, clock, sleep and random-byte system calls from the simulation as the kernel would answer them with no fault, and fail the run that makes any other call | `sysmode_test.zig`: random sequences of file calls compared with the real kernel (ext4); the same program by system call and by `std.Io` gives one trace and one result after a crash; a call that is not emulated fails the run. `test/sqlite.zig` (not part of `zig build test`) |
 
 Requirements R5, R6 and R7 are the ones that carry the tool's fidelity,

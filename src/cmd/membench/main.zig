@@ -124,6 +124,7 @@ pub fn main() !void {
     try row("defaults (`.{}`)", .{});
     try row("`nodes = 3`", .{ .nodes = 3 });
     try row("`nodes = 8`", .{ .nodes = 8 });
+    try row("`nodes = 32` (the most there can be)", .{ .nodes = 32 });
     try row("`limits.tasks_max = 1024`", .{ .limits = .{ .tasks_max = 1024 } });
     try row("`explore = .guided`", .{ .explore = .guided });
     try row("`workers = 4` (four simulators and the caller's)", .{ .workers = 4 });

@@ -268,6 +268,11 @@ watches_armed: u8 = 0,
 child_abort: ?*const fn (s: *Sim, err: anyerror) noreturn = null,
 /// The watch that ran out, once: `drive` then ends the run.
 stalled: ?u8 = null,
+/// The `std.Io` calls this run made that the simulator does not model
+/// (the first `refused.len` distinct names) and how many such calls.
+refused: [4][]const u8 = undefined,
+refused_len: u8 = 0,
+refused_calls: u32 = 0,
 /// Scheduling points and simulated operations so far in this run (what a
 /// watch's steps count).
 sched_points: u64 = 0,
@@ -750,8 +755,9 @@ fn warmOnlySnapshotState(s: *const Sim) bool {
     // waits for it.
     const me = s.current;
     if (me != s.control or s.runq.count != 1 or s.timer_heap_len != 0) return false;
-    // A progress watch armed by setup is not in a snapshot.
-    if (s.watches_armed != 0) return false;
+    // A progress watch armed by setup is not in a snapshot, and neither
+    // are the unmodelled calls setup made.
+    if (s.watches_armed != 0 or s.refused_len != 0) return false;
     for (s.tasks, 0..) |t, i| {
         if (i != 0 and i != me and t.state != .free) return false;
     }
@@ -1285,6 +1291,8 @@ pub const Watch = struct {
 };
 
 fn watchReset(s: *Sim) void {
+    s.refused_len = 0;
+    s.refused_calls = 0;
     s.watches = @splat(.{});
     s.watches_armed = 0;
     s.stalled = null;
@@ -1744,7 +1752,7 @@ pub fn daemonFailed(s: *Sim, err: anyerror) void {
 /// The security layer found a violation: the run fails with
 /// `error.SecurityViolation` (the layer keeps the details).
 pub fn securityFailed(s: *Sim, cwe: u16) void {
-    s.record(.note, s.tasks[s.current].node, cwe, 0, "security violation (a = CWE)");
+    s.record(.note, s.tasks[s.current].node, cwe, 0, "security violation (a = node, b = CWE)");
     if (s.daemon_error == null) s.daemon_error = error.SecurityViolation;
 }
 
@@ -2167,8 +2175,152 @@ const vtable: Io.VTable = blk: {
     v.dirReadLink = dirReadLink;
     v.processSpawn = processSpawn;
     v.processReplace = processReplace;
+    v.fileIsTty = fileIsTty;
+    v.fileSupportsAnsiEscapeCodes = fileSupportsAnsiEscapeCodes;
+    v.fileEnableAnsiEscapeCodes = fileEnableAnsiEscapeCodes;
+    // Every entry that is still std's own refuses the call. Each is wrapped
+    // so that the run remembers which one it was (plan3.md D1).
+    @setEvalBranchQuota(100_000);
+    const table = @typeInfo(Io.VTable).@"struct";
+    for (table.field_names, table.field_types) |name, T| {
+        if (refusalIsQuiet(name)) continue;
+        const theirs = @field(Io.failing.vtable.*, name);
+        if (@field(v, name) == theirs) @field(v, name) = refusing(name, T, theirs);
+    }
     break :blk v;
 };
+
+/// No simulated file is a terminal. (`std.Io.failing` has `unreachable`
+/// for these three, which a program that asks would run into.)
+fn fileIsTty(userdata: ?*anyopaque, file: File) Io.Cancelable!bool {
+    _ = userdata;
+    _ = file;
+    return false;
+}
+
+fn fileSupportsAnsiEscapeCodes(userdata: ?*anyopaque, file: File) Io.Cancelable!bool {
+    _ = userdata;
+    _ = file;
+    return false;
+}
+
+fn fileEnableAnsiEscapeCodes(userdata: ?*anyopaque, file: File) File.EnableAnsiEscapeCodesError!void {
+    _ = userdata;
+    _ = file;
+    return error.NotTerminalDevice;
+}
+
+/// Entries left to `std.Io.failing` that are not wrapped. For three the
+/// answer there is a fine answer for a simulated program ("stderr is
+/// busy", "no progress pipe"). The two `fileWriteFile` entries answer
+/// "unimplemented" and std then copies by reading and writing, which is
+/// simulated: `Dir.copyFile` works, and the program never called them.
+fn refusalIsQuiet(comptime name: []const u8) bool {
+    for ([_][]const u8{ "crashHandler", "tryLockStderr", "progressParentFile", "fileWriteFileStreaming", "fileWriteFilePositional" }) |quiet| {
+        if (std.mem.eql(u8, name, quiet)) return true;
+    }
+    return false;
+}
+
+/// Entries that are `unreachable` in `std.Io.failing`. Most cannot be
+/// called without an earlier call having succeeded (a memory map that was
+/// never created, a child that was never spawned); `lockStderr` and
+/// `netInterfaceName` can. Under the simulator each panics by name where
+/// std would be undefined behaviour in a release build. The list is kept
+/// by hand: an entry that a later Zig makes `unreachable` is not on it
+/// until someone adds it.
+fn refusalPanics(comptime name: []const u8) bool {
+    for ([_][]const u8{
+        "lockStderr",           "unlockStderr",
+        "childWait",            "childKill",
+        "fileMemoryMapDestroy", "fileMemoryMapSetLength",
+        "fileMemoryMapRead",    "fileMemoryMapWrite",
+        "netInterfaceName",
+    }) |name_panics| {
+        if (std.mem.eql(u8, name, name_panics)) return true;
+    }
+    return false;
+}
+
+/// `orig` (an entry of `std.Io.failing`) behind a function that first notes
+/// `name` in the simulator.
+fn refusing(comptime name: []const u8, comptime P: type, comptime orig: anytype) P {
+    const info = @typeInfo(@typeInfo(P).pointer.child).@"fn";
+    const R = info.return_type.?;
+    const p = info.param_types;
+    if (p.len == 0 or p[0].? != ?*anyopaque) return orig;
+    return switch (p.len) {
+        1 => &struct {
+            fn f(u: ?*anyopaque) R {
+                noteRefused(u, name);
+                return orig(u);
+            }
+        }.f,
+        2 => &struct {
+            fn f(u: ?*anyopaque, a: p[1].?) R {
+                noteRefused(u, name);
+                return orig(u, a);
+            }
+        }.f,
+        3 => &struct {
+            fn f(u: ?*anyopaque, a: p[1].?, b: p[2].?) R {
+                noteRefused(u, name);
+                return orig(u, a, b);
+            }
+        }.f,
+        4 => &struct {
+            fn f(u: ?*anyopaque, a: p[1].?, b: p[2].?, c: p[3].?) R {
+                noteRefused(u, name);
+                return orig(u, a, b, c);
+            }
+        }.f,
+        5 => &struct {
+            fn f(u: ?*anyopaque, a: p[1].?, b: p[2].?, c: p[3].?, d: p[4].?) R {
+                noteRefused(u, name);
+                return orig(u, a, b, c, d);
+            }
+        }.f,
+        6 => &struct {
+            fn f(u: ?*anyopaque, a: p[1].?, b: p[2].?, c: p[3].?, d: p[4].?, e: p[5].?) R {
+                noteRefused(u, name);
+                return orig(u, a, b, c, d, e);
+            }
+        }.f,
+        7 => &struct {
+            fn f(u: ?*anyopaque, a: p[1].?, b: p[2].?, c: p[3].?, d: p[4].?, e: p[5].?, g: p[6].?) R {
+                noteRefused(u, name);
+                return orig(u, a, b, c, d, e, g);
+            }
+        }.f,
+        else => @compileError("std.Io." ++ name ++ " takes more arguments than `refusing` wraps"),
+    };
+}
+
+fn noteRefused(userdata: ?*anyopaque, comptime name: []const u8) void {
+    if (comptime refusalPanics(name)) @panic("tardis: the program called std.Io." ++ name ++ ", which the simulator does not model");
+    const s: *Sim = @ptrCast(@alignCast(userdata.?));
+    s.refused_calls +|= 1;
+    for (s.refused[0..s.refused_len]) |have| {
+        if (have.ptr == name.ptr) return;
+    }
+    if (s.refused_len == s.refused.len) return;
+    s.refused[s.refused_len] = name;
+    s.refused_len += 1;
+}
+
+/// The names of the unmodelled `std.Io` calls this run has made so far (at
+/// most the first four distinct ones).
+pub fn refusedCalls(s: *const Sim) []const []const u8 {
+    return s.refused[0..s.refused_len];
+}
+
+/// One line for a failure report, when the run made such a call.
+pub fn printRefused(s: *const Sim) void {
+    if (s.refused_len == 0) return;
+    std.debug.print("tardis: this run called std.Io operations the simulator does not model ({d} call{s}):", .{ s.refused_calls, if (s.refused_calls == 1) "" else "s" });
+    for (s.refusedCalls()) |name| std.debug.print(" {s}", .{name});
+    std.debug.print("{s}. Each got the answer std.Io.failing gives it (an error; setting timestamps does nothing and succeeds) and reached nothing real.\n", .{if (s.refused_len == s.refused.len) " (and maybe others)" else ""});
+}
 
 // --- tasks -----------------------------------------------------------------
 

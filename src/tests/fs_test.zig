@@ -36,6 +36,29 @@ test "write, read back, stat, rename, delete through std.Io APIs" {
     }.run, .{ .iterations = 20 });
 }
 
+test "an operation the simulator does not model fails and is named" {
+    try tardis.check(testing.allocator, struct {
+        fn run(env: *tardis.Env) !void {
+            try testing.expectEqual(@as(usize, 0), env.refusedCalls().len);
+            var buf: [64]u8 = undefined;
+            try testing.expectError(error.FileNotFound, env.dir.realPath(env.io, &buf));
+            try testing.expectError(error.FileNotFound, env.dir.realPath(env.io, &buf));
+            // Asking whether a file is a terminal is answered, not refused.
+            var f = try env.dir.createFile(env.io, "f", .{});
+            defer f.close(env.io);
+            try testing.expect(!try f.isTty(env.io));
+            try testing.expect(!try f.supportsAnsiEscapeCodes(env.io));
+            try testing.expectError(error.NotTerminalDevice, f.enableAnsiEscapeCodes(env.io));
+            // Copying works (std falls back to reading and writing) and
+            // is not a refused call either.
+            try env.dir.copyFile("f", env.dir, "g", env.io, .{});
+            const refused = env.refusedCalls();
+            try testing.expectEqual(@as(usize, 1), refused.len);
+            try testing.expectEqualStrings("dirRealPath", refused[0]);
+        }
+    }.run, .{ .iterations = 3 });
+}
+
 test "streaming reader and writer survive short reads and writes" {
     try tardis.check(testing.allocator, struct {
         fn run(env: *tardis.Env) !void {

@@ -142,6 +142,9 @@ pub const Net = struct {
     gpa: Allocator,
     limits: Limits,
     sockets: []Socket,
+    /// Every socket's receive buffer, `limits.rx_buffer_bytes` each. Empty
+    /// until a run first opens a socket: a test without a network does not
+    /// pay for it (1 MiB with the default limits).
     rx_pool: []u8,
     seg_pool: []Segment,
     node_count: u8,
@@ -157,15 +160,13 @@ pub const Net = struct {
         const n: usize = limits.sockets_max;
         const sockets = try gpa.alloc(Socket, n);
         errdefer gpa.free(sockets);
-        const rx_pool = try gpa.alloc(u8, n * limits.rx_buffer_bytes);
-        errdefer gpa.free(rx_pool);
         const seg_pool = try gpa.alloc(Segment, n * limits.segments_max);
         errdefer gpa.free(seg_pool);
         var net: Net = .{
             .gpa = gpa,
             .limits = limits,
             .sockets = sockets,
-            .rx_pool = rx_pool,
+            .rx_pool = &.{},
             .seg_pool = seg_pool,
             .node_count = node_count,
             .reach = undefined,
@@ -174,7 +175,7 @@ pub const Net = struct {
         for (sockets, 0..) |*s, i| {
             s.kind = .free;
             s.generation = 0;
-            s.rx = rx_pool[i * limits.rx_buffer_bytes ..][0..limits.rx_buffer_bytes];
+            s.rx = &.{};
             s.segs = seg_pool[i * limits.segments_max ..][0..limits.segments_max];
         }
         net.reset();
@@ -257,7 +258,17 @@ pub const Net = struct {
     // ------------------------------------------------------------------
     // Allocation
 
+    /// Allocates the receive buffers, at the first socket of the first run
+    /// that opens one. They are kept from then on. Host memory running out
+    /// here is not something to report to the program under test.
+    fn rxAttach(net: *Net) void {
+        const each: usize = net.limits.rx_buffer_bytes;
+        net.rx_pool = net.gpa.alloc(u8, net.sockets.len * each) catch @panic("tardis: out of host memory for the simulated network's receive buffers");
+        for (net.sockets, 0..) |*s, i| s.rx = net.rx_pool[i * each ..][0..each];
+    }
+
     fn alloc(net: *Net, kind: Kind, node: NodeId, port: u16) ?u16 {
+        if (net.rx_pool.len == 0) net.rxAttach();
         for (net.sockets, 0..) |*s, i| {
             if (s.kind != .free) continue;
             s.kind = kind;
