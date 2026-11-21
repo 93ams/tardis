@@ -7,8 +7,11 @@
 //! entering the kernel. The handler notes the call if it is not one the
 //! simulator and the test harness make themselves (memory, writes to the
 //! terminal, futexes, signals, exiting), then makes the call for the
-//! thread, so the program goes on as it would have. `end` says which call
-//! was the first stray one.
+//! thread, so the program goes on as it would have. Four calls it does not
+//! make: one that starts a thread or a process (clone, clone3, fork,
+//! vfork) is refused with EAGAIN, because the child would begin inside
+//! the handler. `end` says which call was the first stray one and how
+//! many were refused.
 //!
 //! The handler returns through its own two-instruction restorer, which the
 //! kernel is told to let through, so the thread is back to "blocked" before
@@ -43,6 +46,8 @@ threadlocal var selector: u8 = allow;
 threadlocal var armed = false;
 threadlocal var stray_count: u32 = 0;
 threadlocal var stray_first: u64 = 0;
+/// Stray calls that were refused, not made (`startsThreadOrProcess`).
+threadlocal var stray_refused: u32 = 0;
 /// True between `begin` and `end`.
 threadlocal var active = false;
 threadlocal var emulator: ?Emulator = null;
@@ -70,6 +75,14 @@ fn expected(number: u64, arg0: u64) bool {
         13, 14, 15, 131 => true, // rt_sigaction, rt_sigprocmask, rt_sigreturn, sigaltstack
         60, 231, 62, 234, 186, 39 => true, // exit, exit_group, kill, tgkill, gettid, getpid
         157 => true, // prctl (turning the trap off)
+        else => false,
+    };
+}
+
+/// clone, fork, vfork, clone3: calls the trap refuses instead of making.
+pub fn startsThreadOrProcess(number: u64) bool {
+    return switch (number) {
+        56, 57, 58, 435 => true,
         else => false,
     };
 }
@@ -143,8 +156,18 @@ fn onSigsys(_: i32, _: ?*anyopaque, context: ?*anyopaque) callconv(.c) void {
             @atomicStore(u8, &selector, block, .seq_cst);
             return;
         }
+        // A new thread or process would begin its life inside this
+        // handler, and nothing it did would be seen. The call is not made:
+        // the caller is told to try again later, and the run fails.
+        if (startsThreadOrProcess(number)) {
+            stray_refused +|= 1;
+            gregs[@backingInt(Reg.rax)] = @bitCast(@as(i64, -@as(i64, @backingInt(linux.E.AGAIN))));
+            @atomicStore(u8, &selector, block, .seq_cst);
+            return;
+        }
     }
-    // Make the call for the thread: it sees what it would have seen.
+    // Make the call for the thread: it sees what it would have seen. (The
+    // calls refused above never get here.)
     gregs[@backingInt(Reg.rax)] = raw6(
         number,
         a,
@@ -194,13 +217,16 @@ pub fn begin(emulate: ?Emulator) bool {
     if (!arm()) return false;
     stray_count = 0;
     stray_first = 0;
+    stray_refused = 0;
     emulator = emulate;
     active = true;
     @atomicStore(u8, &selector, block, .seq_cst);
     return true;
 }
 
-pub const Stray = struct { number: u64, count: u32 };
+/// `count` stray calls, the first of them `number`; `refused` of them
+/// would have started a thread or a process and were not made.
+pub const Stray = struct { number: u64, count: u32, refused: u32 };
 
 /// The run ended: the first system call that left the simulation, if any.
 pub fn end() ?Stray {
@@ -209,7 +235,7 @@ pub fn end() ?Stray {
     active = false;
     emulator = null;
     if (stray_count == 0) return null;
-    return .{ .number = stray_first, .count = stray_count };
+    return .{ .number = stray_first, .count = stray_count, .refused = stray_refused };
 }
 
 /// A vDSO function the code under test called (`vdso.zig`): answered as
@@ -300,6 +326,8 @@ pub fn name(number: u64) []const u8 {
         42 => "connect",
         56 => "clone",
         57 => "fork",
+        58 => "vfork",
+        435 => "clone3",
         59 => "execve",
         96 => "gettimeofday",
         201 => "time",

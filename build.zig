@@ -200,7 +200,10 @@ pub fn build(b: *std.Build) void {
             }),
             .filters = test_filters,
         });
-        examples_step.dependOn(&b.addRunArtifact(t).step);
+        const run_example = b.addRunArtifact(t);
+        // A failure's replay line then names the step that runs it.
+        run_example.setEnvironmentVariable("TARDIS_REPLAY_COMMAND", "zig build test-examples");
+        examples_step.dependOn(&run_example.step);
     }
     test_step.dependOn(examples_step);
 
@@ -230,6 +233,11 @@ pub fn build(b: *std.Build) void {
     run_rates.addArg("--rates");
     const rates_step = b.step("bugbench-rates", "Print which oracle catches each planted bug, and how often by campaign size");
     rates_step.dependOn(&run_rates.step);
+    // `zig build bugbench-baselines`: the baseline table (plan3.md F2).
+    const run_baselines = b.addRunArtifact(bugbench);
+    run_baselines.addArg("--baselines");
+    const baselines_step = b.step("bugbench-baselines", "Print whether each planted bug is still found without faults, and without preemption");
+    baselines_step.dependOn(&run_baselines.step);
 
     // `zig build run`: demo of a crash-consistency bug found per persona.
     const demo = b.addExecutable(.{

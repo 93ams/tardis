@@ -89,6 +89,12 @@ jobs:
         run: |
           python3 scripts/doc_check.py
           zig build docs
+      # A fresh project fetches the packed tree and runs the tutorial's
+      # example against it (plan3.md B2).
+      - name: The package, from a fresh project
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: tardis
+        run: bash scripts/package_check.sh
       - name: Benchmarks against their budgets
         if: matrix.os == 'ubuntu-latest'
         working-directory: tardis

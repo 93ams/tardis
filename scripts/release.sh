@@ -6,6 +6,7 @@
 #
 # It checks that the working tree is clean, sets the version in
 # build.zig.zon, runs the full local verification (scripts/verify.sh), the
+# package check (scripts/package_check.sh, on the last commit), the
 # bug benchmark (a planted bug that is missed fails the release), the
 # benchmark budgets and the API reference build, writes the release notes
 # (the CHANGELOG entries since the last release tag) to
@@ -65,6 +66,8 @@ grep -q "\.version = \"$version\"," build.zig.zon || fail "could not set the ver
 if [ "${SKIP_VERIFY:-0}" != "1" ]; then
   echo "== verification (formatting, four build modes, -Dsec)"
   ZIG="$ZIG" bash scripts/verify.sh || fail "the verification failed"
+  echo "== the package, from a fresh project"
+  ZIG="$ZIG" bash scripts/package_check.sh || fail "a fresh project could not fetch and use the package"
   echo "== bug benchmark"
   "$ZIG" build bugbench -Doptimize=ReleaseSafe || fail "the bug benchmark missed a planted bug, or a fix failed"
   echo "== benchmark budgets"

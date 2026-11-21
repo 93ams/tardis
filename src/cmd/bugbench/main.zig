@@ -17,6 +17,11 @@
 //! how many of 20 campaigns with different seeds, at 10, 50 and 200
 //! iterations. One campaign finding a bug says little about the next
 //! one; the rate says how large a campaign has to be.
+//!
+//! `zig build bugbench-baselines` prints the baseline table (plan3.md
+//! F2): for each program, whether a campaign of its usual size still
+//! finds the bug with no faults injected, with no preemption, with
+//! neither, and as it is, and what the failing run shrinks to.
 
 const std = @import("std");
 const tardis = @import("tardis");
@@ -128,14 +133,162 @@ fn rateRow(gpa: std.mem.Allocator, io: std.Io, comptime name: []const u8, compti
     return found[rate_sizes.len - 1] == rate_campaigns;
 }
 
+/// A campaign with a part of the exploration taken away, applied on top
+/// of the program's own options.
+const Baseline = enum {
+    /// Schedules are explored; nothing is injected. Every rate in
+    /// `Options.faults` is zero, file operations take no modeled time, a
+    /// power loss neither tears a file nor loses metadata, and a crashed
+    /// peer's connection is reset, never black-holed. What the body does
+    /// itself (a power loss, a partition, a targeted I/O error) still
+    /// happens, and a power loss still keeps or drops each unsynced
+    /// file's data, whole, by a draw.
+    no_faults,
+    /// Faults are injected; no task is switched out at an `std.Io` call
+    /// that does not block, and `io.async` never runs its task inline.
+    /// When a task blocks (a lock, a sleep, a socket, the modeled time of
+    /// a file operation) the next one is still drawn among those that can
+    /// run.
+    no_preemption,
+    /// Both.
+    neither,
+
+    fn apply(b: Baseline, o: *tardis.Options) void {
+        if (b != .no_preemption) {
+            o.faults = .{
+                .io_error_ppm = 0,
+                .short_io_ppm = 0,
+                .oom_ppm = 0,
+                .spurious_wakeup_ppm = 0,
+                .io_latency_min_ns = 0,
+                .io_latency_max_ns = 0,
+                .torn_writes = false,
+                .metadata_loss = false,
+                .net_reset_ppm = 0,
+                .clock_drift_ppm_max = 0,
+                .datagram_loss_ppm = 0,
+                .datagram_duplicate_ppm = 0,
+            };
+            o.net.blackhole_ppm = 0;
+        }
+        if (b != .no_faults) {
+            o.preempt_ppm = 0;
+            o.async_inline_ppm = 0;
+        }
+    }
+};
+
+/// Whether the baseline campaign finds the bug. A campaign that fails
+/// with the fixed program too has not found it: it fails for another
+/// reason (a `sometimes` that needs a fault, say).
+fn baselineCell(gpa: std.mem.Allocator, comptime module: type, base: tardis.Options, b: Baseline) []const u8 {
+    // The failure the default campaign finds: a cell is "yes" only for
+    // the same one.
+    var plain = base;
+    plain.shrink = false;
+    const want: ?anyerror = if (Run(module.buggy).check(gpa, plain)) |_| null else |err| err;
+    var o = base;
+    b.apply(&o);
+    o.shrink = false;
+    if (Run(module.buggy).check(gpa, o)) |_| return "no" else |err| {
+        if (want != null and want.? != err) return "no: it fails another way";
+    }
+    return if (Run(module.fixed).check(gpa, o)) |_| "yes" else |_| "no: the fix fails too";
+}
+
+/// Trouble the example's body makes itself, which no option takes away.
+fn ownTrouble(comptime name: []const u8) []const u8 {
+    const table = .{
+        .{ "wal_kv", "power loss" },
+        .{ "dir_sync", "power loss" },
+        .{ "rename_unsynced", "power loss" },
+        .{ "syscall_rename", "power loss" },
+        .{ "in_place_rewrite", "an I/O error on a write it chooses, power loss" },
+        .{ "index_before_data", "power loss" },
+        .{ "id_reuse", "power loss" },
+        .{ "jobs", "power loss" },
+        .{ "deadlock", "a sleep while holding one lock" },
+        .{ "livelock", "sleeps while holding one lock" },
+        .{ "lease", "a step of the wall clock" },
+        .{ "replica", "a partition" },
+    };
+    inline for (table) |entry| {
+        if (comptime std.mem.eql(u8, name, entry[0])) return entry[1];
+    }
+    return "";
+}
+
+/// The example's trouble: what its body does, then the fault rates its
+/// options set away from their defaults.
+fn troubleText(buf: []u8, comptime name: []const u8, faults: tardis.FaultOptions) []const u8 {
+    const defaults: tardis.FaultOptions = .{};
+    var w: std.Io.Writer = .fixed(buf);
+    w.writeAll(ownTrouble(name)) catch unreachable;
+    inline for (.{ "io_error_ppm", "short_io_ppm", "oom_ppm", "spurious_wakeup_ppm", "net_reset_ppm", "clock_drift_ppm_max", "datagram_loss_ppm", "datagram_duplicate_ppm" }) |field| {
+        if (@field(faults, field) != @field(defaults, field)) {
+            if (w.end != 0) w.writeAll(", ") catch unreachable;
+            w.print("`{s} = {d}`", .{ field, @field(faults, field) }) catch unreachable;
+        }
+    }
+    return w.buffered();
+}
+
+fn baselineRow(gpa: std.mem.Allocator, io: std.Io, comptime name: []const u8, comptime class: []const u8, comptime module: type) !bool {
+    _ = io;
+    _ = class;
+    if (@hasDecl(module, "supported") and (!module.supported or !tardis.syscallModeAvailable())) {
+        std.debug.print("| `{s}` | not run: no system-call mode on this system | | | | | |\n", .{name});
+        return true;
+    }
+    var base: tardis.Options = if (@hasDecl(module, "options")) module.options else .{ .iterations = 200 };
+    base.report = false;
+
+    const no_faults = baselineCell(gpa, module, base, .no_faults);
+    const no_preemption = baselineCell(gpa, module, base, .no_preemption);
+    const neither = baselineCell(gpa, module, base, .neither);
+
+    var shrunk: tardis.ShrinkReport = .{};
+    var campaign = base;
+    campaign.shrink_report = &shrunk;
+    const found = if (Run(module.buggy).check(gpa, campaign)) |_| false else |_| true;
+    var fix = base;
+    fix.shrink = false;
+    const fix_holds = if (Run(module.fixed).check(gpa, fix)) |_| true else |_| false;
+
+    var trouble: [160]u8 = undefined;
+    var reduced: [48]u8 = undefined;
+    const reduced_text = if (shrunk.shrunk)
+        std.fmt.bufPrint(&reduced, "{d} -> {d} decisions", .{ shrunk.before, shrunk.after }) catch unreachable
+    else
+        "not shrunk";
+    std.debug.print("| `{s}` | {s} | {s} | {s} | {s} | {s} | {s} |\n", .{
+        name,
+        troubleText(&trouble, name, base.faults),
+        no_faults,
+        no_preemption,
+        neither,
+        if (!found) "NO" else if (fix_holds) "yes" else "NO: THE FIX FAILS TOO",
+        if (found) reduced_text else "",
+    });
+    return found and fix_holds;
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
     var args = try init.minimal.args.iterateAllocator(gpa);
     defer args.deinit();
     _ = args.skip();
-    const rates = if (args.next()) |a| std.mem.eql(u8, a, "--rates") else false;
-    if (rates) {
+    const mode = args.next() orelse "";
+    if (std.mem.eql(u8, mode, "--baselines")) {
+        std.debug.print("| Program | The example's own trouble | No faults | No preemption | Neither | Default | Failing run of the default |\n|---|---|---|---|---|---|---|\n", .{});
+        if (!try all(gpa, io, baselineRow)) {
+            std.debug.print("\nbugbench: the default campaign missed a planted bug, or a fix failed\n", .{});
+            std.process.exit(1);
+        }
+        return;
+    }
+    if (std.mem.eql(u8, mode, "--rates")) {
         std.debug.print("| Program | Bug class | Caught by | 10 iterations | 50 iterations | 200 iterations |\n|---|---|---|---|---|---|\n", .{});
         if (!try all(gpa, io, rateRow)) {
             std.debug.print("\nbugbench: a planted bug was missed by a campaign of 200 iterations\n", .{});

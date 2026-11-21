@@ -45,10 +45,19 @@ Cases where the report differs:
 - A forked iteration whose child process crashed prints one line that
   ends in `replay with:  TARDIS_SEED=… TARDIS_PERSONA=…`.
 
-Every line ends in `zig build test`. That text is fixed: the library does
-not know which command started it. If the failing test runs under another
-step (`zig build test-examples`, or your project's own step), put that
-step in its place.
+Every line ends in a command, `zig build test` unless told otherwise:
+the library does not know which command started it. A build script says
+so by setting `TARDIS_REPLAY_COMMAND` on the run step of its tests (one
+line of printable text, at most 128 bytes, read in test builds), as this
+repository's `build.zig` does for `zig build test-examples`:
+
+```zig
+const run = b.addRunArtifact(tests);
+run.setEnvironmentVariable("TARDIS_REPLAY_COMMAND", "zig build my-tests");
+```
+
+Without it, if the failing test runs under another step, put that step in
+place of `zig build test`.
 
 ## Running it locally
 

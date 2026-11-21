@@ -124,13 +124,14 @@ release ([stability.md](stability.md)).
 - **Labels are cut at 40 bytes**, so a long path loses its end.
 - **The security layer's findings are not in the trace.** When
   `tardis_sec` fails a run, the trace gets one `note` event on the task
-  that was running, with the label
-  `security violation (a = node, b = CWE)`.
-  Nothing else of the finding is there: not its message, not the
-  addresses or tainted bytes, not the two accesses of a race. The layer
-  keeps those itself; a `certify` campaign writes them to the evidence
-  bundle's SARIF. Putting them in the trace is the open half of
-  `plan3.md` C9.
+  that was running: the node in `a`, the CWE number in `b`, and a label
+  that starts with `security:` and names the kind of finding where the
+  engine knows it (`security: data_race`, `security: lock_order`) or else
+  where it was seen (`security: in a path`,
+  `security: in bytes leaving the node`). Nothing else of the finding is
+  there: not its message, not the addresses or tainted bytes, not the two
+  accesses of a race. The layer keeps those itself; a `certify` campaign
+  writes them to the evidence bundle's SARIF.
 - **Only what the simulator saw.** Code that left the simulation
   ([threads.md](threads.md)) leaves no events.
 - **A run of its own.** `traceJson` runs the body again; it does not dump

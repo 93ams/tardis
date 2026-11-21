@@ -1,8 +1,9 @@
 # Measurements
 
-Two tables that the repository can print again at any time. Numbers in the
-first follow from the seeds and are the same on every machine; the second
-depends on the allocator's rounding and may move by a few kilobytes.
+Three tables that the repository can print again at any time. Numbers in
+the first and the third follow from the seeds and are the same on every
+machine; the second depends on the allocator's rounding and may move by a
+few kilobytes.
 
 ## 1. Which oracle catches which bug, and how often
 
@@ -103,3 +104,98 @@ What the numbers are made of:
 - The files a test writes, `env.allocator` (up to
   `limits.heap_bytes_max`) and a guided corpus come on top, as the test
   uses them.
+
+## 3. What each part of the exploration contributes
+
+`zig build bugbench-baselines -Doptimize=ReleaseSafe` (`plan3.md` F2).
+Each program runs the campaign of its own options four times, and a cell
+says whether the bug was found. A campaign counts only if the fixed
+program passes the same one.
+
+- **No faults:** schedules are explored and nothing is injected. Every
+  rate in `Options.faults` is zero, the ones the example sets included;
+  file operations take no modeled time; a power loss neither tears a file
+  nor loses metadata; `net.blackhole_ppm` is zero.
+- **No preemption:** faults are injected, `preempt_ppm = 0` and
+  `async_inline_ppm = 0`. A task is never switched out at a call that
+  does not block. When a task does block (a lock, a sleep, a socket, the
+  modeled time of a file operation) the scheduler still draws the next
+  one among those that can run.
+- **Neither:** both at once.
+- **Default:** the campaign as the example asks for it. The last column is
+  its failing run: decisions before shrinking and after.
+
+No option takes away what an example's body does itself. The second
+column names it, and the fault rates the example's options set. A power
+loss the body calls still keeps or drops each unsynced file's data, whole,
+by a draw, in every column. The inputs a body draws with `env.fuzz` and
+the network's latency are drawn in every column too.
+
+| Program | The example's own trouble | No faults | No preemption | Neither | Default | Failing run of the default |
+|---|---|---|---|---|---|---|
+| `wal_kv` | power loss | yes | yes | yes | yes | 52 -> 3 decisions |
+| `dir_sync` | power loss | no | yes | no | yes | 13 -> 2 decisions |
+| `rename_unsynced` | power loss | yes | yes | yes | yes | 25 -> 1 decisions |
+| `syscall_rename` | not run: no system-call mode on this system | | | | | |
+| `in_place_rewrite` | an I/O error on a write it chooses, power loss | yes | yes | yes | yes | 15 -> 0 decisions |
+| `index_before_data` | power loss | yes | yes | yes | yes | 86 -> 3 decisions |
+| `id_reuse` | power loss | yes | yes | yes | yes | 34 -> 2 decisions |
+| `jobs` | power loss | yes | yes | yes | yes | 112 -> 1 decisions |
+| `short_write` |  | no | yes | no | yes | 22 -> 2 decisions |
+| `short_read` |  | no | yes | no | yes | 19 -> 2 decisions |
+| `error_leak` | `io_error_ppm = 50000` | no | yes | no | yes | 28 -> 4 decisions |
+| `oom_partial` | `oom_ppm = 100000` | no | yes | no | yes | 14 -> 2 decisions |
+| `counter` |  | yes | yes | no | yes | 41 -> 1 decisions |
+| `check_then_act` |  | yes | no | no | yes | 27 -> 4 decisions |
+| `lin_register` |  | yes | yes | no | yes | 63 -> 2 decisions |
+| `write_skew` |  | yes | yes | no | yes | 25 -> 1 decisions |
+| `deadlock` | a sleep while holding one lock | yes | yes | yes | yes | 18 -> 0 decisions |
+| `livelock` | sleeps while holding one lock | yes | yes | yes | yes | 521 -> 1 decisions |
+| `hidden_state` |  | yes | yes | yes | yes | not shrunk |
+| `never_retried` | `io_error_ppm = 100000` | no: the fix fails too | yes | no: the fix fails too | yes | not shrunk |
+| `lease` | a step of the wall clock | yes | yes | yes | yes | 16 -> 1 decisions |
+| `udp_retry` | `datagram_loss_ppm = 200000`, `datagram_duplicate_ppm = 0` | no | yes | no | yes | 96 -> 1 decisions |
+| `udp_order` | `datagram_loss_ppm = 0`, `datagram_duplicate_ppm = 300000` | yes | yes | yes | yes | 30 -> 1 decisions |
+| `udp_no_timeout` | `datagram_loss_ppm = 150000`, `datagram_duplicate_ppm = 0` | no | yes | no | yes | 22 -> 1 decisions |
+| `stale_read` |  | yes | yes | yes | yes | not shrunk |
+| `replica` | a partition | yes | yes | yes | yes | not shrunk |
+
+Measured on Windows at revision 89. `syscall_rename` (system-call mode,
+Linux on x86_64) is not in this run.
+
+How to read it:
+
+- **Bugs that need a fault** are the ones with "no" under "No faults":
+  metadata lost in a power loss (`dir_sync`), a short transfer
+  (`short_write`, `short_read`), an I/O error (`error_leak`), an
+  allocation that fails (`oom_partial`), a datagram lost (`udp_retry`,
+  `udp_no_timeout`). `never_retried` belongs here as well: its `sometimes`
+  needs an I/O error, so without faults the fixed program fails it too and
+  the campaign tells nothing apart.
+- **Bugs that need schedule exploration** are `check_then_act`, `counter`,
+  `lin_register` and `write_skew`: found with no faults, not found with
+  neither. Only `check_then_act` needs preemption as such. The other
+  three are still found with `preempt_ppm = 0`, because each file
+  operation's modeled time is a point where a task blocks and the
+  scheduler draws; take that away too and they pass.
+- **Bugs that need neither** are the rest. Six need only the power loss
+  their test calls and the draw of what unsynced data it keeps (`wal_kv`,
+  `rename_unsynced`, `in_place_rewrite`, `index_before_data`, `id_reuse`,
+  `jobs`). `deadlock` and `livelock` sleep while holding a lock, and the
+  draw among the tasks that can run when one blocks is enough. `lease`
+  steps the clock itself, `replica` partitions the network itself, and
+  `udp_order` and `stale_read` are found with what is still drawn in
+  that column (the network's latency, the task that runs when one
+  blocks). `hidden_state` is caught by running a seed twice.
+- Of those, `in_place_rewrite`, `deadlock` and `replica` fail in a plain
+  run as well (`zig build bugbench`); the first two shrink to 0 decisions.
+- The default campaign finds every bug, and the command fails if it does
+  not. `hidden_state` and `never_retried` are not shrunk because their
+  failure is not one run's; `stale_read` and `replica` turn shrinking off.
+
+Zig's built-in fuzzer is not run as a baseline. `std.testing.fuzz` hands
+the test a `std.testing.Smith` and chooses the values the test draws from
+it, so what it drives is a program's input. Which task runs next, whether
+a write is short and what a power loss keeps are decided by the `std.Io`
+the test uses, which the fuzzer does not supply. A test binary that is
+not built in fuzz mode runs only the corpus the test passes.

@@ -1,6 +1,7 @@
 //! TARDIS: deterministic simulation testing for Zig `std.Io` programs.
 //!
-//! See `plan.md` for the design. Entry points:
+//! The user guide is `docs/guide.md`; `plan.md` is the design record.
+//! Entry points:
 //!
 //! * `check(gpa, body, options)`: run `body(*Env)` across many seeds and
 //!   personas; report a replayable failure.
@@ -358,6 +359,37 @@ pub const FailureLog = struct {
         return null;
     }
 };
+
+var replay_command_state: std.atomic.Value(u8) = .init(0); // 0 unknown, 1 being read, 2 known
+var replay_command_buf: [128]u8 = undefined;
+var replay_command_len: usize = 0;
+
+/// The command a replay line ends in: `zig build test`, or what
+/// `TARDIS_REPLAY_COMMAND` says (read once, in test builds). A build script
+/// sets it on the run step of tests that another step runs, so that the
+/// line a failure prints can be pasted as it is.
+fn replayCommand() []const u8 {
+    const default = "zig build test";
+    if (!builtin.is_test) return default;
+    while (true) switch (replay_command_state.load(.acquire)) {
+        2 => return if (replay_command_len == 0) default else replay_command_buf[0..replay_command_len],
+        1 => std.atomic.spinLoopHint(),
+        else => if (replay_command_state.cmpxchgStrong(0, 1, .acquire, .monotonic) == null) {
+            const a = std.heap.page_allocator;
+            if (std.testing.environ.getAlloc(a, "TARDIS_REPLAY_COMMAND")) |text| {
+                defer a.free(text);
+                // A command is one line of printable text that fits.
+                var ok = text.len > 0 and text.len <= replay_command_buf.len;
+                for (text) |c| ok = ok and c >= 0x20 and c < 0x7f;
+                if (ok) {
+                    @memcpy(replay_command_buf[0..text.len], text);
+                    replay_command_len = text.len;
+                }
+            } else |_| {}
+            replay_command_state.store(2, .release);
+        },
+    };
+}
 
 var trap_env: std.atomic.Value(u8) = .init(0); // 0 unknown, 1 off, 2 on
 
@@ -958,7 +990,8 @@ fn runOnce(s: *Sim, comptime body: fn (*Env) anyerror!void, seed: u64, persona: 
         result = error.StraySyscall;
     }
     if (stray) |call| {
-        if (s.config.report) std.debug.print("tardis: the code under test made {d} real system call(s), the first one {s} (number {d}): it left the simulation, so the run does not depend on its seed alone\n", .{ call.count, syscalls.name(call.number), call.number });
+        if (s.config.report) std.debug.print("tardis: the code under test tried {d} real system call(s), the first one {s} (number {d}): it left the simulation, so the run does not depend on its seed alone\n", .{ call.count, syscalls.name(call.number), call.number });
+        if (s.config.report and call.refused != 0) std.debug.print("tardis: {d} of them would have started a thread or a process, which the simulation cannot hold: refused, not made (docs/threads.md)\n", .{call.refused});
         // A run that left the simulation proves nothing, whether it passed
         // or failed: its outcome does not follow from its seed.
         result = error.StraySyscall;
@@ -1001,12 +1034,12 @@ fn reportFailure(s: *Sim, err: anyerror, iteration: u32, iterations: u32, seed: 
         .{earlier},
     );
     if (forced.len == 0) {
-        std.debug.print("tardis: replay with:  TARDIS_SEED=0x{x:0>16} TARDIS_PERSONA={s} zig build test\n\n", .{ seed, @tagName(persona) });
+        std.debug.print("tardis: replay with:  TARDIS_SEED=0x{x:0>16} TARDIS_PERSONA={s} {s}\n\n", .{ seed, @tagName(persona), replayCommand() });
         return;
     }
     var buf: [ShrinkReport.token_bytes_max]u8 = undefined;
     if (shrink.formatToken(&buf, @tagName(persona), seed, null, forced)) |t| {
-        std.debug.print("tardis: replay with:  TARDIS_REPLAY={s} zig build test\n\n", .{t});
+        std.debug.print("tardis: replay with:  TARDIS_REPLAY={s} {s}\n\n", .{ t, replayCommand() });
     }
 }
 
@@ -1067,7 +1100,7 @@ fn reportShrunk(s: *Sim, sh: *shrink.Shrinker, persona: Persona, seed: u64, repo
     std.debug.print("tardis: shrunk {d} -> {d} decisions and lowered {d} values in {d} runs (every other decision is benign: no fault, no preemption, nothing lost in a crash, minimal input)\n", .{ report.before, report.after, report.values, report.runs });
     s.trace.dump(16);
     if (report.token_len > 0) {
-        std.debug.print("tardis: replay the shrunk run with:  TARDIS_REPLAY={s} zig build test\n\n", .{report.token()});
+        std.debug.print("tardis: replay the shrunk run with:  TARDIS_REPLAY={s} {s}\n\n", .{ report.token(), replayCommand() });
     } else {
         std.debug.print("tardis: the shrunk replay token is too long to print\n\n", .{});
     }
@@ -1234,7 +1267,7 @@ fn fuzzyReplay(gpa: Allocator, s: *Sim, comptime body: fn (*Env) anyerror!void, 
                         if (s.config.report) {
                             std.debug.print("\ntardis: FAILED  replay token, with {d} of its {d} decisions moved by {d} draws (the code draws differently than when the token was made)\ntardis: error.{s}\n", .{ moved, keys.len, d, @errorName(err) });
                             s.trace.dump(32);
-                            if (report.token_len > 0) std.debug.print("tardis: the token for this code:  TARDIS_REPLAY={s} zig build test\n\n", .{report.token()});
+                            if (report.token_len > 0) std.debug.print("tardis: the token for this code:  TARDIS_REPLAY={s} {s}\n\n", .{ report.token(), replayCommand() });
                         }
                         return err;
                     };
@@ -2348,7 +2381,7 @@ fn forkRange(gpa: Allocator, s: *Sim, comptime body: fn (*Env) anyerror!void, op
         try r.outcome; // the setup itself failed
         if (ctx.crashed) {
             const it = ctx.failed_at.?;
-            if (s.config.report) std.debug.print("tardis: iteration {d} crashed its forked child (persona={s}); replay with:  TARDIS_SEED=0x{x:0>16} TARDIS_PERSONA={s} zig build test\n", .{ it + 1, @tagName(persona), runSeed(options.campaign_seed, it, pi), @tagName(persona) });
+            if (s.config.report) std.debug.print("tardis: iteration {d} crashed its forked child (persona={s}); replay with:  TARDIS_SEED=0x{x:0>16} TARDIS_PERSONA={s} {s}\n", .{ it + 1, @tagName(persona), runSeed(options.campaign_seed, it, pi), @tagName(persona), replayCommand() });
             return error.ChildCrashed;
         }
         if (ctx.failed_at) |f| best = if (best) |b| @min(b, f) else f;
@@ -2940,7 +2973,7 @@ pub const Simulation = struct {
                 \\
             , .{ self.iteration + 1, self.options.iterations, @tagName(self.persona()), self.s.seed });
             self.s.trace.dump(16);
-            std.debug.print("tardis: replay with:  TARDIS_SEED=0x{x:0>16} TARDIS_PERSONA={s} zig build test\n\n", .{ self.s.seed, @tagName(self.persona()) });
+            std.debug.print("tardis: replay with:  TARDIS_SEED=0x{x:0>16} TARDIS_PERSONA={s} {s}\n\n", .{ self.s.seed, @tagName(self.persona()), replayCommand() });
             self.s.endRun();
             self.s.overlay = null;
             self.s.recorder = null;

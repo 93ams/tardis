@@ -89,21 +89,23 @@ What it catches:
 - Asking the kernel for anything through a system call: opening or
   reading a real file, a socket, `getrandom`, `nanosleep`, a clock read
   that is a real system call.
-- Starting a thread, probably not cleanly. It takes a system call
-  (`clone`, from Zig's `std.Thread.spawn` without libc), which is not on
-  the list of expected calls, so it does not pass unseen. But the trap
-  makes a stray call again from inside its signal handler, and a `clone`
-  that gives the child a new stack would resume the child inside that
-  handler: a crash is the likely result, not a tidy report. The suite has
-  tests for stray `getrandom`, file and socket calls and none that starts
-  a thread; this is from reading the code and has not been run.
+- Starting a thread or a process. `clone`, `clone3`, `fork` and `vfork`
+  are not made at all (the other stray calls are made and counted; in
+  system-call mode no stray call is made, and these get `ENOSYS` like
+  the rest): the caller gets "try again" (`EAGAIN`), which
+  `std.Thread.spawn` returns as `error.ThreadQuotaExceeded` without libc,
+  and the run fails with `error.StraySyscall` and a line saying how many
+  calls were refused. A thread
+  begun from inside the trap's signal handler could not be left to run.
+  Tested for `std.Thread.spawn` without libc (`syscall_test.zig`); with
+  libc the call is libc's own, std maps the answer to
+  `error.SystemResources`, and it has not been tried.
 
 What it does not catch:
 
-- **Anything the new thread does.** The trap is set for the thread that
-  runs the simulation. Other threads are not trapped: the thread's
-  creation is seen, its work is not. A thread that existed before the run
-  began (a pool made outside the body) is not seen at all.
+- **Threads that already exist.** The trap is set for the thread that
+  runs the simulation. A thread that existed before the run began (a pool
+  made outside the body) is not trapped, and its work is not seen.
 - **Calls the harness makes too.** These are let through, whoever makes
   them: memory calls (`mmap`, `mprotect`, `munmap`, `brk`, `mremap`,
   `madvise`), `write` and `writev` to standard output and standard error,

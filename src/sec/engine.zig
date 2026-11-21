@@ -993,7 +993,7 @@ pub fn lockAcquire(class: u16) void {
         .detail = .{ held, class },
         .at_ns = s.now_ns,
     });
-    s.securityFailed(833);
+    s.securityFailed(833, "lock_order");
 }
 
 fn onFileLock(ctx: *anyopaque, node: seam.NodeId, inode: u32, held: bool) void {
@@ -1022,7 +1022,7 @@ pub fn cSink(sink: SinkKind, bytes: []const u8) u16 {
         .detail = .{ 0, s.currentNode() },
         .at_ns = s.now_ns,
     });
-    s.securityFailed(cwe);
+    s.securityFailed(cwe, @tagName(kind));
     return cwe;
 }
 
@@ -1061,7 +1061,7 @@ pub fn spectreLoad(addr: usize, value: u64) void {
         .detail = .{ @intCast(@min(scale, std.math.maxInt(u16))), s.currentNode() },
         .at_ns = s.now_ns,
     });
-    s.securityFailed(1037);
+    s.securityFailed(1037, "spectre_v1");
 }
 
 /// Instrumented code is about to read or write `len` bytes at `addr`
@@ -1146,7 +1146,7 @@ fn raceAccess(e: *Engine, addr: usize, len: usize, write: bool) void {
         .detail = .{ r.other, node },
         .at_ns = s.now_ns,
     });
-    s.securityFailed(362);
+    s.securityFailed(362, "data_race");
 }
 
 /// The first bad access of a run is its finding, and fails it.
@@ -1171,7 +1171,7 @@ fn heapAccess(e: *Engine, addr: usize, len: usize, write: bool) void {
         .detail = .{ @intCast(@min(len, std.math.maxInt(u16))), s.currentNode() },
         .at_ns = s.now_ns,
     });
-    s.securityFailed(kind.cwe());
+    s.securityFailed(kind.cwe(), @tagName(kind));
 }
 
 /// A security-critical comparison's result, possibly inverted: one
@@ -1193,7 +1193,7 @@ pub fn cSpawn(argv: []const []const u8) u16 {
     const e = active() orelse return 0;
     const s = tardis.Sim.activeOrNull().?;
     const cwe = onCapability(e, s.currentNode(), .process_spawn, argv);
-    if (cwe != 0) s.securityFailed(cwe);
+    if (cwe != 0) s.securityFailed(cwe, "a process started from C");
     return cwe;
 }
 

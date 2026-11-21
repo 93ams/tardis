@@ -1751,8 +1751,13 @@ pub fn daemonFailed(s: *Sim, err: anyerror) void {
 
 /// The security layer found a violation: the run fails with
 /// `error.SecurityViolation` (the layer keeps the details).
-pub fn securityFailed(s: *Sim, cwe: u16) void {
-    s.record(.note, s.tasks[s.current].node, cwe, 0, "security violation (a = node, b = CWE)");
+/// `what` goes into the trace: the kind of finding where the caller knows
+/// it, otherwise where it was seen.
+pub fn securityFailed(s: *Sim, cwe: u16, what: []const u8) void {
+    // In the trace: a = node, b = CWE (docs/trace.md).
+    var label: [trace_mod.label_bytes_max]u8 = undefined;
+    const text = std.fmt.bufPrint(&label, "security: {s}", .{what[0..@min(what.len, label.len - 10)]}) catch unreachable;
+    s.record(.note, s.tasks[s.current].node, cwe, 0, text);
     if (s.daemon_error == null) s.daemon_error = error.SecurityViolation;
 }
 
@@ -1768,7 +1773,7 @@ pub fn secTokens(s: *Sim) []const u64 {
 pub fn secEndRun(s: *Sim) void {
     const a = s.sec orelse return;
     const cwe = a.provider.end_run(a.ctx);
-    if (cwe != 0) s.securityFailed(cwe);
+    if (cwe != 0) s.securityFailed(cwe, "found at the end of the run");
 }
 
 /// The security layer's key for this run's first finding (seam 4): 0
@@ -1803,14 +1808,14 @@ pub fn secCampaignEnd(s: *Sim, end: *const seam.CampaignEnd) void {
 
 fn secViolationThunk(ctx: *anyopaque, cwe: u16) void {
     const s: *Sim = @ptrCast(@alignCast(ctx));
-    s.securityFailed(cwe);
+    s.securityFailed(cwe, "reported by the layer");
 }
 
 fn secEgress(s: *Sim, sink: seam.Sink, bytes: []const u8) void {
     const a = s.sec orelse return;
     if (bytes.len == 0) return;
     const cwe = a.provider.egress(a.ctx, sink, bytes);
-    if (cwe != 0) s.securityFailed(cwe);
+    if (cwe != 0) s.securityFailed(cwe, "in bytes leaving the node");
 }
 
 /// The first `n` bytes of `data` were just filled from `sink`.
@@ -1837,7 +1842,7 @@ fn secSync(s: *Sim, op: seam.TaskSync, a: usize, b: usize) void {
 fn secPath(s: *Sim, op: seam.VfsOp, path: []const u8) void {
     const a = s.sec orelse return;
     const cwe = a.provider.path(a.ctx, s.currentNode(), op, path);
-    if (cwe != 0) s.securityFailed(cwe);
+    if (cwe != 0) s.securityFailed(cwe, "in a path");
 }
 
 /// A capability about to be used (plan2.md §5.2). A violation fails the
@@ -1845,7 +1850,7 @@ fn secPath(s: *Sim, op: seam.VfsOp, path: []const u8) void {
 fn secCapability(s: *Sim, cap: seam.Capability, argv: []const []const u8) void {
     const a = s.sec orelse return;
     const cwe = a.provider.capability(a.ctx, s.currentNode(), cap, argv);
-    if (cwe != 0) s.securityFailed(cwe);
+    if (cwe != 0) s.securityFailed(cwe, "a capability the sandbox lacks");
 }
 
 /// Where a parent swap moves the original directory.

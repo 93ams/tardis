@@ -196,5 +196,7 @@ properties you stated. It does not mean the program has no bugs.
   tasks, found by the scheduler.
 - [`examples/jobs.zig`](../examples/jobs.zig): a job done twice after a
   restart, with every write synced.
-- The [README](../README.md): options, multi-node tests, replaying and
-  tracing.
+- The [user guide](guide.md): the oracles, faults, crashes, several
+  nodes, campaign size and guided exploration.
+- [reproducing.md](reproducing.md) and [trace.md](trace.md): replaying a
+  failure and reading a run as a timeline.

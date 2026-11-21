@@ -19,6 +19,39 @@ fn realRandom(env: *Env) !void {
     try testing.expect(!std.mem.allEqual(u8, &bytes, 0));
 }
 
+fn threadBody() void {}
+
+/// What the last spawn inside a run came to. A stray call replaces the
+/// body's own result with `StraySyscall`, so the body cannot assert this.
+var spawn_refusals: u32 = 0;
+var spawn_other: u32 = 0;
+
+/// Starts a real thread behind the simulator's back.
+fn startsThread(env: *Env) !void {
+    _ = env;
+    if (std.Thread.spawn(.{}, threadBody, .{})) |t| {
+        t.join();
+        spawn_other += 1;
+    } else |err| switch (err) {
+        // The trap answers EAGAIN: this without libc, the other with it.
+        error.ThreadQuotaExceeded, error.SystemResources => spawn_refusals += 1,
+        else => spawn_other += 1,
+    }
+}
+
+test "trap_syscalls: starting a thread is refused and fails the run" {
+    if (!tardis.trap_syscalls_supported) return error.SkipZigTest;
+    spawn_refusals = 0;
+    spawn_other = 0;
+    try testing.expectError(error.StraySyscall, tardis.check(gpa, startsThread, .{ .iterations = 3, .trap_syscalls = true, .report = false, .shrink = false }));
+    // Every spawn was refused: no thread ran, and none failed otherwise.
+    try testing.expect(spawn_refusals >= 1);
+    try testing.expectEqual(@as(u32, 0), spawn_other);
+    // Threads still start once the run is over.
+    const t = try std.Thread.spawn(.{}, threadBody, .{});
+    t.join();
+}
+
 /// Randomness and the clock from the simulation; files, sleeping and a
 /// large allocation on the way.
 fn simulated(env: *Env) !void {

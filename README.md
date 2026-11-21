@@ -12,24 +12,54 @@ decisions that cause it.
 secret tracking, lock-order checks, Byzantine peers, constant-time checks,
 MC/DC and signed evidence bundles.
 
-New here? The [tutorial](docs/tutorial.md) goes from an empty test to a found,
-shrunk and fixed bug, and [`examples/`](examples) has twenty-six small programs,
-each with one planted bug and its fix. [docs/stability.md](docs/stability.md)
-says what may change between releases, and what a seed is and is not
-promised to mean. [docs/qualification.md](docs/qualification.md) lists what
-the tool is required to do, the tests behind each requirement, and its
-known limits, for anyone who has to justify relying on it.
+## Documentation
 
-Three shorter guides: [docs/reproducing.md](docs/reproducing.md) takes a
-failure from a CI log to your machine, [docs/trace.md](docs/trace.md)
-reads a run as a timeline in Perfetto, and
-[docs/threads.md](docs/threads.md) says why real threads are outside the
-simulation and what to use instead.
+New here:
 
-The design and its status are in [plan.md](plan.md) (core) and
-[plan2.md](plan2.md) (security layer). Both say what is verified by tests and
-what is not. [CHANGELOG.md](CHANGELOG.md) lists what each revision changed,
-and [plan3.md](plan3.md) is the proposal for getting to a release.
+- [docs/tutorial.md](docs/tutorial.md) goes from an empty test to a found,
+  shrunk and fixed bug.
+- [docs/guide.md](docs/guide.md) is the user guide: oracles, faults,
+  crashes, several nodes, campaign size, guided exploration, the history
+  checkers.
+- [`examples/`](examples) has twenty-six small programs, each with one
+  planted bug and its fix.
+
+When a test fails:
+
+- [docs/reproducing.md](docs/reproducing.md) takes a failure from a CI log
+  to your machine.
+- [docs/trace.md](docs/trace.md) reads a run as a timeline in Perfetto.
+
+Reference:
+
+- `zig build docs` writes the API reference to `zig-out/docs`.
+- [docs/stability.md](docs/stability.md) says what may change between
+  releases, and what a seed is and is not promised to mean.
+- [docs/measurements.md](docs/measurements.md) has which oracle catches
+  which planted bug and how often, and what a simulator costs in memory.
+- [docs/threads.md](docs/threads.md) says why real threads are outside the
+  simulation and what to use instead.
+- [docs/qualification.md](docs/qualification.md) lists what the tool is
+  required to do, the tests behind each requirement, and its known
+  limits, for anyone who has to justify relying on it.
+
+The security layer, which the core does not need:
+
+- [docs/security.md](docs/security.md).
+
+Design record:
+
+- [plan.md](plan.md) (core) and [plan2.md](plan2.md) (security layer) hold
+  the design and its status. Both say what is verified by tests and what
+  is not.
+- [plan3.md](plan3.md) is the proposal for getting to a release.
+- [CHANGELOG.md](CHANGELOG.md) lists what each revision changed.
+
+Contributors:
+
+- [CONTRIBUTING.md](CONTRIBUTING.md) says what a change needs.
+- [docs/housekeeping.md](docs/housekeeping.md) says how to clean the build
+  cache.
 
 ## Licence
 
@@ -107,7 +137,8 @@ events, and prints two ways to run it again:
 | `TARDIS_ITERATIONS_SCALE=<n>` | nothing: it multiplies every `check`'s iterations |
 | `TARDIS_CORPUS_DIR=<dir>` | nothing: each `check` keeps a file there, and the next campaign runs the runs that failed first and goes on exploring where the last stopped |
 | `TARDIS_EXPLORE=guided` | nothing: every `check` explores guided by coverage |
-| `TARDIS_PRESET=quick\|thorough\|nightly` | nothing: it sizes every `check` that left `iterations` at its default (20, 1,000 or 10,000; `nightly` is also guided) |
+| `TARDIS_PRESET=quick\|thorough\|nightly` | nothing: it sizes every `check` whose `iterations` is the default 100, written out or not (20, 1,000 or 10,000; `nightly` is also guided) |
+| `TARDIS_REPLAY_COMMAND=<command>` | nothing: replay lines end in it, not in `zig build test`; a build script sets it on a run step ([`docs/reproducing.md`](docs/reproducing.md)) |
 | `TARDIS_REPLAY_FUZZY=2` | with `TARDIS_REPLAY`: if the token no longer fails because the code now draws a little differently, try it with its decisions moved by up to 2 draws |
 
 `Options.seed`, `Options.replay` and `Options.replay_fuzzy` do the same from
@@ -224,6 +255,9 @@ qualified under any standard, and using it certifies nothing: it produces
 evidence in the shapes some standards ask for, which is for your own
 assessors to judge.
 
+[docs/security.md](docs/security.md) is the guide to the layer: each
+detector with an example, the evidence campaign, and its limits.
+
 C code linked into a test can take part: include `src/sec/c/tardis_sec.h`
 after the system headers and export its functions from the Zig test with
 `comptime { sec.exportC(); }`. The header's comment lists what it wraps.
@@ -273,6 +307,7 @@ worked example.
 | `zig build bench` | throughput benchmarks, always optimized |
 | `zig build bugbench` | the bug benchmark: each example's planted bug, whether a plain run sees it, whether a campaign finds it, what it shrinks to |
 | `zig build bugbench-rates` | which oracle catches each planted bug, and in how many of 20 campaigns by size ([`docs/measurements.md`](docs/measurements.md)) |
+| `zig build bugbench-baselines` | whether each planted bug is still found with no faults injected, and with no preemption ([`docs/measurements.md`](docs/measurements.md)) |
 | `zig build membench` | the memory one simulator takes, by option |
 | `zig build docs` | the API reference, into `zig-out/docs` |
 | `zig build run` | the demo |
