@@ -28,14 +28,18 @@
 //! are not modelled); `shutdown` of a listening socket wakes its
 //! `accept`; a connected datagram socket receives only from its peer.
 //!
-//! Not emulated (stray): non-blocking sockets (`SOCK_NONBLOCK`, `O_NONBLOCK`
-//! set by `fcntl`, `MSG_DONTWAIT`) and so `poll`, `select` and `epoll`,
-//! which only non-blocking code needs; `sendmsg`, `recvmsg`, `MSG_PEEK`,
+//! Non-blocking sockets (`SOCK_NONBLOCK`, `accept4`'s flag, `O_NONBLOCK`
+//! set by `fcntl`, `MSG_DONTWAIT`) fail a call that would wait with
+//! `EAGAIN`; a non-blocking `connect` completes before it returns (in
+//! virtual time, as long as the handshake takes) and says `EINPROGRESS`.
+//! `poll` and `ppoll` are in `sysemu.zig`, with `pollMask` here. Many
+//! details follow Linux as a differential test found them
+//! (`src/tests/sysnet_diff_test.zig`).
+//!
+//! Not emulated (stray): `select`, `pselect6` and `epoll`; `sendmsg`, `recvmsg`, `MSG_PEEK`,
 //! `MSG_OOB`, `MSG_WAITALL`; a datagram `writev` of more than one vector;
-//! Unix-domain and other families. Not modelled: a stream `bind` reserves
-//! nothing until `listen` (an address in use is reported there, and
-//! `bind` to port 0 reads back port 0 until then), and a `bind` before
-//! `connect` does not choose the local port.
+//! Unix-domain and other families. A stream `bind` reserves its port, as
+//! the kernel's does, and `listen` or `connect` after it use that port.
 
 const std = @import("std");
 const Io = std.Io;
@@ -54,7 +58,8 @@ const Kind = enum {
     free,
     /// From `socket`: no simulated socket yet.
     fresh,
-    /// A stream socket `bind` gave an address, not yet listening.
+    /// A stream socket `bind` gave an address and a reserved port
+    /// (`Sim.bindStream`), not yet listening or connected.
     bound,
     listening,
     /// A connected stream.
@@ -70,6 +75,16 @@ const Slot = struct {
     mode: Mode = .stream,
     /// The node of the task that made it: its crash frees the slot.
     node: u16 = 0,
+    /// `SOCK_NONBLOCK` or `O_NONBLOCK`: a call that would wait fails
+    /// with `EAGAIN` instead (`MSG_DONTWAIT` does so for one call).
+    nonblock: bool = false,
+    /// A non-blocking `connect` failed and has not been asked again:
+    /// Linux's next `connect` then fails with `ECONNABORTED` if
+    /// `SO_ERROR` already took the error.
+    connect_failed: bool = false,
+    /// `shutdown` after that failed attempt: Linux's socket is then
+    /// "disconnecting", and every later `connect` fails with `EINVAL`.
+    disconnecting: bool = false,
     /// Changes whenever the slot is taken: an operation that waited
     /// checks it to see whether its descriptor was closed meanwhile.
     gen: u32 = 0,
@@ -80,8 +95,27 @@ const Slot = struct {
     peer: ?ionet.IpAddress = null,
     /// `shutdown(SHUT_WR)` was made: a write fails with `EPIPE`.
     shut_send: bool = false,
+    /// A stream bound to port 0 (the kernel chose it): a failed `connect`
+    /// gives the port up, as Linux does, though `getsockname` still shows
+    /// it; `stale_port` then marks it given up.
+    chose_port: bool = false,
+    stale_port: bool = false,
+    /// Once bound to a specific address (Linux's `SOCK_BINDADDR_LOCK`,
+    /// never cleared): a failed `connect` keeps the source address it
+    /// chose, where another socket goes back to the wildcard.
+    addr_locked: bool = false,
+    /// `shutdown(SHUT_RD)` of a connected datagram socket: a read with
+    /// nothing queued returns 0 instead of waiting.
+    shut_recv: bool = false,
     /// A reset was reported once: later writes fail with `EPIPE`.
     reset_reported: bool = false,
+    /// A connected datagram socket's datagram to its peer found no socket
+    /// there: the kernel's ICMP port unreachable, reported once by the
+    /// next `recv`, `send` or `SO_ERROR`.
+    pending: ?E = null,
+    /// Datagrams that arrived before a datagram socket's `connect`: Linux
+    /// keeps them whatever their source, and filters only later ones.
+    unfiltered: u32 = 0,
 };
 
 const unspecified: ionet.IpAddress = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } };
@@ -221,6 +255,8 @@ const sock_dgram = 2;
 const sock_nonblock = 0o4000;
 const sock_cloexec = 0o2000000;
 const msg_nosignal = 0x4000;
+const msg_dontwait = 0x40;
+const o_nonblock = 0o4000;
 
 /// Entry point from `sysemu.emulate`: the value for `rax`, or null for a
 /// call that is not emulated (stray).
@@ -243,13 +279,16 @@ pub fn emulate(s: *Sim, number: u64, a: *const [6]u64) ?u64 {
         48 => shutdown(s, slot, a[1]),
         3 => close(s, fd),
         51 => if (writeAddress(a[1], a[2], slot.local)) |e| fail(e) else 0, // getsockname
-        52 => if ((slot.kind == .stream or slot.kind == .dgram) and slot.peer != null) // getpeername
+        // getpeername; Linux reports no peer while its port is 0 (a
+        // datagram socket connected to port 0 sends there all the same).
+        // A stream whose reset was reported is closed: no peer either.
+        52 => if ((slot.kind == .stream or slot.kind == .dgram) and slot.peer != null and slot.peer.?.ip4.port != 0 and !resetOf(s, slot))
             (if (writeAddress(a[1], a[2], slot.peer.?)) |e| fail(e) else 0)
         else
             fail(.NOTCONN),
         54 => 0, // setsockopt: accepted, changes nothing
-        55 => getsockopt(slot, a[1], a[2], a[3], a[4]),
-        72 => fcntl(@truncate(a[1]), a[2]),
+        55 => getsockopt(s, slot, a[1], a[2], a[3], a[4]),
+        72 => fcntl(slot, @truncate(a[1]), a[2]),
         else => null,
     };
 }
@@ -257,13 +296,13 @@ pub fn emulate(s: *Sim, number: u64, a: *const [6]u64) ?u64 {
 fn socket(s: *Sim, domain: u32, type_and_flags: u32, protocol: u32) ?u64 {
     if (domain == af_inet6) return fail(.AFNOSUPPORT);
     if (domain != af_inet) return null;
-    if (type_and_flags & sock_nonblock != 0) return null;
     const mode: Mode = switch (type_and_flags & ~@as(u32, sock_nonblock | sock_cloexec)) {
         sock_stream => if (protocol == 0 or protocol == 6) .stream else return fail(.PROTONOSUPPORT),
         sock_dgram => if (protocol == 0 or protocol == 17) .dgram else return fail(.PROTONOSUPPORT),
         else => return null,
     };
     const i = take(s, .fresh, mode) orelse return fail(.MFILE);
+    slots[i].nonblock = type_and_flags & sock_nonblock != 0;
     return fdOf(i);
 }
 
@@ -275,8 +314,13 @@ fn bind(s: *Sim, slot: *Slot, addr_ptr: u64, len: u64) u64 {
     if (slot.kind != .fresh) return fail(.INVAL);
     switch (slot.mode) {
         .stream => {
-            slot.local = address;
+            const sock = s.bindStream(address) catch |err| return fail(errnoOf(err));
+            slot.handle = sock.handle;
+            slot.local = sock.address;
             slot.kind = .bound;
+            slot.chose_port = address.ip4.port == 0;
+            slot.stale_port = false;
+            if (!std.mem.eql(u8, &address.ip4.bytes, &.{ 0, 0, 0, 0 })) slot.addr_locked = true;
         },
         .dgram => {
             const io = s.io();
@@ -291,14 +335,25 @@ fn bind(s: *Sim, slot: *Slot, addr_ptr: u64, len: u64) u64 {
 
 fn listen(s: *Sim, slot: *Slot, backlog: u64) u64 {
     if (slot.mode != .stream) return fail(.OPNOTSUPP);
+    // Still "connecting" after a failed non-blocking attempt (Linux).
+    if (slot.connect_failed) return fail(.INVAL);
     switch (slot.kind) {
         .listening => return 0,
         .fresh, .bound => {},
         else => return fail(.INVAL),
     }
+    const queue: u31 = @intCast(std.math.clamp(@as(i64, @bitCast(backlog)), 1, std.math.maxInt(u31)));
+    if (slot.kind == .bound) {
+        // On the port `bind` reserved.
+        s.listenBound(slot.handle, queue) catch |err| return fail(errnoOf(err));
+        slot.kind = .listening;
+        return 0;
+    }
     const io = s.io();
-    const sock = io.vtable.netListenIp(io.userdata, &slot.local, .{
-        .kernel_backlog = @intCast(std.math.clamp(@as(i64, @bitCast(backlog)), 1, std.math.maxInt(u31))),
+    var here = slot.local;
+    if (slot.stale_port) here.ip4.port = 0;
+    const sock = io.vtable.netListenIp(io.userdata, &here, .{
+        .kernel_backlog = queue,
         .reuse_address = true,
         .mode = .stream,
         .protocol = .tcp,
@@ -306,12 +361,15 @@ fn listen(s: *Sim, slot: *Slot, backlog: u64) u64 {
     slot.handle = sock.handle;
     slot.local = sock.address;
     slot.kind = .listening;
+    // Listening unbound, the kernel chose the port.
+    slot.chose_port = true;
     return 0;
 }
 
 fn accept(s: *Sim, slot: *Slot, addr_ptr: u64, len_ptr: u64, flags: u32) ?u64 {
-    if (flags & sock_nonblock != 0) return null;
+    if (slot.mode == .dgram) return fail(.OPNOTSUPP);
     if (slot.kind != .listening) return fail(.INVAL);
+    if (slot.nonblock and !s.listenerReady(slot.handle)) return fail(.AGAIN);
     // Taken before the wait: another task's `socket` must not take it.
     const fresh = take(s, .fresh, .stream) orelse return fail(.MFILE);
     const fresh_gen = slots[fresh].gen;
@@ -332,15 +390,21 @@ fn accept(s: *Sim, slot: *Slot, addr_ptr: u64, len_ptr: u64, flags: u32) ?u64 {
     var here = local;
     switch (here) {
         .ip4 => |*x| if (std.mem.eql(u8, &x.bytes, &.{ 0, 0, 0, 0 })) {
-            x.bytes = net_mod.Net.nodeAddress(s.currentNode());
+            x.bytes = sourceFor(s, sock.address);
         },
         .ip6 => {},
     }
+    if (writeAddress(addr_ptr, len_ptr, sock.address)) |e| {
+        // No descriptor to give back: the connection is closed, not leaked.
+        io.vtable.netClose(io.userdata, &.{sock});
+        slots[fresh] = .{};
+        return fail(e);
+    }
     slots[fresh].kind = .stream;
+    slots[fresh].nonblock = flags & sock_nonblock != 0;
     slots[fresh].handle = sock.handle;
     slots[fresh].local = here;
     slots[fresh].peer = sock.address;
-    if (writeAddress(addr_ptr, len_ptr, sock.address)) |e| return fail(e);
     return fdOf(fresh);
 }
 
@@ -354,30 +418,108 @@ fn connect(s: *Sim, slot: *Slot, addr_ptr: u64, len: u64) u64 {
         .stream => {
             switch (slot.kind) {
                 .fresh, .bound => {},
-                .stream => return fail(.ISCONN),
+                // Linux: a listening socket is not "closed", so connected.
+                .stream, .listening => return fail(.ISCONN),
                 else => return fail(.INVAL),
             }
+            // A non-blocking attempt that failed: its error, or, taken
+            // by `SO_ERROR` already, `ECONNABORTED` (Linux).
+            if (slot.disconnecting) return fail(.INVAL);
+            if (slot.connect_failed) {
+                // This call disconnects it (`tcp_disconnect`).
+                slot.connect_failed = false;
+                slot.shut_send = false;
+                slot.shut_recv = false;
+                if (!slot.addr_locked) slot.local.ip4.bytes = .{ 0, 0, 0, 0 };
+                const e = slot.pending orelse .CONNABORTED;
+                slot.pending = null;
+                return fail(e);
+            }
             const gen = slot.gen;
-            const result = io.vtable.netConnectIp(io.userdata, &address, .{ .mode = .stream });
+            // A bound socket connects from the port it reserved.
+            const result = if (slot.kind == .bound)
+                s.connectFrom(slot.handle, address)
+            else
+                io.vtable.netConnectIp(io.userdata, &address, .{ .mode = .stream });
             // Closed (by another task, or a crash) while it connected: the
             // connection belongs to no descriptor.
             if (slot.gen != gen) {
                 if (result) |sock| io.vtable.netClose(io.userdata, &.{sock}) else |_| {}
                 return fail(.BADF);
             }
-            const sock = result catch |err| return fail(errnoOf(err));
+            const sock = result catch |err| {
+                const after_port = err == error.ConnectionRefused or err == error.Timeout or err == error.ConnectionTimedOut;
+                // A blocking attempt that fails disconnects the socket
+                // (`tcp_disconnect`), which clears a recorded `shutdown`.
+                if (!slot.nonblock) {
+                    slot.shut_send = false;
+                    slot.shut_recv = false;
+                }
+                if (after_port) slot.local.ip4.bytes = if (slot.addr_locked) sourceFor(s, address) else .{ 0, 0, 0, 0 };
+                if (slot.kind == .fresh and after_port) {
+                    // Linux chose a port for the attempt, and gives it up;
+                    // `getsockname` still shows it, with any address
+                    // `bind` named.
+                    slot.local.ip4.port = s.last_connect_port;
+                    slot.stale_port = true;
+                }
+                if (slot.kind == .bound and slot.chose_port) {
+                    // Linux gives up a port it chose when the connection
+                    // fails; the socket may be bound again.
+                    io.vtable.netClose(io.userdata, &.{.{ .handle = slot.handle, .address = slot.local }});
+                    slot.kind = .fresh;
+                    slot.stale_port = true;
+                }
+                // Non-blocking, the attempt completed before the call
+                // returns (POSIX allows it), but the call still says it is
+                // in progress, as Linux does on loopback: the error is left
+                // for `SO_ERROR`, `poll` and the next call.
+                if (slot.nonblock and after_port) {
+                    // Not disconnected yet: the source address stays until
+                    // the next call does that (`tcp_disconnect`).
+                    slot.local.ip4.bytes = sourceFor(s, address);
+                    slot.pending = errnoOf(err);
+                    slot.connect_failed = true;
+                    return fail(.INPROGRESS);
+                }
+                return fail(errnoOf(err));
+            };
             slot.handle = sock.handle;
-            // The simulator's `connect` gives the local address.
-            slot.local = sock.address;
+            // The simulator's `connect` gives the local address; a bound
+            // socket keeps its port, and its address unless the wildcard.
+            if (slot.kind != .bound) {
+                slot.local = sock.address;
+            } else if (std.mem.eql(u8, &slot.local.ip4.bytes, &.{ 0, 0, 0, 0 })) {
+                slot.local.ip4.bytes = sourceFor(s, address);
+            }
             slot.peer = address;
             slot.kind = .stream;
+            // A `shutdown` recorded before stays: `SHUT_WR` refuses sends
+            // (no FIN goes), `SHUT_RD` ends reads.
+            if (slot.shut_recv) io.vtable.netShutdown(io.userdata, slot.handle, .recv) catch {};
+            if (slot.nonblock) return fail(.INPROGRESS);
         },
         .dgram => {
             if (ensureBound(s, slot)) |e| return fail(e);
+            // Kept: what arrived and the old filter (if any) let through;
+            // what it refused is gone, as on Linux, where it never queued.
+            if (slot.peer) |old| if (slot.unfiltered == 0) s.dropDatagramsNotFrom(slot.handle, old);
+            slot.unfiltered = readable(s, slot);
             slot.peer = address;
+            // Connected, the socket's address is the route's source.
+            if (std.mem.eql(u8, &slot.local.ip4.bytes, &.{ 0, 0, 0, 0 })) slot.local.ip4.bytes = sourceFor(s, address);
         },
     }
     return 0;
+}
+
+/// The source address a host uses toward `to`: loopback for loopback,
+/// else the node's own.
+fn sourceFor(s: *Sim, to: ionet.IpAddress) [4]u8 {
+    return switch (to) {
+        .ip4 => |a| if (a.bytes[0] == 127) .{ 127, 0, 0, 1 } else net_mod.Net.nodeAddress(s.currentNode()),
+        .ip6 => net_mod.Net.nodeAddress(s.currentNode()),
+    };
 }
 
 /// A datagram socket sends from an address: the first send binds it to
@@ -405,20 +547,45 @@ fn userBytes(ptr: u64, len: u64) ?[]u8 {
 }
 
 fn receive(s: *Sim, slot: *Slot, buf_ptr: u64, len: u64, flags: u32, from_ptr: u64, from_len_ptr: u64) ?u64 {
-    if (flags & ~@as(u32, msg_nosignal) != 0) return null; // peek, waitall, dontwait, oob
+    if (flags & ~@as(u32, msg_nosignal | msg_dontwait) != 0) return null; // peek, waitall, oob
     const buf = userBytes(buf_ptr, len) orelse return fail(.FAULT);
+    const nonblock = slot.nonblock or flags & msg_dontwait != 0;
     const io = s.io();
     switch (slot.kind) {
         .stream => {
-            // Linux returns at once for an empty buffer on a stream.
-            if (buf.len == 0) return 0;
+            // Linux returns at once for an empty buffer on a stream, and
+            // reads the end of a stream whose reset was reported.
+            if (buf.len == 0 or slot.reset_reported) return 0;
+            if (nonblock and !s.streamReadable(slot.handle)) return fail(.AGAIN);
             var data = [_][]u8{buf};
             const r = io.operate(.{ .net_read = .{ .socket_handle = slot.handle, .data = &data } }) catch return fail(.INTR);
-            const got = r.net_read catch |err| return fail(errnoOf(err));
+            const got = r.net_read catch |err| {
+                if (err == error.ConnectionResetByPeer) slot.reset_reported = true;
+                return fail(errnoOf(err));
+            };
             if (from_ptr != 0) if (writeAddress(from_ptr, from_len_ptr, slot.peer.?)) |e| return fail(e);
             return got.data_len;
         },
         .dgram => while (true) {
+            if (slot.pending) |e| {
+                slot.pending = null;
+                return fail(e);
+            }
+            // Linux looks at `SHUT_RD` only when the read would wait: a
+            // non-blocking one says `EAGAIN` all the same.
+            // It waits here rather than in the simulator, so a `shutdown`,
+            // a close or an ICMP error (sysnet's own state) ends the wait.
+            while (readable(s, slot) == 0) {
+                if (nonblock) return fail(.AGAIN);
+                if (slot.shut_recv) return 0;
+                const gen = slot.gen;
+                s.waitNetwork(s.net.nextEventAfter(s.now_ns)) catch return fail(.INTR);
+                if (slot.gen != gen or slot.kind != .dgram) return fail(.BADF);
+                if (slot.pending) |e| {
+                    slot.pending = null;
+                    return fail(e);
+                }
+            }
             var message = [_]ionet.IncomingMessage{.init};
             const r = io.operate(.{ .net_receive = .{
                 .socket_handle = slot.handle,
@@ -429,35 +596,72 @@ fn receive(s: *Sim, slot: *Slot, buf_ptr: u64, len: u64, flags: u32, from_ptr: u
             const err, const count = r.net_receive;
             if (err) |e| return fail(errnoOf(e));
             if (count == 0) return fail(.AGAIN);
-            // A connected datagram socket receives only from its peer.
-            if (slot.peer) |p| if (!sameAddress(p, message[0].from)) continue;
+            // A connected datagram socket receives only from its peer,
+            // once the datagrams that arrived before `connect` are read.
+            if (slot.unfiltered > 0) {
+                slot.unfiltered -= 1;
+            } else if (slot.peer) |p| if (!icmpMatches(p, message[0].from)) continue;
             if (writeAddress(from_ptr, from_len_ptr, message[0].from)) |e| return fail(e);
             return message[0].data.len;
         },
-        .fresh => return if (slot.mode == .stream) fail(.NOTCONN) else null, // a receive on an unbound datagram socket waits forever
-        .bound, .listening => return fail(.NOTCONN),
+        // Shut down for reading (see `shutdown`): 0 at once. Otherwise a
+        // stream is not connected, and an unbound datagram socket would
+        // wait forever.
+        .fresh, .bound => {
+            // A failed non-blocking `connect`'s error comes first (Linux).
+            if (slot.mode == .stream) if (slot.pending) |e| {
+                slot.pending = null;
+                return fail(e);
+            };
+            if (slot.mode == .stream) {
+                if (slot.shut_recv or slot.connect_failed) return 0;
+                return fail(.NOTCONN);
+            }
+            if (nonblock) return fail(.AGAIN);
+            return if (slot.shut_recv) 0 else null;
+        },
+        .listening => return fail(.NOTCONN),
         .free => unreachable,
     }
 }
 
 fn send(s: *Sim, slot: *Slot, buf_ptr: u64, len: u64, flags: u32, to_ptr: u64, to_len: u64) ?u64 {
-    if (flags & ~@as(u32, msg_nosignal) != 0) return null;
+    if (flags & ~@as(u32, msg_nosignal | msg_dontwait) != 0) return null;
     const buf = userBytes(buf_ptr, len) orelse return fail(.FAULT);
+    const nonblock = slot.nonblock or flags & msg_dontwait != 0;
     const io = s.io();
     switch (slot.mode) {
         .stream => {
-            if (slot.kind != .stream) return fail(.NOTCONN);
+            // Linux: a stream that is not connected (fresh, bound or
+            // listening) fails a send with `EPIPE`, not `ENOTCONN`.
+            if (slot.kind != .stream) {
+                if (slot.pending) |e| {
+                    slot.pending = null;
+                    return fail(e);
+                }
+                return fail(.PIPE);
+            }
+            // A reset not yet reported comes first (`sk_err`), once.
+            if (!slot.reset_reported and s.streamReset(slot.handle)) {
+                slot.reset_reported = true;
+                return fail(resetErrno(s, slot));
+            }
             if (slot.shut_send or slot.reset_reported) return fail(.PIPE);
             // A blocking send on a stream returns when all of it is sent
             // (Linux: short only on a signal): the simulator's writes may
             // be short, so continue until done or failed.
             var sent: usize = 0;
             while (sent < buf.len) {
+                // Non-blocking: as much as fits now, or `EAGAIN`.
+                if (nonblock and !s.streamWritable(slot.handle)) return if (sent > 0) sent else fail(.AGAIN);
                 const data = [_][]const u8{buf[sent..]};
                 const r = io.operate(.{ .net_write = .{ .socket_handle = slot.handle, .data = &data } }) catch
                     return if (sent > 0) sent else fail(.INTR);
                 const n = r.net_write catch |err| {
-                    if (err == error.ConnectionResetByPeer) slot.reset_reported = true;
+                    if (err == error.ConnectionResetByPeer) {
+                        slot.reset_reported = true;
+                        return if (sent > 0) sent else fail(resetErrno(s, slot));
+                    }
                     return if (sent > 0) sent else fail(errnoOf(err));
                 };
                 if (n == 0) break;
@@ -466,19 +670,70 @@ fn send(s: *Sim, slot: *Slot, buf_ptr: u64, len: u64, flags: u32, to_ptr: u64, t
             return sent;
         },
         .dgram => {
+            // Linux binds the socket first, whatever the destination turns
+            // out to be: a send that fails still leaves it bound.
+            if (ensureBound(s, slot)) |e| return fail(e);
             const to: ionet.IpAddress = if (to_ptr != 0) switch (readAddress(to_ptr, to_len)) {
                 .ok => |x| x,
                 .err => |e| return fail(e),
             } else slot.peer orelse return fail(.DESTADDRREQ);
-            if (ensureBound(s, slot)) |e| return fail(e);
+            // Port 0 named in the call is refused (a connected socket's
+            // port 0 is sent to).
+            if (to_ptr != 0 and to.ip4.port == 0) return fail(.INVAL);
+            // A pending error, then `SHUT_WR`, refuse it only now, when
+            // the buffer is allocated (`sock_alloc_send_pskb`).
+            if (slot.pending) |e| {
+                slot.pending = null;
+                return fail(e);
+            }
+            if (slot.shut_send) return fail(.PIPE);
             var message = [_]ionet.OutgoingMessage{.{ .address = &to, .data_ptr = buf.ptr, .data_len = buf.len }};
             const r = io.operate(.{ .net_send = .{ .socket_handle = slot.handle, .messages = &message, .flags = .{} } }) catch return fail(.INTR);
             const err, const count = r.net_send;
             if (err) |e| return fail(errnoOf(e));
             if (count == 0) return fail(.AGAIN);
+            // The ICMP answer reaches a connected socket whose peer it
+            // matches: Linux matches a peer port of 0 to any port.
+            if (slot.peer) |p| if (icmpMatches(p, to) and noDatagramSocket(s, to, slot.local.ip4.port)) {
+                slot.pending = .CONNREFUSED;
+            };
             return message[0].data_len;
         },
     }
+}
+
+fn icmpMatches(peer: ionet.IpAddress, to: ionet.IpAddress) bool {
+    const p = switch (peer) {
+        .ip4 => |x| x,
+        .ip6 => return false,
+    };
+    const t = switch (to) {
+        .ip4 => |x| x,
+        .ip6 => return false,
+    };
+    return std.mem.eql(u8, &p.bytes, &t.bytes) and (p.port == 0 or p.port == t.port);
+}
+
+/// True when `to` names a host that is up and reachable and has no
+/// datagram socket at that port that takes a datagram from `from_port`
+/// (one connected to another peer does not): the host answers with ICMP
+/// port unreachable, which a connected socket reports.
+fn noDatagramSocket(s: *Sim, to: ionet.IpAddress, from_port: u16) bool {
+    const a = switch (to) {
+        .ip4 => |x| x,
+        .ip6 => return false,
+    };
+    const here = s.currentNode();
+    const node = s.net.nodeOf(here, a.bytes) orelse return false;
+    if (!s.net.reachable(here, node)) return false;
+    if (s.net.findDgram(node, a.port) == null) return true;
+    const from: ionet.IpAddress = .{ .ip4 = .{ .bytes = sourceFor(s, to), .port = from_port } };
+    for (&slots) |*other| {
+        if (other.kind != .dgram or other.node != node or other.local.ip4.port != a.port) continue;
+        const peer = other.peer orelse return false;
+        return !icmpMatches(peer, from);
+    }
+    return false;
 }
 
 const Iovec = extern struct { base: u64, len: u64 };
@@ -543,15 +798,42 @@ fn shutdown(s: *Sim, slot: *Slot, how: u64) u64 {
     const io = s.io();
     switch (slot.kind) {
         .stream => {
+            // Reset, the socket is closed: as for an unconnected one.
+            if (resetOf(s, slot)) {
+                if (h != .recv) slot.shut_send = true;
+                if (h != .send) slot.shut_recv = true;
+                return fail(.NOTCONN);
+            }
             io.vtable.netShutdown(io.userdata, slot.handle, h) catch |err| return fail(errnoOf(err));
             if (h != .recv) slot.shut_send = true;
+            if (h != .send) slot.shut_recv = true;
         },
-        // Linux: shutting down a listener's receiving side wakes its
-        // `accept`, which then fails; servers stop their loops this way.
+        // Linux disconnects a listener shut down for reading
+        // (`tcp_disconnect`): its queue is reset, a waiting `accept` fails
+        // (servers stop their loops this way), and the socket is closed
+        // again, keeping its port only if `bind` named one.
         .listening => if (h != .send) {
-            io.vtable.netShutdown(io.userdata, slot.handle, .recv) catch |err| return fail(errnoOf(err));
+            s.unlisten(slot.handle);
+            slot.kind = .bound;
+            slot.shut_send = false;
+            slot.shut_recv = false;
+            if (slot.chose_port) {
+                io.vtable.netClose(io.userdata, &.{.{ .handle = slot.handle, .address = slot.local }});
+                slot.kind = .fresh;
+                slot.stale_port = true;
+            }
         },
-        else => return fail(.NOTCONN),
+        // Linux records the shutdown on any other socket, and fails it
+        // with `ENOTCONN` when the socket is not connected; a read then
+        // returns 0 at once (`inet_shutdown` does so to wake pollers).
+        .dgram, .fresh, .bound => {
+            defer s.wakeNetwork();
+            if (slot.connect_failed) slot.disconnecting = true;
+            if (h != .recv) slot.shut_send = true;
+            if (h != .send) slot.shut_recv = true;
+            if (slot.peer == null) return fail(.NOTCONN);
+        },
+        .free => unreachable,
     }
     return 0;
 }
@@ -559,7 +841,7 @@ fn shutdown(s: *Sim, slot: *Slot, how: u64) u64 {
 fn close(s: *Sim, fd: i32) u64 {
     const slot = &slots[@intCast(fd - fd_base)];
     switch (slot.kind) {
-        .listening, .stream, .dgram => {
+        .bound, .listening, .stream, .dgram => {
             const io = s.io();
             const sock = [_]ionet.Socket{.{ .handle = slot.handle, .address = slot.local }};
             io.vtable.netClose(io.userdata, &sock);
@@ -570,26 +852,113 @@ fn close(s: *Sim, fd: i32) u64 {
     return 0;
 }
 
-fn getsockopt(slot: *const Slot, level: u64, name: u64, value_ptr: u64, len_ptr: u64) u64 {
+/// Datagrams a read would take now: those that arrived before `connect`,
+/// then only the peer's.
+fn readable(s: *Sim, slot: *const Slot) u32 {
+    const all = s.datagramsArrived(slot.handle);
+    const peer = slot.peer orelse return all;
+    if (slot.unfiltered > 0 and all > 0) return all;
+    return s.datagramsArrivedFrom(slot.handle, peer);
+}
+
+/// What a reset reads as: `EPIPE` after the peer's FIN, else `ECONNRESET`.
+fn resetErrno(s: *Sim, slot: *const Slot) E {
+    return if (s.streamResetIsPipe(slot.handle)) .PIPE else .CONNRESET;
+}
+
+/// A stream reset by its peer, reported or not: Linux counts it closed.
+fn resetOf(s: *Sim, slot: *const Slot) bool {
+    return slot.kind == .stream and (slot.reset_reported or s.streamReset(slot.handle));
+}
+
+fn getsockopt(s: *Sim, slot: *Slot, level: u64, name: u64, value_ptr: u64, len_ptr: u64) u64 {
     if (value_ptr == 0 or len_ptr == 0) return fail(.FAULT);
     const len: *align(1) u32 = @ptrFromInt(len_ptr);
     if (len.* < 4) return fail(.INVAL);
     const sol_socket = 1;
     const value: u32 = if (level == sol_socket and name == 3) // SO_TYPE
         (if (slot.mode == .stream) sock_stream else sock_dgram)
-    else
-        0; // SO_ERROR (no pending error) and every other option
+    else if (level == sol_socket and name == 4) blk: { // SO_ERROR, cleared
+        // A reset not yet reported is reported here, once.
+        if (slot.kind == .stream and !slot.reset_reported and s.streamReset(slot.handle)) {
+            slot.reset_reported = true;
+            break :blk @backingInt(resetErrno(s, slot));
+        }
+        const e = slot.pending orelse break :blk 0;
+        slot.pending = null;
+        break :blk @backingInt(e);
+    } else 0; // every other option
     @as(*align(1) u32, @ptrFromInt(value_ptr)).* = value;
     len.* = 4;
     return 0;
 }
 
-fn fcntl(cmd: u32, arg: u64) ?u64 {
+fn fcntl(slot: *Slot, cmd: u32, arg: u64) ?u64 {
     return switch (cmd) {
         1 => 0, // F_GETFD
         2 => 0, // F_SETFD
-        3 => 2, // F_GETFL: O_RDWR
-        4 => if (arg & sock_nonblock != 0) null else 0, // F_SETFL: non-blocking is not emulated
+        3 => if (slot.nonblock) 2 | o_nonblock else 2, // F_GETFL: O_RDWR
+        4 => blk: { // F_SETFL: only O_NONBLOCK changes anything
+            slot.nonblock = arg & o_nonblock != 0;
+            break :blk 0;
+        },
         else => null,
     };
+}
+
+// --- poll ---------------------------------------------------------------------
+
+pub const pollin = 0x1;
+pub const pollout = 0x4;
+pub const pollerr = 0x8;
+pub const pollhup = 0x10;
+pub const pollnval = 0x20;
+const pollrdnorm = 0x40;
+const pollwrnorm = 0x100;
+const pollwrband = 0x200;
+const pollrdhup = 0x2000;
+
+/// The events a socket descriptor has, as Linux's `tcp_poll` and
+/// `datagram_poll` compute them (before the caller's mask).
+pub fn pollMask(s: *Sim, fd: i32) u16 {
+    const slot = slotOf(fd) orelse return pollnval;
+    const in: u16 = pollin | pollrdnorm;
+    const out: u16 = pollout | pollwrnorm;
+    var m: u16 = 0;
+    switch (slot.kind) {
+        .free => unreachable,
+        .listening => if (s.listenerReady(slot.handle)) {
+            m |= in;
+        },
+        .fresh, .bound => if (slot.mode == .stream) {
+            // A closed TCP socket: hung up, and writable.
+            m |= pollhup | out;
+            // A failed non-blocking attempt left it shut down both ways.
+            if (slot.shut_recv or slot.connect_failed) m |= in | pollrdhup;
+            if (slot.pending != null) m |= pollerr;
+        } else {
+            m |= out | pollwrband;
+            if (slot.shut_recv) m |= in | pollrdhup;
+            if (slot.shut_recv and slot.shut_send) m |= pollhup;
+        },
+        .stream => if (resetOf(s, slot)) {
+            // Reset: closed, shut down both ways; the error until taken.
+            m |= pollhup | in | pollrdhup | out;
+            if (!slot.reset_reported) m |= pollerr;
+        } else {
+            const rcv_shut = slot.shut_recv or s.streamResetIsPipe(slot.handle);
+            if (rcv_shut) m |= in | pollrdhup;
+            if (rcv_shut and slot.shut_send) m |= pollhup;
+            if (s.streamReadable(slot.handle)) m |= in;
+            if (slot.shut_send or s.streamWritable(slot.handle)) m |= out;
+        },
+        .dgram => {
+            m |= out | pollwrband;
+            if (readable(s, slot) > 0) m |= in;
+            if (slot.pending != null) m |= pollerr;
+            if (slot.shut_recv) m |= in | pollrdhup;
+            if (slot.shut_recv and slot.shut_send) m |= pollhup;
+        },
+    }
+    return m;
 }

@@ -99,6 +99,8 @@ events, and prints two ways to run it again:
 | `TARDIS_REPLAY=<token>` | the shrunk run: only the decisions that matter keep their value |
 | `TARDIS_CAMPAIGN_SALT=<number>` | nothing: it gives every `check` other seeds than its usual ones, for a long run on new ground |
 | `TARDIS_ITERATIONS_SCALE=<n>` | nothing: it multiplies every `check`'s iterations |
+| `TARDIS_CORPUS_DIR=<dir>` | nothing: each `check` keeps a file there, and the next campaign runs the runs that failed first and goes on exploring where the last stopped |
+| `TARDIS_EXPLORE=guided` | nothing: every `check` explores guided by coverage |
 | `TARDIS_REPLAY_FUZZY=2` | with `TARDIS_REPLAY`: if the token no longer fails because the code now draws a little differently, try it with its decisions moved by up to 2 draws |
 
 `Options.seed`, `Options.replay` and `Options.replay_fuzzy` do the same from
@@ -180,8 +182,8 @@ allows that (`zig build test-sqlite -Dsqlite`).
 
 What to know before relying on it:
 
-- IPv4 sockets are emulated, blocking ones only: a non-blocking socket,
-  `poll`, `epoll`, pipes, `mmap` of a file and `dup` are stray calls.
+- IPv4 sockets are emulated, blocking and non-blocking, with `poll`;
+  `select`, `epoll`, pipes, `mmap` of a file and `dup` are stray calls.
 - Clock reads that libc answers through the vDSO are answered from the
   simulation too, by making the vDSO's code fault during a run.
 - A task dropped (by a crash, or the end of a run) inside a C library

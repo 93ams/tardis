@@ -26,6 +26,7 @@ const vfs_mod = @import("../model/vfs.zig");
 const fuzz = @import("../search/fuzz.zig");
 const net_mod = @import("../model/net.zig");
 const explore = @import("../search/explore.zig");
+const persist = @import("../search/persist.zig");
 const seam = @import("sec_seam.zig");
 const syscalls = @import("syscalls.zig");
 const sysnet = @import("sysnet.zig");
@@ -262,6 +263,14 @@ control: TaskId,
 
 persona: Persona,
 seed: u64,
+/// The first runs of a `check` that root.zig's `reportFailure` reported
+/// (several with `keep_going`): what a campaign's corpus keeps
+/// (`Options.corpus_dir`).
+reported: [4]persist.Failed = undefined,
+reported_len: u8 = 0,
+/// The port the last stream `connect` used, failed or not (system-call
+/// mode's `getsockname` after a failed attempt).
+last_connect_port: u16 = 0,
 boot_count: u32,
 crash_count: u32,
 
@@ -3011,7 +3020,8 @@ fn netAccept(userdata: ?*anyopaque, server: ionet.Socket.Handle, options: ionet.
             const ss = &s.net.sockets[sv];
             const v = s.net.encode(sv);
             s.record(.net_accept, ss.node, ss.peer_node, v, "");
-            return .{ .handle = toHandle(v), .address = ip4(net_mod.Net.nodeAddress(ss.peer_node), ss.peer_port) };
+            const from: [4]u8 = if (ss.loopback) .{ 127, 0, 0, 1 } else net_mod.Net.nodeAddress(ss.peer_node);
+            return .{ .handle = toHandle(v), .address = ip4(from, ss.peer_port) };
         }
         s.block(.net, null, true);
         try s.cancelPoint();
@@ -3022,6 +3032,116 @@ fn netConnectIp(userdata: ?*anyopaque, address: *const ionet.IpAddress, options:
     const s = fromUserdata(userdata);
     const E = ionet.IpAddress.ConnectError;
     try s.enter(E);
+    return s.connectStream(address, options, null);
+}
+
+// --- stream sockets of system-call mode (`sysnet.zig`) ---------------------
+//
+// A kernel's stream socket has a state `std.Io` does not: bound to a port
+// before `listen` or `connect`. These give it to system-call mode.
+
+/// Stops a listener in place, keeping its port reserved (system-call mode:
+/// Linux's `shutdown(SHUT_RD)` of a listener). Waiting connections are
+/// reset and a waiting `accept` fails.
+pub fn unlisten(s: *Sim, handle: ionet.Socket.Handle) void {
+    const slot = s.net.decode(handleValue(handle)) catch return;
+    if (s.net.sockets[slot].kind != .listener) return;
+    s.net.unlisten(slot, s.now_ns, &s.decider, s.config.net);
+    s.touchGlobal();
+    s.netWakeAll();
+}
+
+/// Wakes the tasks waiting on the network (system-call mode: a `shutdown`
+/// that only sysnet records still ends a `poll` or a read).
+pub fn wakeNetwork(s: *Sim) void {
+    s.touchGlobal();
+    s.netWakeAll();
+}
+
+/// System-call mode's `poll`: a connected stream's readiness.
+pub fn streamReadable(s: *Sim, handle: ionet.Socket.Handle) bool {
+    const slot = s.streamSlot(handle) orelse return true;
+    return s.net.streamReadable(slot, s.now_ns);
+}
+
+pub fn streamWritable(s: *Sim, handle: ionet.Socket.Handle) bool {
+    const slot = s.streamSlot(handle) orelse return true;
+    return s.net.streamWritable(slot, s.now_ns);
+}
+
+/// A listener has a connection waiting, or was shut down.
+pub fn listenerReady(s: *Sim, handle: ionet.Socket.Handle) bool {
+    const slot = s.net.decode(handleValue(handle)) catch return true;
+    const l = &s.net.sockets[slot];
+    return l.kind != .listener or l.shut_recv or l.backlog_len > 0;
+}
+
+/// Waits until the network changes or `deadline_ns` passes (system-call
+/// mode's `poll`). A wait that cannot end is a deadlock, as for any
+/// blocked task.
+pub fn waitNetwork(s: *Sim, deadline_ns: ?u64) Io.Cancelable!void {
+    s.block(.net, deadline_ns, true);
+    try s.cancelPoint();
+}
+
+/// The connected stream was reset by its peer (system-call mode: Linux
+/// then counts the socket closed).
+pub fn streamReset(s: *Sim, handle: ionet.Socket.Handle) bool {
+    const slot = s.streamSlot(handle) orelse return false;
+    return s.net.isReset(slot, s.now_ns);
+}
+
+/// The error Linux reports for a reset stream: `EPIPE` when the peer's FIN
+/// came first (the socket was in CLOSE_WAIT), else `ECONNRESET`.
+pub fn streamResetIsPipe(s: *Sim, handle: ionet.Socket.Handle) bool {
+    const slot = s.streamSlot(handle) orelse return false;
+    return s.net.finArrived(slot, s.now_ns);
+}
+
+/// `bind` of a stream socket: reserves the port (an ephemeral one for 0).
+pub fn bindStream(s: *Sim, address: ionet.IpAddress) ionet.IpAddress.BindError!ionet.Socket {
+    const E = ionet.IpAddress.BindError;
+    try s.enter(E);
+    s.secCapability(.net_listen, &.{});
+    const a = switch (address) {
+        .ip4 => |a| a,
+        .ip6 => return error.AddressFamilyUnsupported,
+    };
+    const node = s.currentNode();
+    if (!net_mod.Net.isLocal(node, a.bytes)) return error.AddressUnavailable;
+    const port = if (a.port == 0) s.net.ephemeralPort(node, false) orelse return error.AddressInUse else a.port;
+    const slot = try s.net.bindStream(node, port);
+    const v = s.net.encode(slot);
+    s.record(.net_bind, node, port, v, "stream");
+    return .{ .handle = toHandle(v), .address = ip4(a.bytes, port) };
+}
+
+/// `listen` of a bound stream socket, on its port.
+pub fn listenBound(s: *Sim, handle: ionet.Socket.Handle, backlog: u31) ionet.IpAddress.ListenError!void {
+    const E = ionet.IpAddress.ListenError;
+    try s.enter(E);
+    const slot = s.net.decode(handleValue(handle)) catch return error.Unexpected;
+    if (s.net.sockets[slot].kind != .bound) return error.Unexpected;
+    s.net.listenBound(slot, backlog);
+    s.record(.net_listen, s.net.sockets[slot].node, s.net.sockets[slot].local_port, handleValue(handle), "bound");
+}
+
+/// `connect` of a bound stream socket: the connection takes its port.
+pub fn connectFrom(s: *Sim, handle: ionet.Socket.Handle, address: ionet.IpAddress) ionet.IpAddress.ConnectError!ionet.Socket {
+    const E = ionet.IpAddress.ConnectError;
+    try s.enter(E);
+    const slot = s.net.decode(handleValue(handle)) catch return error.Unexpected;
+    if (s.net.sockets[slot].kind != .bound) return error.Unexpected;
+    return s.connectStream(&address, .{ .mode = .stream }, slot);
+}
+
+/// `from`: a bound socket whose port the connection takes, and whose
+/// reservation it then replaces.
+fn connectStream(s: *Sim, address: *const ionet.IpAddress, options: ionet.IpAddress.ConnectOptions, from: ?u16) ionet.IpAddress.ConnectError!ionet.Socket {
+    const E = ionet.IpAddress.ConnectError;
+    // The bound socket by its handle, generation and all: it may be closed
+    // and its slot reused while the SYN is out.
+    const bound_value: ?u32 = if (from) |b| s.net.encode(b) else null;
     s.secCapability(.net_connect, &.{});
     if (options.mode != .stream) return error.SocketModeUnsupported;
     if (options.protocol) |p| if (p != .tcp) return error.ProtocolUnsupportedByAddressFamily;
@@ -3045,7 +3165,13 @@ fn netConnectIp(userdata: ?*anyopaque, address: *const ionet.IpAddress, options:
         try s.cancelPoint();
     }
     s.netDelay(); // SYN
-    const port = s.net.ephemeralPort(src, false) orelse return error.AddressUnavailable;
+    // A bound socket closed while the SYN was out: its port is no longer its.
+    if (bound_value) |v| {
+        const b = s.net.decode(v) catch return error.Canceled;
+        if (b != from.? or s.net.sockets[b].kind != .bound) return error.Canceled;
+    }
+    const port = if (from) |b| s.net.sockets[b].local_port else s.net.ephemeralPort(src, false) orelse return error.AddressUnavailable;
+    s.last_connect_port = port;
     const listener = s.net.findListener(dst, a.port) orelse {
         s.netDelay(); // RST
         s.record(.net_connect, src, dst, a.port, "refused");
@@ -3059,11 +3185,15 @@ fn netConnectIp(userdata: ?*anyopaque, address: *const ionet.IpAddress, options:
         },
         error.SystemResources => return error.SystemResources,
     };
+    if (from) |b| s.net.releaseBound(b);
+    const loopback = a.bytes[0] == 127;
+    s.net.sockets[c].loopback = loopback;
+    s.net.sockets[s.net.sockets[c].peer].loopback = loopback;
     s.netWakeAll(); // acceptors
     s.netDelay(); // SYN-ACK
     const v = s.net.encode(c);
     s.record(.net_connect, src, dst, v, "established");
-    return .{ .handle = toHandle(v), .address = ip4(net_mod.Net.nodeAddress(src), port) };
+    return .{ .handle = toHandle(v), .address = ip4(if (loopback) .{ 127, 0, 0, 1 } else net_mod.Net.nodeAddress(src), port) };
 }
 
 fn netClose(userdata: ?*anyopaque, sockets: []const ionet.Socket) void {
@@ -3343,6 +3473,49 @@ fn netWriteStep(s: *Sim, op: Io.Operation.NetWrite) ?Io.Operation.NetWrite.Resul
 
 // --- datagrams ---------------------------------------------------------------
 
+/// Datagrams that have arrived at a datagram socket and are not read
+/// (system-call mode's `connect`, `sysnet.zig`).
+pub fn datagramsArrived(s: *Sim, handle: ionet.Socket.Handle) u32 {
+    const slot = s.dgramSlot(handle) orelse return 0;
+    return s.net.datagramsArrived(slot, s.now_ns);
+}
+
+/// Drops the arrived datagrams not from `from` (port 0: any port): a
+/// connected socket's filter, which Linux applies on arrival.
+pub fn dropDatagramsNotFrom(s: *Sim, handle: ionet.Socket.Handle, from: ionet.IpAddress) void {
+    const slot = s.dgramSlot(handle) orelse return;
+    const f = switch (from) {
+        .ip4 => |x| x,
+        .ip6 => return,
+    };
+    const sock = &s.net.sockets[slot];
+    var i: usize = 0;
+    while (i < sock.seg_len) {
+        const seg = sock.segs[i];
+        const bytes: [4]u8 = if (seg.loopback) .{ 127, 0, 0, 1 } else net_mod.Net.nodeAddress(seg.src_node);
+        const match = (f.port == 0 or seg.src_port == f.port) and std.mem.eql(u8, &bytes, &f.bytes);
+        if (seg.deliver_at <= s.now_ns and !match) s.net.dropDatagram(slot, i) else i += 1;
+    }
+}
+
+/// Of those, the ones from `from` (a connected datagram socket's peer).
+pub fn datagramsArrivedFrom(s: *Sim, handle: ionet.Socket.Handle, from: ionet.IpAddress) u32 {
+    const slot = s.dgramSlot(handle) orelse return 0;
+    const f = switch (from) {
+        .ip4 => |x| x,
+        .ip6 => return 0,
+    };
+    const sock = &s.net.sockets[slot];
+    var n: u32 = 0;
+    for (sock.segs[0..sock.seg_len]) |seg| {
+        // A peer port of 0 matches any port (Linux).
+        if (seg.deliver_at > s.now_ns or (f.port != 0 and seg.src_port != f.port)) continue;
+        const bytes: [4]u8 = if (seg.loopback) .{ 127, 0, 0, 1 } else net_mod.Net.nodeAddress(seg.src_node);
+        if (std.mem.eql(u8, &bytes, &f.bytes)) n += 1;
+    }
+    return n;
+}
+
 fn dgramSlot(s: *Sim, handle: ionet.Socket.Handle) ?u16 {
     const slot = s.net.decode(handleValue(handle)) catch return null;
     if (s.net.sockets[slot].kind != .dgram) return null;
@@ -3413,13 +3586,13 @@ fn netSendStep(s: *Sim, op: Io.Operation.NetSend) Io.Operation.NetSend.Result {
                 // The attacker's copy: no loss decisions, so a replay that
                 // was chosen is one that arrives.
                 const replayed = s.sec_scratch[cap..][0..n];
-                const outcome = s.net.sendDatagram(slot, dst, a.port, replayed, false, false, s.now_ns, &s.decider, s.config.net);
+                const outcome = s.net.sendDatagram(slot, dst, a.port, replayed, false, false, s.now_ns, &s.decider, s.config.net, a.bytes[0] == 127);
                 s.record(.net_send, slot, n, @backingInt(outcome), "replay");
             }
         }
         const lose = loss_on and s.decider.chance(.fault, f.datagram_loss_ppm);
         const dup = loss_on and s.decider.chance(.fault, f.datagram_duplicate_ppm);
-        const outcome = s.net.sendDatagram(slot, dst, a.port, payload, lose, dup, s.now_ns, &s.decider, s.config.net);
+        const outcome = s.net.sendDatagram(slot, dst, a.port, payload, lose, dup, s.now_ns, &s.decider, s.config.net, a.bytes[0] == 127);
         s.stats.datagrams += 1;
         s.stats.net_bytes += m.data_len;
         s.record(.net_send, slot, m.data_len, @backingInt(outcome), @tagName(outcome));
@@ -3440,7 +3613,7 @@ fn netReceiveStep(s: *Sim, op: Io.Operation.NetReceive) ?Io.Operation.NetReceive
         if (count > 0 and out.len == 0) break;
         const dg = s.net.recvDatagram(slot, out, s.now_ns) orelse break;
         const m = &op.message_buffer[count];
-        m.from = ip4(net_mod.Net.nodeAddress(dg.src_node), dg.src_port);
+        m.from = ip4(if (dg.loopback) .{ 127, 0, 0, 1 } else net_mod.Net.nodeAddress(dg.src_node), dg.src_port);
         m.data = out[0..dg.len];
         if (s.sec) |a| a.provider.ingress(a.ctx, s.socketSink(.datagram, slot, dg.src_node), m.data);
         m.control = m.control[0..0];

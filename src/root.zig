@@ -27,6 +27,7 @@ pub const fuzz = @import("search/fuzz.zig");
 pub const trace = @import("sim/trace.zig");
 pub const shrink = @import("search/shrink.zig");
 pub const explore = @import("search/explore.zig");
+const persist = @import("search/persist.zig");
 pub const lin = @import("check/lin.zig");
 pub const elle = @import("check/elle.zig");
 pub const ledger = @import("check/ledger.zig");
@@ -158,6 +159,25 @@ pub const Options = struct {
     /// Corpus entries kept by guided exploration.
     corpus_max: u32 = 256,
     explore_report: ?*ExploreReport = null,
+    /// A directory where a campaign keeps what it learned for the next
+    /// one (`search/persist.zig`): the runs that failed, which the next
+    /// campaign runs first and drops once they pass, and with
+    /// `explore = .guided` the corpus and the coverage it reached, so
+    /// exploration goes on where it stopped. In tests
+    /// `TARDIS_CORPUS_DIR` sets it. Null: nothing is kept. A seed or
+    /// replay token still replays without it.
+    corpus_dir: ?[]const u8 = null,
+    /// The file's name in `corpus_dir`. By default the name of the
+    /// function that called `check` (the test) when the program has
+    /// debug info, or else of `body`, followed by a hash of `personas`,
+    /// `nodes`, `mode` and `workers`, so two checks in one test keep two
+    /// files. Two checks that share a name share a file: harmless (each
+    /// run still replays from its token) but it dilutes both corpora.
+    corpus_name: ?[]const u8 = null,
+    /// The `std.Io` that reads and writes the corpus file. Tests use
+    /// `std.testing.io` when this is null; elsewhere nothing is kept
+    /// without it.
+    corpus_io: ?std.Io = null,
     /// Threads for the campaign (M5), each with its own simulator. Results
     /// (which failure is reported, `sometimes` outcomes) do not depend on
     /// thread timing. Guided exploration with several workers runs in
@@ -687,6 +707,12 @@ fn campaignFromEnv(gpa: Allocator, o: *Options) void {
             o.iterations *|= @max(scale, 1);
         } else |_| std.debug.print("tardis: ignoring unparsable TARDIS_ITERATIONS_SCALE=\"{s}\"\n", .{text});
     } else |_| {}
+    if (std.testing.environ.getAlloc(gpa, "TARDIS_EXPLORE")) |text| {
+        defer gpa.free(text);
+        if (std.meta.stringToEnum(Explore, std.mem.trim(u8, text, " \t\r\n"))) |e| {
+            o.explore = e;
+        } else std.debug.print("tardis: ignoring TARDIS_EXPLORE=\"{s}\" (random or guided)\n", .{text});
+    } else |_| {}
 }
 
 fn replayFromEnv(gpa: Allocator) Replay {
@@ -803,6 +829,12 @@ fn runOnce(s: *Sim, comptime body: fn (*Env) anyerror!void, seed: u64, persona: 
 }
 
 fn reportFailure(s: *Sim, err: anyerror, iteration: u32, iterations: u32, seed: u64, persona: Persona, forced: []const decide.Forced) void {
+    if (s.reported_len < s.reported.len and forced.len <= explore.forced_max) {
+        var r: persist.Failed = .{ .persona = persona, .seed = seed, .forced_len = @intCast(forced.len) };
+        @memcpy(r.forced[0..forced.len], forced);
+        s.reported[s.reported_len] = r;
+        s.reported_len += 1;
+    }
     if (!s.config.report) return;
     std.debug.print(
         \\
@@ -1098,6 +1130,194 @@ fn replayTokenFromEnv(gpa: Allocator) ?[]u8 {
 }
 
 // ===========================================================================
+// What a campaign keeps for the next one (plan3.md E4)
+
+/// A check's corpus file (`Options.corpus_dir`, `search/persist.zig`).
+const Keeping = struct {
+    kept: persist.Kept,
+    io: std.Io,
+    dir: []u8,
+    /// `dir` and the file's name.
+    path: []u8,
+    report: bool,
+
+    /// Null when nothing is to be kept (no directory, or no `std.Io` for
+    /// it outside tests). A file that cannot be read or decoded gives an
+    /// empty corpus, and is replaced at the end.
+    fn open(gpa: Allocator, comptime body: fn (*Env) anyerror!void, options: Options, caller: usize) ?Keeping {
+        const io = options.corpus_io orelse (if (builtin.is_test) std.testing.io else return null);
+        const dir: []u8 = if (options.corpus_dir) |d| (gpa.dupe(u8, d) catch return null) else blk: {
+            if (!builtin.is_test) return null;
+            const text = std.testing.environ.getAlloc(gpa, "TARDIS_CORPUS_DIR") catch return null;
+            const trimmed = std.mem.trim(u8, text, " \t\r\n");
+            if (trimmed.len == 0) {
+                gpa.free(text);
+                return null;
+            }
+            const d = gpa.dupe(u8, trimmed) catch {
+                gpa.free(text);
+                return null;
+            };
+            gpa.free(text);
+            break :blk d;
+        };
+        const name = corpusName(gpa, body, options, caller) catch {
+            gpa.free(dir);
+            return null;
+        };
+        defer gpa.free(name);
+        const path = std.fs.path.join(gpa, &.{ dir, name }) catch {
+            gpa.free(dir);
+            return null;
+        };
+        var k: Keeping = .{ .kept = .{}, .io = io, .dir = dir, .path = path, .report = options.report };
+        if (std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 << 20))) |bytes| {
+            defer gpa.free(bytes);
+            if (persist.decode(gpa, bytes)) |kept| {
+                k.kept = kept;
+                if (k.report) std.debug.print("tardis: corpus {s}: {d} entries and {d} failed runs kept from earlier campaigns\n", .{ path, kept.entries.items.len, kept.failures_len });
+            } else |_| if (k.report) std.debug.print("tardis: corpus {s} does not decode (another version, or damaged): starting empty\n", .{path});
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => if (k.report) std.debug.print("tardis: cannot read corpus {s} ({s}): starting empty\n", .{ path, @errorName(err) }),
+        }
+        return k;
+    }
+
+    fn close(k: *Keeping, gpa: Allocator) void {
+        k.kept.deinit(gpa);
+        gpa.free(k.path);
+        gpa.free(k.dir);
+        k.* = undefined;
+    }
+
+    /// Writes the file whole beside its final name, then renames it into
+    /// place, so a campaign stopped while saving leaves the last version.
+    fn save(k: *Keeping, gpa: Allocator) void {
+        const bytes = persist.encode(gpa, &k.kept) catch {
+            std.debug.print("tardis: out of memory saving corpus {s}\n", .{k.path});
+            return;
+        };
+        defer gpa.free(bytes);
+        const cwd = std.Io.Dir.cwd();
+        cwd.createDirPath(k.io, k.dir) catch |err| {
+            std.debug.print("tardis: cannot create corpus directory {s} ({s})\n", .{ k.dir, @errorName(err) });
+            return;
+        };
+        // Unique to this process and save: test binaries run at once.
+        // Two processes saving different contents cannot pick the same
+        // name; the same contents may, harmlessly.
+        const tmp = std.fmt.allocPrint(gpa, "{s}.{x}.tmp", .{ k.path, std.hash.Wyhash.hash(@intFromPtr(bytes.ptr) ^ @intFromPtr(k), bytes) }) catch return;
+        defer gpa.free(tmp);
+        cwd.writeFile(k.io, .{ .sub_path = tmp, .data = bytes }) catch |err| {
+            std.debug.print("tardis: cannot write corpus {s} ({s})\n", .{ tmp, @errorName(err) });
+            cwd.deleteFile(k.io, tmp) catch {};
+            return;
+        };
+        std.Io.Dir.rename(cwd, tmp, cwd, k.path, k.io) catch |err| {
+            std.debug.print("tardis: cannot replace corpus {s} ({s})\n", .{ k.path, @errorName(err) });
+            cwd.deleteFile(k.io, tmp) catch {};
+        };
+    }
+};
+
+fn BodyName(comptime body: fn (*Env) anyerror!void) type {
+    return struct {
+        const f = body;
+    };
+}
+
+/// The name of `body` as the compiler gives it ("body", not its namespace).
+fn bodyName(comptime body: fn (*Env) anyerror!void) []const u8 {
+    const full = @typeName(BodyName(body));
+    const start = comptime if (std.mem.indexOf(u8, full, "function '")) |i| i + "function '".len else 0;
+    const end = comptime std.mem.indexOfScalarPos(u8, full, start, '\'') orelse full.len;
+    return full[start..end];
+}
+
+/// The name of the function that contains `address`, from the program's
+/// own debug info; null without it.
+fn callerName(address: usize, buf: []u8) ?[]const u8 {
+    if (std.debug.SelfInfo == void or address == 0) return null else {
+        const si = std.debug.getSelfDebugInfo() catch return null;
+        // Symbolized as `sec/edges.zig` does, the way `std.debug` symbolizes
+        // a stack trace: with the caller's I/O and allocator `getSymbols`
+        // hangs on Linux (Zig 0.17; found in WSL, revision 82).
+        const dio = std.Options.debug_io;
+        const prev = dio.swapCancelProtection(.blocked);
+        defer _ = dio.swapCancelProtection(prev);
+        var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+        defer arena.deinit();
+        const symbol_allocator = std.debug.getDebugInfoAllocator();
+        var symbols: std.ArrayList(std.debug.Symbol) = .empty;
+        defer symbols.deinit(symbol_allocator);
+        si.getSymbols(dio, symbol_allocator, arena.allocator(), address - 1, false, &symbols) catch return null;
+        for (symbols.items) |sym| {
+            const n = sym.name orelse continue;
+            if (n.len == 0) continue;
+            const len = @min(n.len, buf.len);
+            @memcpy(buf[0..len], n[0..len]);
+            return buf[0..len];
+        }
+        return null;
+    }
+}
+
+/// `Options.corpus_name`, or the test's (else the body's) name and a hash
+/// of the options that shape the runs.
+fn corpusName(gpa: Allocator, comptime body: fn (*Env) anyerror!void, options: Options, caller: usize) ![]u8 {
+    if (options.corpus_name) |n| return gpa.dupe(u8, n);
+    var buf: [256]u8 = undefined;
+    const who = callerName(caller, &buf) orelse bodyName(body);
+    var h: std.hash.Wyhash = .init(0x7A2D_C0);
+    h.update(who);
+    h.update(bodyName(body));
+    for (options.personas) |p| {
+        h.update(&.{0});
+        h.update(@tagName(p));
+    }
+    h.update(&.{ 1, options.nodes });
+    h.update(@tagName(options.mode));
+    h.update(std.mem.asBytes(&options.workers));
+    var safe: [64]u8 = undefined;
+    const n = @min(who.len, safe.len);
+    for (who[0..n], safe[0..n]) |c, *out| out.* = if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.') c else '_';
+    return std.fmt.allocPrint(gpa, "{s}-{x:0>8}.corpus", .{ safe[0..n], @as(u32, @truncate(h.final())) });
+}
+
+/// Runs the failed runs the corpus kept, before the campaign's own: one
+/// that fails again fails the check as a campaign failure does; one that
+/// passes now is dropped.
+fn runKept(gpa: Allocator, s: *Sim, comptime body: fn (*Env) anyerror!void, options: Options, k: *Keeping) !void {
+    var i: usize = 0;
+    while (i < k.kept.failures_len) {
+        const f = k.kept.failures[i];
+        if (std.mem.indexOfScalar(Persona, options.personas, f.persona) == null) {
+            i += 1;
+            continue;
+        }
+        const forced = f.forcedSlice();
+        const overlay: decide.Overlay = .{ .forced = forced };
+        s.overlay = if (forced.len > 0) &overlay else null;
+        const out = runOnce(s, body, f.seed, f.persona, 0, options.leak_check);
+        s.overlay = null;
+        out.result catch |err| {
+            if (options.keep_going) |log| {
+                logFailure(gpa, s, body, log, 0, f.seed, f.persona, forced, err, options);
+                i += 1;
+                continue;
+            }
+            if (s.config.report) std.debug.print("\ntardis: a run that failed in an earlier campaign (kept in {s}) fails again\n", .{k.path});
+            reportFailure(s, err, 0, 1, f.seed, f.persona, forced);
+            shrinkAndReport(gpa, s, body, f.seed, f.persona, forced, err, options);
+            return err;
+        };
+        if (s.config.report) std.debug.print("tardis: a run that failed in an earlier campaign passes now; dropped from {s}\n", .{k.path});
+        k.kept.removeFailure(i);
+    }
+}
+
+// ===========================================================================
 // Guided exploration (M3)
 
 pub const Explore = enum {
@@ -1127,7 +1347,7 @@ const Guided = struct {
     rec_buf: []u64,
     mutated: u32,
 
-    fn init(gpa: Allocator, options: Options) !Guided {
+    fn init(gpa: Allocator, options: Options, keep: ?*Keeping) !Guided {
         var corpus = try explore.Corpus.init(gpa, options.corpus_max, options.campaign_seed);
         errdefer corpus.deinit(gpa);
         const seen = try gpa.create([explore.map_words]u64);
@@ -1135,10 +1355,14 @@ const Guided = struct {
         const run = try gpa.create([explore.map_words]u64);
         errdefer gpa.destroy(run);
         @memset(seen, 0);
+        if (keep) |k| k.kept.intoCorpus(&corpus, seen, options.personas);
         return .{ .corpus = corpus, .seen = seen, .run = run, .rec_buf = try gpa.alloc(u64, 4096), .mutated = 0 };
     }
 
-    fn deinit(g: *Guided, gpa: Allocator) void {
+    /// Hands the corpus to `keep` (saved by `checkOn`), then frees it.
+    fn deinit(g: *Guided, gpa: Allocator, options: Options, keep: ?*Keeping) void {
+        if (keep) |k| k.kept.fromCorpus(gpa, &g.corpus, g.seen, options.personas) catch
+            std.debug.print("tardis: out of memory keeping the corpus; its file keeps the last one\n", .{});
         gpa.free(g.rec_buf);
         gpa.destroy(g.run);
         gpa.destroy(g.seen);
@@ -1173,7 +1397,7 @@ pub fn check(gpa: Allocator, comptime body: fn (*Env) anyerror!void, options: Op
     // The shrunk token, for a security layer's emitter (seam 4).
     var shrunk: ShrinkReport = .{};
     if (o.shrink_report == null) o.shrink_report = &shrunk;
-    const result = checkOn(gpa, s, body, o);
+    const result = checkOn(gpa, s, body, o, caller);
     if (options.warm_report) |r| r.* = .{
         .restores = s.warm.restores,
         .checks = s.warm.checks,
@@ -1195,7 +1419,7 @@ pub fn check(gpa: Allocator, comptime body: fn (*Env) anyerror!void, options: Op
     return result;
 }
 
-fn checkOn(gpa: Allocator, s: *Sim, comptime body: fn (*Env) anyerror!void, options: Options) anyerror!void {
+fn checkOn(gpa: Allocator, s: *Sim, comptime body: fn (*Env) anyerror!void, options: Options, caller: usize) anyerror!void {
     // Notes on C state left behind are about this check's own runs.
     syscalls.dropped_in_call_seed = null;
     if (options.replay) |text| return runToken(gpa, s, body, text, options);
@@ -1221,6 +1445,20 @@ fn checkOn(gpa: Allocator, s: *Sim, comptime body: fn (*Env) anyerror!void, opti
         return;
     }
 
+    var keeping = Keeping.open(gpa, body, options, caller);
+    defer if (keeping) |*k| k.close(gpa);
+    const keep: ?*Keeping = if (keeping) |*k| k else null;
+    s.reported_len = 0;
+    const result = campaign(gpa, s, body, options, keep);
+    if (keep) |k| {
+        if (result) |_| {} else |_| for (s.reported[0..s.reported_len]) |r| k.kept.addFailure(r);
+        k.save(gpa);
+    }
+    return result;
+}
+
+fn campaign(gpa: Allocator, s: *Sim, comptime body: fn (*Env) anyerror!void, options: Options, keep: ?*Keeping) anyerror!void {
+    if (keep) |k| try runKept(gpa, s, body, options, k);
     const fork_server = options.fork and forkserver.supported and options.setup != null;
     if (options.workers > 1 and options.explore == .random and !fork_server) {
         if (try runParallel(gpa, s, body, options)) |failed_at| {
@@ -1231,10 +1469,10 @@ fn checkOn(gpa: Allocator, s: *Sim, comptime body: fn (*Env) anyerror!void, opti
         }
         if (options.keep_going) |log| if (log.len > 0) return log.entries[0].err;
     } else if (options.workers > 1 and options.explore == .guided) {
-        try runGuidedParallel(gpa, s, body, options);
+        try runGuidedParallel(gpa, s, body, options, keep);
     } else {
-        var guided: ?Guided = if (options.explore == .guided) try Guided.init(gpa, options) else null;
-        defer if (guided) |*g| g.deinit(gpa);
+        var guided: ?Guided = if (options.explore == .guided) try Guided.init(gpa, options, keep) else null;
+        defer if (guided) |*g| g.deinit(gpa, options, keep);
         try campaignRange(gpa, s, body, options, if (guided) |*g| g else null, 0, options.iterations);
         if (guided) |*g| g.report(options, null);
     }
@@ -1638,11 +1876,11 @@ fn GuidedWorker(comptime body: fn (*Env) anyerror!void) type {
     };
 }
 
-fn runGuidedParallel(gpa: Allocator, s: *Sim, comptime body: fn (*Env) anyerror!void, options: Options) !void {
+fn runGuidedParallel(gpa: Allocator, s: *Sim, comptime body: fn (*Env) anyerror!void, options: Options, keep: ?*Keeping) !void {
     const workers = options.workers;
     const epoch: u32 = @max(options.epoch_iterations, 1);
-    var g = try Guided.init(gpa, options);
-    defer g.deinit(gpa);
+    var g = try Guided.init(gpa, options, keep);
+    defer g.deinit(gpa, options, keep);
     const jobs_max = @as(usize, epoch) * options.personas.len;
     const jobs = try gpa.alloc(GuidedJob, jobs_max);
     defer gpa.free(jobs);
@@ -2591,6 +2829,7 @@ test {
     _ = @import("model/net.zig");
     _ = @import("search/shrink.zig");
     _ = @import("search/explore.zig");
+    _ = @import("search/persist.zig");
     _ = @import("check/lin.zig");
     _ = @import("check/elle.zig");
     _ = @import("check/ledger.zig");
@@ -2599,9 +2838,11 @@ test {
     _ = @import("tests/weak_test.zig");
     _ = @import("tests/syscall_test.zig");
     _ = @import("tests/sysmode_test.zig");
+    _ = @import("tests/sysnet_diff_test.zig");
     _ = @import("tests/tsc_test.zig");
     _ = @import("tests/diff_fs_test.zig");
     _ = @import("tests/self_fuzz_test.zig");
+    _ = @import("tests/corpus_test.zig");
     _ = @import("tests/diff_net_test.zig");
     _ = syscalls;
     _ = atomic;

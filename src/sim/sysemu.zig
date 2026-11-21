@@ -178,6 +178,57 @@ fn dirOf(s: *Sim, dirfd: i32, path: []const u8) DirOf {
     return .{ .dir = .{ .handle = @intCast(valueOf(dirfd)) } };
 }
 
+// --- poll ------------------------------------------------------------------------
+
+const PollFd = extern struct { fd: i32, events: i16, revents: i16 };
+
+fn pollDeadline(s: *Sim, timeout_ms: u64) ?u64 {
+    const ms: i32 = @bitCast(@as(u32, @truncate(timeout_ms)));
+    if (ms < 0) return null;
+    return s.now_ns + @as(u64, @intCast(ms)) * std.time.ns_per_ms;
+}
+
+fn ppoll(s: *Sim, fds_ptr: u64, nfds: u64, ts_ptr: u64) ?u64 {
+    if (ts_ptr == 0) return poll(s, fds_ptr, nfds, null);
+    const ts: *align(1) const [2]i64 = @ptrFromInt(ts_ptr);
+    if (ts[0] < 0 or ts[1] < 0 or ts[1] >= std.time.ns_per_s) return fail(.INVAL);
+    const ns = @as(u64, @intCast(ts[0])) *| std.time.ns_per_s +| @as(u64, @intCast(ts[1]));
+    return poll(s, fds_ptr, nfds, s.now_ns +| ns);
+}
+
+/// `poll` over simulated descriptors: sockets (`sysnet.pollMask`) and
+/// simulated files (always ready, as regular files are). A real
+/// descriptor among them makes the call a stray. Waits in virtual time,
+/// for the network to change or the deadline to pass.
+fn poll(s: *Sim, fds_ptr: u64, nfds: u64, deadline: ?u64) ?u64 {
+    if (nfds > 4096) return fail(.INVAL);
+    if (nfds > 0 and fds_ptr == 0) return fail(.FAULT);
+    const fds: []align(1) PollFd = if (nfds == 0) &.{} else @as([*]align(1) PollFd, @ptrFromInt(fds_ptr))[0..nfds];
+    for (fds) |p| if (p.fd >= 0 and !simulated(p.fd) and !sysnet.isSocketFd(p.fd)) return null;
+    while (true) {
+        var ready: u64 = 0;
+        for (fds) |*p| {
+            p.revents = 0;
+            if (p.fd < 0) continue;
+            const mask: u16 = if (sysnet.isSocketFd(p.fd))
+                sysnet.pollMask(s, p.fd)
+            else if (p.fd == root_fd or p.fd == random_fd or handleOf(s, p.fd) != null)
+                sysnet.pollin | sysnet.pollout | 0x40 | 0x100
+            else
+                sysnet.pollnval;
+            const want: u16 = @as(u16, @bitCast(p.events)) | sysnet.pollerr | sysnet.pollhup | sysnet.pollnval;
+            p.revents = @bitCast(mask & want);
+            if (p.revents != 0) ready += 1;
+        }
+        if (ready > 0) return ready;
+        if (deadline) |d| if (s.now_ns >= d) return 0;
+        // Wake for the next network event too: a delivery due later.
+        var until = deadline;
+        if (s.net.nextEventAfter(s.now_ns)) |t| until = if (until) |d| @min(d, t) else t;
+        s.waitNetwork(until) catch return fail(.INTR);
+    }
+}
+
 /// A run begins: no socket is open (`sysnet.zig`).
 pub fn resetRun() void {
     sysnet.reset();
@@ -199,6 +250,8 @@ pub fn emulate(number: u64, a: *const [6]u64) ?u64 {
     };
     if (on_descriptor and sysnet.isSocketFd(fd)) return sysnet.emulate(s, number, a);
     return switch (number) {
+        7 => poll(s, a[0], a[1], pollDeadline(s, a[2])),
+        271 => ppoll(s, a[0], a[1], a[2]),
         2 => open(s, at_fdcwd, a[0], @truncate(a[1])),
         85 => open(s, at_fdcwd, a[0], o_creat | o_wronly | o_trunc), // creat
         257 => open(s, fd, a[1], @truncate(a[2])),

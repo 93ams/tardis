@@ -73,7 +73,7 @@ ran, no run broke a property the test stated. It does not mean more.
   mutex leaves it held, into the next run (C statics are the process's).
 - In system-call mode: clock reads through the vDSO are answered from
   the simulation (revision 78); a thread inside the vDSO when a run
-  begins makes that run fail with `StraySyscall`. Non-blocking sockets, `poll`, `epoll`, pipes, `mmap` of a file,
+  begins makes that run fail with `StraySyscall`. `select`, `epoll`, pipes, `mmap` of a file,
   `dup` and `poll` are not emulated (each fails the run). Owners,
   permission bits and record locks are not modelled. State a library keeps
   for the life of the process is carried from one run to the next.

@@ -15,10 +15,12 @@
 # and its error), labelled `tardis-campaign`.
 #
 # Between runs each system keeps a directory in the Actions cache,
-# `campaign-corpus`, and names it in `TARDIS_CORPUS_DIR`. Today it holds
-# the history of the runs (salt, scale, outcome) and the failures seen
-# with their replay tokens; the library does not read it yet, so the
-# guided explorer's corpus still starts empty each run (plan3.md E4).
+# `campaign-corpus`, and names it in `TARDIS_CORPUS_DIR`. Every check keeps
+# a file there (plan3.md E4): the runs that failed, which the next night
+# runs first until they pass, and the guided explorer's corpus and
+# coverage, so exploration goes on where the last night stopped
+# (`TARDIS_EXPLORE=guided`). The directory also holds the history of the
+# runs (salt, scale, outcome) and the failures seen with their tokens.
 #
 # Only tests that state a property for any seed belong here. A test that
 # expects a planted bug to be found within its usual iterations, or
@@ -53,6 +55,10 @@ on:
         description: Open or update an issue for each failure
         type: boolean
         default: false
+      explore:
+        description: How checks choose their runs (guided or random)
+        type: string
+        default: guided
   workflow_call:
     inputs:
       command:
@@ -67,6 +73,10 @@ on:
         description: The Zig release to build with
         type: string
         default: "0.17.0"
+      explore:
+        description: How checks choose their runs (guided or random)
+        type: string
+        default: guided
       open_issues:
         description: Open or update an issue for each failure
         type: boolean
@@ -90,7 +100,10 @@ jobs:
       # names the seeds it used.
       TARDIS_CAMPAIGN_SALT: ${{ github.run_id }}
       TARDIS_ITERATIONS_SCALE: ${{ inputs.scale || '20' }}
-      # Kept between runs (actions/cache). Not read by the library yet.
+      # Guided exploration, whatever a check asks for, so the corpus
+      # kept between nights is used.
+      TARDIS_EXPLORE: ${{ inputs.explore || 'guided' }}
+      # Kept between runs (actions/cache): one file per check.
       TARDIS_CORPUS_DIR: ${{ github.workspace }}/campaign-corpus
       CAMPAIGN_REPORT_DIR: ${{ github.workspace }}/campaign-report
       # This repository's own campaign: the tests that hold for any seed

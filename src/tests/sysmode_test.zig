@@ -1025,14 +1025,194 @@ test "system-call mode: datagrams and socket errors, by system calls" {
     try tardis.check(gpa, socketErrors, .{ .iterations = 20, .mode = .syscalls });
 }
 
-fn nonBlocking(env: *Env) !void {
+fn usesEpoll(env: *Env) !void {
     _ = env;
-    _ = sys(.socket, 2, 1 | 0o4000, 0, 0); // SOCK_NONBLOCK: not emulated
+    _ = sys(.epoll_create1, 0, 0, 0, 0); // epoll: not emulated
 }
 
-test "system-call mode: a non-blocking socket is not emulated, and fails the run" {
+test "system-call mode: epoll is not emulated, and fails the run" {
     if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
-    try testing.expectError(error.StraySyscall, tardis.check(gpa, nonBlocking, .{ .iterations = 1, .mode = .syscalls, .report = false, .shrink = false }));
+    try testing.expectError(error.StraySyscall, tardis.check(gpa, usesEpoll, .{ .iterations = 1, .mode = .syscalls, .report = false, .shrink = false }));
+}
+
+// --- non-blocking sockets and poll (revision 82) -----------------------------------
+
+const PollFd = extern struct { fd: i32, events: i16, revents: i16 };
+const pollin = 0x1;
+const pollout = 0x4;
+const eagain = -11;
+
+/// Waits for `events` on `fd`, as an event loop does.
+fn waitFor(fd: usize, events: i16) !i16 {
+    var p: PollFd = .{ .fd = @intCast(fd), .events = events, .revents = 0 };
+    const n = try ok(sys(.poll, @intFromPtr(&p), 1, @as(u32, @bitCast(@as(i32, -1))), 0));
+    try testing.expectEqual(@as(usize, 1), n);
+    return p.revents;
+}
+
+/// Reads exactly `buf.len` bytes from a non-blocking stream, polling when
+/// there is nothing yet.
+fn readAllPolled(fd: usize, buf: []u8) !void {
+    var got: usize = 0;
+    while (got < buf.len) {
+        const rc = sys6(.recvfrom, fd, @intFromPtr(buf.ptr) + got, buf.len - got, 0, 0, 0);
+        if (rc == eagain) {
+            _ = try waitFor(fd, pollin);
+            continue;
+        }
+        const n = try ok(rc);
+        if (n == 0) return error.EndOfStream;
+        got += n;
+    }
+}
+
+fn pollServer(listener: usize) void {
+    pollServe(listener) catch |err| std.debug.panic("poll server: {s}", .{@errorName(err)});
+}
+
+fn pollServe(listener: usize) !void {
+    // Nothing waits yet: accept says so instead of waiting.
+    var peer: SockaddrIn = undefined;
+    var peer_len: u32 = @sizeOf(SockaddrIn);
+    const sock_nonblock = 0o4000;
+    var rc = sys(.accept4, listener, @intFromPtr(&peer), @intFromPtr(&peer_len), sock_nonblock);
+    while (rc == eagain) {
+        _ = try waitFor(listener, pollin);
+        rc = sys(.accept4, listener, @intFromPtr(&peer), @intFromPtr(&peer_len), sock_nonblock);
+    }
+    const conn = try ok(rc);
+    defer _ = sys(.close, conn, 0, 0, 0);
+    var buf: [4]u8 = undefined;
+    try readAllPolled(conn, &buf);
+    var sent: usize = 0;
+    while (sent < buf.len) {
+        const w = sys6(.sendto, conn, @intFromPtr(&buf) + sent, buf.len - sent, 0x4000, 0, 0);
+        if (w == eagain) {
+            _ = try waitFor(conn, pollout);
+            continue;
+        }
+        sent += try ok(w);
+    }
+}
+
+fn eventLoop(env: *Env) !void {
+    const sock_nonblock = 0o4000;
+    const listener = try ok(sys(.socket, 2, 1 | sock_nonblock, 0, 0));
+    const bound = sockaddr(.{ 127, 0, 0, 1 }, 7100);
+    _ = try ok(sys(.bind, listener, @intFromPtr(&bound), @sizeOf(SockaddrIn), 0));
+    _ = try ok(sys(.listen, listener, 8, 0, 0));
+    var server = try env.io.concurrent(pollServer, .{listener});
+
+    // A client made blocking, then switched by fcntl, as libraries do.
+    const client = try ok(sys(.socket, 2, 1, 0, 0));
+    const flags = try ok(sys(.fcntl, client, 3, 0, 0)); // F_GETFL
+    _ = try ok(sys(.fcntl, client, 4, flags | sock_nonblock, 0)); // F_SETFL
+    try testing.expect(try ok(sys(.fcntl, client, 3, 0, 0)) & sock_nonblock != 0);
+    const rc = sys(.connect, client, @intFromPtr(&bound), @sizeOf(SockaddrIn), 0);
+    try testing.expect(rc == 0 or rc == errOf(.INPROGRESS));
+    try testing.expect(try waitFor(client, pollout) & pollout != 0);
+    var err: u32 = 1;
+    var err_len: u32 = 4;
+    _ = try ok(sys6(.getsockopt, client, 1, 4, @intFromPtr(&err), @intFromPtr(&err_len), 0)); // SO_ERROR
+    try testing.expectEqual(@as(u32, 0), err);
+    // Nothing to read yet.
+    var buf: [4]u8 = undefined;
+    try testing.expectEqual(@as(isize, eagain), sys6(.recvfrom, client, @intFromPtr(&buf), buf.len, 0, 0, 0));
+    _ = try ok(sys6(.sendto, client, @intFromPtr("ping"), 4, 0x4000, 0, 0));
+    try readAllPolled(client, &buf);
+    try testing.expectEqualStrings("ping", &buf);
+    server.await(env.io);
+    // The server closed: readable, and the stream ends.
+    try testing.expect(try waitFor(client, pollin) & pollin != 0);
+    try testing.expectEqual(@as(isize, 0), sys6(.recvfrom, client, @intFromPtr(&buf), buf.len, 0, 0, 0));
+    _ = sys(.close, client, 0, 0, 0);
+    _ = sys(.close, listener, 0, 0, 0);
+}
+
+test "system-call mode: a non-blocking echo driven by poll, as an event loop runs it" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, eventLoop, .{ .iterations = 100, .mode = .syscalls });
+}
+
+fn pollTimesOut(env: *Env) !void {
+    _ = env;
+    const s = try ok(sys(.socket, 2, 2, 0, 0));
+    defer _ = sys(.close, s, 0, 0, 0);
+    const at = sockaddr(.{ 127, 0, 0, 1 }, 9100);
+    _ = try ok(sys(.bind, s, @intFromPtr(&at), @sizeOf(SockaddrIn), 0));
+    var p: PollFd = .{ .fd = @intCast(s), .events = pollin, .revents = 0 };
+    const before = try monotonicNs();
+    // Nothing arrives: the timeout passes, in virtual time.
+    try testing.expectEqual(@as(isize, 0), sys(.poll, @intFromPtr(&p), 1, 250, 0));
+    try testing.expect(try monotonicNs() - before >= 250 * std.time.ns_per_ms);
+    // MSG_DONTWAIT on a blocking socket.
+    var buf: [8]u8 = undefined;
+    try testing.expectEqual(@as(isize, eagain), sys6(.recvfrom, s, @intFromPtr(&buf), buf.len, 0x40, 0, 0));
+}
+
+fn shutsDown(fd: usize) void {
+    sleepsMs(5);
+    _ = sys(.shutdown, fd, 0, 0, 0); // SHUT_RD
+}
+
+fn sleepsMs(ms: i64) void {
+    const ts = Timespec{ .sec = 0, .nsec = ms * std.time.ns_per_ms };
+    _ = sys(.nanosleep, @intFromPtr(&ts), 0, 0, 0);
+}
+
+fn pollWokenByShutdown(env: *Env) !void {
+    const s = try ok(sys(.socket, 2, 2, 0, 0));
+    defer _ = sys(.close, s, 0, 0, 0);
+    const at = sockaddr(.{ 127, 0, 0, 1 }, 9200);
+    _ = try ok(sys(.bind, s, @intFromPtr(&at), @sizeOf(SockaddrIn), 0));
+    const peer = sockaddr(.{ 127, 0, 0, 1 }, 9201);
+    _ = try ok(sys(.connect, s, @intFromPtr(&peer), @sizeOf(SockaddrIn), 0));
+    var other = try env.io.concurrent(shutsDown, .{s});
+    // Nothing arrives; another task's shutdown ends the wait (found by
+    // review, revision 82: it waited forever).
+    const revents = try waitFor(s, pollin);
+    try testing.expect(revents & pollin != 0);
+    other.await(env.io);
+    var buf: [8]u8 = undefined;
+    try testing.expectEqual(@as(isize, 0), sys6(.recvfrom, s, @intFromPtr(&buf), buf.len, 0, 0, 0));
+}
+
+test "system-call mode: a shutdown by another task wakes a poll and a read on a datagram socket" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, pollWokenByShutdown, .{ .iterations = 10, .mode = .syscalls });
+}
+
+fn listenerKeepsPort(env: *Env) !void {
+    _ = env;
+    const l = try ok(sys(.socket, 2, 1, 0, 0));
+    const at = sockaddr(.{ 127, 0, 0, 1 }, 7200);
+    _ = try ok(sys(.bind, l, @intFromPtr(&at), @sizeOf(SockaddrIn), 0));
+    _ = try ok(sys(.listen, l, 8, 0, 0));
+    const c = try ok(sys(.socket, 2, 1, 0, 0));
+    _ = try ok(sys(.connect, c, @intFromPtr(&at), @sizeOf(SockaddrIn), 0));
+    const conn = try ok(sys(.accept, l, 0, 0, 0));
+    // With a connection still open on its port, the listener stops and
+    // listens again on the same port (found by review, revision 82: it
+    // took an ephemeral one).
+    _ = try ok(sys(.shutdown, l, 0, 0, 0));
+    _ = try ok(sys(.listen, l, 8, 0, 0));
+    var name: SockaddrIn = undefined;
+    var name_len: u32 = @sizeOf(SockaddrIn);
+    _ = try ok(sys(.getsockname, l, @intFromPtr(&name), @intFromPtr(&name_len), 0));
+    try testing.expectEqual(@as(u16, 7200), std.mem.bigToNative(u16, name.port_be));
+    _ = sys(.close, conn, 0, 0, 0);
+    _ = sys(.close, c, 0, 0, 0);
+    _ = sys(.close, l, 0, 0, 0);
+}
+
+test "system-call mode: a listener shut down for reading keeps its port" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, listenerKeepsPort, .{ .iterations = 10, .mode = .syscalls });
+}
+
+test "system-call mode: poll's timeout passes in virtual time, and MSG_DONTWAIT does not wait" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, pollTimesOut, .{ .iterations = 10, .mode = .syscalls });
 }
 
 // --- found by review (revision 79) ------------------------------------------------

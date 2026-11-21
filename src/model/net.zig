@@ -56,7 +56,9 @@ pub const Options = struct {
 pub const ephemeral_port_first: u16 = 49152;
 const backlog_cap = 32;
 
-pub const Kind = enum(u8) { free, listener, stream, dgram };
+/// `bound`: a stream socket's port reserved by `bind`, before `listen` or
+/// `connect` (system-call mode; `std.Io` has no such state).
+pub const Kind = enum(u8) { free, listener, stream, dgram, bound };
 
 pub const Fault = enum(u8) { none, reset, timed_out };
 
@@ -68,6 +70,8 @@ pub const Segment = struct {
     /// Sender, for datagrams.
     src_node: NodeId = 0,
     src_port: u16 = 0,
+    /// A datagram sent to a loopback address.
+    loopback: bool = false,
 };
 
 const no_peer: u16 = std.math.maxInt(u16);
@@ -90,6 +94,9 @@ pub const Socket = struct {
     peer_port: u16,
     /// True while the socket waits in a listener's backlog (kernel-owned).
     in_backlog: bool,
+    /// A connection made to a loopback address: both ends' addresses read
+    /// as 127.0.0.1, as on a real host.
+    loopback: bool = false,
     rx: []u8,
     rx_head: u32,
     /// Bytes buffered, delivered or not.
@@ -264,6 +271,7 @@ pub const Net = struct {
             s.peer_node = 0;
             s.peer_port = 0;
             s.in_backlog = false;
+            s.loopback = false;
             s.rx_head = 0;
             s.rx_len = 0;
             s.rx_ready = 0;
@@ -326,6 +334,41 @@ pub const Net = struct {
         const slot = net.alloc(.listener, node, port) orelse return error.SystemResources;
         net.sockets[slot].backlog_limit = @intCast(@max(1, @min(backlog, net.limits.backlog_max)));
         return slot;
+    }
+
+    /// Reserves a stream port, as a kernel's `bind` does.
+    pub fn bindStream(net: *Net, node: NodeId, port: u16) error{ AddressInUse, SystemResources }!u16 {
+        if (net.portInUse(node, port, false)) return error.AddressInUse;
+        return net.alloc(.bound, node, port) orelse error.SystemResources;
+    }
+
+    /// A bound stream socket starts listening on its port.
+    pub fn listenBound(net: *Net, slot: u16, backlog: u31) void {
+        const s = &net.sockets[slot];
+        assert(s.kind == .bound);
+        s.kind = .listener;
+        s.backlog_len = 0;
+        s.backlog_limit = @intCast(@max(1, @min(backlog, net.limits.backlog_max)));
+    }
+
+    /// A listener stops listening and keeps its port (as `bound`): the
+    /// connections waiting in its queue are reset.
+    pub fn unlisten(net: *Net, slot: u16, now_ns: u64, d: *decide.Decider, o: Options) void {
+        const s = &net.sockets[slot];
+        assert(s.kind == .listener);
+        for (s.backlog[0..s.backlog_len]) |sv| {
+            if (net.peerOf(sv)) |c| net.setFault(c, .reset, now_ns + drawLatency(d, o));
+            net.release(sv);
+        }
+        s.backlog_len = 0;
+        s.shut_recv = false;
+        s.kind = .bound;
+    }
+
+    /// Frees a bound socket's reservation once its connection has the port.
+    pub fn releaseBound(net: *Net, slot: u16) void {
+        assert(net.sockets[slot].kind == .bound);
+        net.release(slot);
     }
 
     pub fn findListener(net: *const Net, node: NodeId, port: u16) ?u16 {
@@ -421,6 +464,30 @@ pub const Net = struct {
         return best;
     }
 
+    /// A stream has something for a read by now: data, its end, a fault,
+    /// or reading shut down.
+    pub fn streamReadable(net: *Net, slot: u16, now_ns: u64) bool {
+        net.settle(slot, now_ns);
+        const s = &net.sockets[slot];
+        return s.rx_ready > 0 or s.eof or s.shut_recv or activeFault(s, now_ns) != null;
+    }
+
+    /// A write on a stream would not wait (it may fail).
+    pub fn streamWritable(net: *Net, slot: u16, now_ns: u64) bool {
+        return net.checkSend(slot, now_ns) != .would_block;
+    }
+
+    /// The peer's FIN has arrived by now (read or not).
+    pub fn finArrived(net: *Net, slot: u16, now_ns: u64) bool {
+        net.settle(slot, now_ns);
+        return net.sockets[slot].eof;
+    }
+
+    /// The stream was reset by now (its peer's RST arrived).
+    pub fn isReset(net: *const Net, slot: u16, now_ns: u64) bool {
+        return activeFault(&net.sockets[slot], now_ns) == .reset;
+    }
+
     fn activeFault(s: *const Socket, now_ns: u64) ?Fault {
         if (s.fault != .none and s.fault_at <= now_ns) return s.fault;
         if (s.rto_at != 0 and s.rto_at <= now_ns) return .timed_out;
@@ -504,6 +571,13 @@ pub const Net = struct {
         const idx = (ps.seg_head + ps.seg_len) % ps.segs.len;
         ps.segs[idx] = .{ .len = len, .deliver_at = at, .held = held, .fin = fin };
         ps.seg_len += 1;
+        // Data for a peer that shut down both ways (FIN sent, reading shut:
+        // Linux's FIN_WAIT with RCV_SHUTDOWN) aborts the connection: the
+        // peer resets itself and answers with RST (RFC 1122 4.2.2.13).
+        if (len > 0 and !held and ps.shut_recv and ps.shut_send) {
+            net.setFault(p, .reset, at);
+            net.setFault(slot, .reset, at + drawLatency(d, o));
+        }
     }
 
     /// Marks `slot` as failing with `fault` from `at` on.
@@ -533,7 +607,7 @@ pub const Net = struct {
         const s = &net.sockets[slot];
         switch (s.kind) {
             .free => return,
-            .dgram => {},
+            .dgram, .bound => {},
             .listener => {
                 // Un-accepted connections are reset.
                 for (s.backlog[0..s.backlog_len]) |sv| {
@@ -625,7 +699,7 @@ pub const Net = struct {
         var best: ?u64 = null;
         for (net.sockets) |*s| {
             switch (s.kind) {
-                .free, .listener => continue,
+                .free, .listener, .bound => continue,
                 .stream => {
                     var k: u16 = 0;
                     while (k < s.seg_len) : (k += 1) {
@@ -675,7 +749,9 @@ pub const Net = struct {
 
     /// Queues one datagram from socket `src` to `dst_node:dst_port`.
     /// `lose` and `duplicate` are the fault decisions for this datagram.
-    pub fn sendDatagram(net: *Net, src: u16, dst_node: NodeId, dst_port: u16, data: []const u8, lose: bool, duplicate: bool, now_ns: u64, d: *decide.Decider, o: Options) SendOutcome {
+    /// `loopback`: sent to a 127.x address, so its source reads as
+    /// 127.0.0.1, as on a real host.
+    pub fn sendDatagram(net: *Net, src: u16, dst_node: NodeId, dst_port: u16, data: []const u8, lose: bool, duplicate: bool, now_ns: u64, d: *decide.Decider, o: Options, loopback: bool) SendOutcome {
         const ss = &net.sockets[src];
         if (!net.reachable(ss.node, dst_node)) return .dropped_unreachable;
         if (lose) return .dropped_loss;
@@ -694,13 +770,14 @@ pub const Net = struct {
                 .fin = false,
                 .src_node = ss.node,
                 .src_port = ss.local_port,
+                .loopback = loopback,
             };
             ds.seg_len += 1;
         }
         return .queued;
     }
 
-    pub const Datagram = struct { len: usize, truncated: bool, src_node: NodeId, src_port: u16 };
+    pub const Datagram = struct { len: usize, truncated: bool, src_node: NodeId, src_port: u16, loopback: bool };
 
     /// Takes the earliest deliverable datagram, copying up to `out.len`
     /// bytes. Null if none is deliverable yet.
@@ -722,7 +799,28 @@ pub const Net = struct {
         s.rx_len -= seg.len;
         std.mem.copyForwards(Segment, s.segs[i .. s.seg_len - 1], s.segs[i + 1 .. s.seg_len]);
         s.seg_len -= 1;
-        return .{ .len = n, .truncated = n < seg.len, .src_node = seg.src_node, .src_port = seg.src_port };
+        return .{ .len = n, .truncated = n < seg.len, .src_node = seg.src_node, .src_port = seg.src_port, .loopback = seg.loopback };
+    }
+
+    /// Removes the `i`th queued datagram of `slot`, unread.
+    pub fn dropDatagram(net: *Net, slot: u16, i: usize) void {
+        const s = &net.sockets[slot];
+        var offset: u32 = 0;
+        for (s.segs[0..i]) |seg| offset += seg.len;
+        const len = s.segs[i].len;
+        std.mem.copyForwards(u8, s.rx[offset .. s.rx_len - len], s.rx[offset + len .. s.rx_len]);
+        s.rx_len -= len;
+        std.mem.copyForwards(Segment, s.segs[i .. s.seg_len - 1], s.segs[i + 1 .. s.seg_len]);
+        s.seg_len -= 1;
+    }
+
+    /// Datagrams that have arrived at `slot` by `now_ns` and are not read.
+    pub fn datagramsArrived(net: *const Net, slot: u16, now_ns: u64) u32 {
+        var n: u32 = 0;
+        for (net.sockets[slot].segs[0..net.sockets[slot].seg_len]) |seg| {
+            if (seg.deliver_at <= now_ns) n += 1;
+        }
+        return n;
     }
 
     pub fn datagramCapacity(net: *const Net) usize {
@@ -817,10 +915,10 @@ test "datagrams: loss, duplication, reordering, separate port space" {
     const b = try net.bind(1, 53); // same number as the TCP listener: allowed
     try testing.expectError(error.AddressInUse, net.bind(1, 53));
 
-    try testing.expectEqual(Net.SendOutcome.dropped_loss, net.sendDatagram(a, 1, 53, "lost", true, false, 0, &d, o));
-    try testing.expectEqual(Net.SendOutcome.dropped_no_socket, net.sendDatagram(a, 1, 54, "x", false, false, 0, &d, o));
-    try testing.expectEqual(Net.SendOutcome.queued, net.sendDatagram(a, 1, 53, "one", false, true, 0, &d, o));
-    try testing.expectEqual(Net.SendOutcome.queued, net.sendDatagram(a, 1, 53, "two", false, false, 0, &d, o));
+    try testing.expectEqual(Net.SendOutcome.dropped_loss, net.sendDatagram(a, 1, 53, "lost", true, false, 0, &d, o, false));
+    try testing.expectEqual(Net.SendOutcome.dropped_no_socket, net.sendDatagram(a, 1, 54, "x", false, false, 0, &d, o, false));
+    try testing.expectEqual(Net.SendOutcome.queued, net.sendDatagram(a, 1, 53, "one", false, true, 0, &d, o, false));
+    try testing.expectEqual(Net.SendOutcome.queued, net.sendDatagram(a, 1, 53, "two", false, false, 0, &d, o, false));
 
     var buf: [8]u8 = undefined;
     try testing.expect(net.recvDatagram(b, &buf, 0) == null);
@@ -840,7 +938,7 @@ test "datagrams: loss, duplication, reordering, separate port space" {
     try testing.expectEqual(@as(u32, 2), ones);
 
     net.setLink(0, 1, false, 0, &d, o);
-    try testing.expectEqual(Net.SendOutcome.dropped_unreachable, net.sendDatagram(a, 1, 53, "cut", false, false, 0, &d, o));
+    try testing.expectEqual(Net.SendOutcome.dropped_unreachable, net.sendDatagram(a, 1, 53, "cut", false, false, 0, &d, o, false));
     net.close(a, 0, &d, o);
     net.close(b, 0, &d, o);
     net.close(tcp, 0, &d, o);
