@@ -138,6 +138,7 @@ events, and prints two ways to run it again:
 | `TARDIS_CORPUS_DIR=<dir>` | nothing: each `check` keeps a file there, and the next campaign runs the runs that failed first and goes on exploring where the last stopped |
 | `TARDIS_EXPLORE=guided` | nothing: every `check` explores guided by coverage |
 | `TARDIS_PRESET=quick\|thorough\|nightly` | nothing: it sizes every `check` whose `iterations` is the default 100, written out or not (20, 1,000 or 10,000; `nightly` is also guided) |
+| `TARDIS_TRACE_DIR=<dir>` | nothing: a failing check that is reported writes a Chrome trace of the failing run and of the shrunk run there ([`docs/trace.md`](docs/trace.md)) |
 | `TARDIS_REPLAY_COMMAND=<command>` | nothing: replay lines end in it, not in `zig build test`; a build script sets it on a run step ([`docs/reproducing.md`](docs/reproducing.md)) |
 | `TARDIS_REPLAY_FUZZY=2` | with `TARDIS_REPLAY`: if the token no longer fails because the code now draws a little differently, try it with its decisions moved by up to 2 draws |
 
@@ -307,6 +308,7 @@ worked example.
 | `zig build bench` | throughput benchmarks, always optimized |
 | `zig build bugbench` | the bug benchmark: each example's planted bug, whether a plain run sees it, whether a campaign finds it, what it shrinks to |
 | `zig build bugbench-rates` | which oracle catches each planted bug, and in how many of 20 campaigns by size ([`docs/measurements.md`](docs/measurements.md)) |
+| `zig build bugbench-schedules` | how often each planted bug is found with tasks switched at random and by priority, PCT ([`docs/measurements.md`](docs/measurements.md)) |
 | `zig build bugbench-baselines` | whether each planted bug is still found with no faults injected, and with no preemption ([`docs/measurements.md`](docs/measurements.md)) |
 | `zig build membench` | the memory one simulator takes, by option |
 | `zig build docs` | the API reference, into `zig-out/docs` |

@@ -34,6 +34,9 @@ jobs:
           # If a real filesystem call panics inside std, this file holds
           # the sequence that did it (diff_fs_test.zig).
           TARDIS_DIFF_TRACE: diff_fs.trace
+          # A failing check leaves a Chrome trace of its run here
+          # (docs/trace.md); the upload step below keeps it.
+          TARDIS_TRACE_DIR: traces
           # On Linux x86_64 a check whose code makes a real system call
           # fails (plan3.md D3); ignored on the other systems.
           TARDIS_TRAP_SYSCALLS: 1
@@ -73,6 +76,7 @@ jobs:
           path: |
             tardis/test.log
             tardis/diff_fs.trace
+            tardis/traces
           if-no-files-found: ignore
           retention-days: 14
       # Numbers that follow from the seed must not move; timings must stay

@@ -23,6 +23,69 @@ fn tmpPath(tmp: *const testing.TmpDir, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path}) catch unreachable;
 }
 
+/// Writes a file for each of a few drawn numbers, then fails: the run
+/// as found writes some, the shrunk run none.
+fn alwaysFails(env: *Env) !void {
+    for (0..6) |_| {
+        if ((try env.fuzz(u8)) % 4 != 0) try env.dir.writeFile(env.io, .{ .sub_path = "f", .data = "x" });
+    }
+    try env.always("this never holds", false);
+}
+
+test "trace_dir: a failure leaves the trace of the run as found and of the shrunk run" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+    const dir = tmpPath(&tmp, &buf);
+    try testing.expectError(error.AssertionFailed, tardis.check(gpa, alwaysFails, .{ .iterations = 3, .report = false, .trace_dir = dir }));
+    // The same check again: the same seed, and a name of its own.
+    try testing.expectError(error.AssertionFailed, tardis.check(gpa, alwaysFails, .{ .iterations = 3, .report = false, .trace_dir = dir }));
+    // A token replayed leaves its trace too.
+    var report: tardis.ShrinkReport = .{};
+    try testing.expectError(error.AssertionFailed, tardis.check(gpa, alwaysFails, .{ .iterations = 3, .report = false, .shrink_report = &report }));
+    try testing.expectError(error.AssertionFailed, tardis.check(gpa, alwaysFails, .{ .replay = report.token(), .report = false, .trace_dir = dir }));
+    var found: usize = 0;
+    var shrunk: usize = 0;
+    var numbered: usize = 0;
+    var found_events: usize = 0;
+    var shrunk_events: usize = 0;
+    var it = tmp.dir.iterate();
+    while (try it.next(testing.io)) |e| {
+        try testing.expect(std.mem.endsWith(u8, e.name, ".trace.json"));
+        // Named for the persona and the seed of the replay line.
+        try testing.expect(std.mem.indexOf(u8, e.name, "-linux_ext4-") != null);
+        const is_shrunk = std.mem.endsWith(u8, e.name, ".shrunk.trace.json");
+        if (is_shrunk) shrunk += 1 else found += 1;
+        if (std.mem.indexOf(u8, e.name, "-1.") != null or std.mem.indexOf(u8, e.name, "-2.") != null) numbered += 1;
+        var file_buf: [64 * 1024]u8 = undefined;
+        const text = try tmp.dir.readFile(testing.io, e.name, &file_buf);
+        // A JSON array that holds the failing assertion.
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, text, .{});
+        defer parsed.deinit();
+        const events = parsed.value.array.items.len;
+        try testing.expect(events > 0);
+        try testing.expect(std.mem.indexOf(u8, text, "this never holds") != null);
+        if (is_shrunk) shrunk_events = @max(shrunk_events, events) else found_events = @max(found_events, events);
+    }
+    // Two campaigns, each with the run as found and the shrunk run, and
+    // the replayed token (the shrunk run again, found as it is).
+    try testing.expectEqual(@as(usize, 3), found);
+    try testing.expectEqual(@as(usize, 2), shrunk);
+    try testing.expectEqual(@as(usize, 3), numbered);
+    // The shrunk file is the shrunk run: it wrote no file.
+    try testing.expect(shrunk_events < found_events);
+}
+
+test "trace_dir: a passing campaign leaves nothing" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+    const dir = tmpPath(&tmp, &buf);
+    try tardis.check(gpa, combinationLock, .{ .iterations = 3, .trace_dir = dir });
+    var it = tmp.dir.iterate();
+    try testing.expect(try it.next(testing.io) == null);
+}
+
 fn corpusFiles(tmp: *testing.TmpDir) !usize {
     var n: usize = 0;
     var it = tmp.dir.iterate();

@@ -22,6 +22,14 @@
 //! F2): for each program, whether a campaign of its usual size still
 //! finds the bug with no faults injected, with no preemption, with
 //! neither, and as it is, and what the failing run shrinks to.
+//!
+//! `zig build bugbench-schedules` prints the schedule table (plan3.md
+//! E5): for each program, in how many of 20 campaigns of 10 and of 50
+//! iterations the bug is found when tasks are switched at random
+//! (`Options.schedule = .random`, the default) and by priority (`.pct`)
+//! at depths 1, 2 and 3, and whether the fixed program passes under
+//! priorities. Two programs at its end are not examples: they are the
+//! two shapes of ordering bug that tell the schedules apart.
 
 const std = @import("std");
 const tardis = @import("tardis");
@@ -132,6 +140,126 @@ fn rateRow(gpa: std.mem.Allocator, io: std.Io, comptime name: []const u8, compti
     // The largest size must find it every time: the table is the claim.
     return found[rate_sizes.len - 1] == rate_campaigns;
 }
+
+const Strategy = struct { schedule: tardis.Schedule, depth: u8 };
+const strategies = [_]Strategy{
+    .{ .schedule = .random, .depth = 0 },
+    .{ .schedule = .pct, .depth = 1 },
+    .{ .schedule = .pct, .depth = 2 },
+    .{ .schedule = .pct, .depth = 3 },
+};
+const schedule_sizes = [_]u32{ 10, 50 };
+
+fn scheduleRow(gpa: std.mem.Allocator, io: std.Io, comptime name: []const u8, comptime class: []const u8, comptime module: type) !bool {
+    _ = io;
+    _ = class;
+    if (@hasDecl(module, "supported") and (!module.supported or !tardis.syscallModeAvailable())) {
+        std.debug.print("| `{s}` | not run: no system-call mode on this system | | | | | | | | |\n", .{name});
+        return true;
+    }
+    var base: tardis.Options = if (@hasDecl(module, "options")) module.options else .{};
+    base.report = false;
+    base.shrink = false;
+    // The failure a campaign of the usual size finds: only that one is
+    // counted below.
+    var usual = base;
+    usual.iterations = if (@hasDecl(module, "options")) module.options.iterations else 200;
+    var want: ?anyerror = if (Run(module.buggy).check(gpa, usual)) |_| null else |err| err;
+    if (want == null) {
+        // A bug the random schedule does not reach at that size.
+        usual.schedule = .pct;
+        want = if (Run(module.buggy).check(gpa, usual)) |_| null else |err| err;
+    }
+    std.debug.print("| `{s}` |", .{name});
+    for (strategies) |strategy| {
+        for (schedule_sizes) |size| {
+            var found: u32 = 0;
+            for (0..rate_campaigns) |c| {
+                var o = base;
+                o.iterations = size;
+                o.schedule = strategy.schedule;
+                o.pct_depth = @max(1, strategy.depth);
+                o.campaign_seed = tardis.default_campaign_seed +% 0x9E37_79B9 *% (c + 1);
+                if (Run(module.buggy).check(gpa, o)) |_| {} else |err| {
+                    if (want == null or want.? == err) found += 1;
+                }
+            }
+            std.debug.print(" {d}/{d} |", .{ found, rate_campaigns });
+        }
+    }
+    // A schedule must not fail a correct program: the fixed one, under
+    // priorities, at the usual size.
+    var fix_holds = true;
+    if (@hasDecl(module, "fixed")) {
+        var fix = usual;
+        fix.schedule = .pct;
+        fix_holds = if (Run(module.fixed).check(gpa, fix)) |_| true else |_| false;
+        std.debug.print(" {s} |\n", .{if (fix_holds) "passes" else "FAILS"});
+    } else std.debug.print(" |\n", .{});
+    return want != null and fix_holds;
+}
+
+/// Two ordering bugs that are not examples, one for each way a schedule
+/// can be hard to reach. Each has two tasks and one assertion.
+const shapes = struct {
+    const Io = std.Io;
+    const steps = 40;
+
+    fn work(io: Io, dir: Io.Dir, name: []const u8, n: u32, done: *bool) Io.Cancelable!void {
+        for (0..n) |_| dir.writeFile(io, .{ .sub_path = name, .data = "x" }) catch {};
+        done.* = true;
+    }
+
+    fn look(io: Io, dir: Io.Dir, other_done: *const bool, saw: *bool) Io.Cancelable!void {
+        dir.writeFile(io, .{ .sub_path = "look", .data = "x" }) catch {};
+        saw.* = other_done.*;
+    }
+
+    /// One long stretch: the bug shows when one task does all of its
+    /// forty operations while the other does its one.
+    const long_stretch = struct {
+        pub const options: tardis.Options = .{ .iterations = 2000, .faults = quiet_faults, .swarm = false };
+
+        pub fn buggy(env: *tardis.Env) !void {
+            var done = false;
+            var saw = false;
+            var group: Io.Group = .init;
+            defer group.cancel(env.io);
+            try group.concurrent(env.io, work, .{ env.io, env.dir, "a", steps, &done });
+            try group.concurrent(env.io, look, .{ env.io, env.dir, &done, &saw });
+            try group.await(env.io);
+            try env.always("the second task starts before the first has finished", !saw);
+        }
+    };
+
+    fn bump(io: Io, dir: Io.Dir, name: []const u8, turn: *u32, me: u32, switches: *u32) Io.Cancelable!void {
+        for (0..steps) |_| {
+            dir.writeFile(io, .{ .sub_path = name, .data = "x" }) catch {};
+            if (turn.* != me) switches.* += 1;
+            turn.* = me;
+        }
+    }
+
+    /// Many short stretches: the bug shows when the two tasks have
+    /// taken turns twelve times.
+    const many_switches = struct {
+        pub const options: tardis.Options = .{ .iterations = 2000, .faults = quiet_faults, .swarm = false };
+
+        pub fn buggy(env: *tardis.Env) !void {
+            var turn: u32 = 0;
+            var switches: u32 = 0;
+            var group: Io.Group = .init;
+            defer group.cancel(env.io);
+            try group.concurrent(env.io, bump, .{ env.io, env.dir, "a", &turn, 1, &switches });
+            try group.concurrent(env.io, bump, .{ env.io, env.dir, "b", &turn, 2, &switches });
+            try group.await(env.io);
+            try env.always("the two tasks take turns fewer than twelve times", switches < 12);
+        }
+    };
+
+    /// Nothing but the schedule decides these runs.
+    const quiet_faults: tardis.FaultOptions = .{ .io_error_ppm = 0, .short_io_ppm = 0, .io_latency_min_ns = 0, .io_latency_max_ns = 0 };
+};
 
 /// A campaign with a part of the exploration taken away, applied on top
 /// of the program's own options.
@@ -284,6 +412,17 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("| Program | The example's own trouble | No faults | No preemption | Neither | Default | Failing run of the default |\n|---|---|---|---|---|---|---|\n", .{});
         if (!try all(gpa, io, baselineRow)) {
             std.debug.print("\nbugbench: the default campaign missed a planted bug, or a fix failed\n", .{});
+            std.process.exit(1);
+        }
+        return;
+    }
+    if (std.mem.eql(u8, mode, "--schedules")) {
+        std.debug.print("| Program | random, 10 | random, 50 | pct 1, 10 | pct 1, 50 | pct 2, 10 | pct 2, 50 | pct 3, 10 | pct 3, 50 | The fix under pct 3 |\n|---|---|---|---|---|---|---|---|---|---|\n", .{});
+        var ok = try all(gpa, io, scheduleRow);
+        ok = try scheduleRow(gpa, io, "(one long stretch)", "", shapes.long_stretch) and ok;
+        ok = try scheduleRow(gpa, io, "(many short stretches)", "", shapes.many_switches) and ok;
+        if (!ok) {
+            std.debug.print("\nbugbench: a campaign of the usual size found no bug to count, or a fixed program failed under priorities\n", .{});
             std.process.exit(1);
         }
         return;

@@ -1,9 +1,9 @@
 # Measurements
 
-Three tables that the repository can print again at any time. Numbers in
-the first and the third follow from the seeds and are the same on every
-machine; the second depends on the allocator's rounding and may move by a
-few kilobytes.
+Four tables that the repository can print again at any time. Numbers in
+the first, the third and the fourth follow from the seeds and are the
+same on every machine; the second depends on the allocator's rounding and
+may move by a few kilobytes.
 
 ## 1. Which oracle catches which bug, and how often
 
@@ -199,3 +199,101 @@ it, so what it drives is a program's input. Which task runs next, whether
 a write is short and what a power loss keeps are decided by the `std.Io`
 the test uses, which the fuzzer does not supply. A test binary that is
 not built in fuzz mode runs only the corpus the test passes.
+
+## 4. Switching tasks at random, or by priority
+
+`zig build bugbench-schedules -Doptimize=ReleaseSafe` (`plan3.md` E5).
+`Options.schedule` chooses how the next task is picked:
+
+- **`.random`** (the default): at each simulated operation, with
+  probability `preempt_ppm` (a quarter), the next task is drawn again,
+  uniformly among those that can run, the current one included. With two
+  tasks that is a switch at one operation in eight.
+- **`.pct`**: priorities, after PCT (Burckhardt, Kothari, Musuvathi and
+  Nagarakatte, ASPLOS 2010). Each task gets a random priority when it
+  starts, and the runnable task with the highest one always runs. At
+  `pct_depth - 1` steps of the run, drawn at its start, the running task
+  drops below the others. Depth 1 changes nothing during a run: each run
+  is one order of the tasks. A task stops only where it blocks, at a
+  change point, when a task above it becomes runnable, or when a task
+  below it has waited more than 4,096 steps.
+
+Each cell is the number of campaigns, of 20 with different seeds, that
+found the program's bug, at 10 and at 50 iterations. Only the failure a
+campaign of the usual size finds is counted. Everything but the schedule
+is as the example asks for it. The last column is the fixed program under
+priorities at depth 3, at the usual size: a schedule must not fail a
+correct program.
+
+| Program | random, 10 | random, 50 | pct 1, 10 | pct 1, 50 | pct 2, 10 | pct 2, 50 | pct 3, 10 | pct 3, 50 | The fix under pct 3 |
+|---|---|---|---|---|---|---|---|---|---|
+| `wal_kv` | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | passes |
+| `dir_sync` | 19/20 | 20/20 | 19/20 | 20/20 | 19/20 | 20/20 | 19/20 | 20/20 | passes |
+| `rename_unsynced` | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | passes |
+| `syscall_rename` | not run: no system-call mode on this system | | | | | | | | |
+| `in_place_rewrite` | 18/20 | 20/20 | 18/20 | 20/20 | 18/20 | 20/20 | 18/20 | 20/20 | passes |
+| `index_before_data` | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | passes |
+| `id_reuse` | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | passes |
+| `jobs` | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | passes |
+| `short_write` | 11/20 | 20/20 | 11/20 | 20/20 | 11/20 | 20/20 | 11/20 | 20/20 | passes |
+| `short_read` | 13/20 | 19/20 | 13/20 | 19/20 | 13/20 | 19/20 | 13/20 | 19/20 | passes |
+| `error_leak` | 11/20 | 20/20 | 11/20 | 20/20 | 11/20 | 20/20 | 11/20 | 20/20 | passes |
+| `oom_partial` | 7/20 | 18/20 | 7/20 | 18/20 | 7/20 | 18/20 | 7/20 | 18/20 | passes |
+| `counter` | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | passes |
+| `check_then_act` | 19/20 | 20/20 | 0/20 | 0/20 | 1/20 | 9/20 | 3/20 | 13/20 | passes |
+| `lin_register` | 13/20 | 19/20 | 1/20 | 7/20 | 1/20 | 9/20 | 1/20 | 12/20 | passes |
+| `write_skew` | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | passes |
+| `deadlock` | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | passes |
+| `livelock` | 19/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | passes |
+| `hidden_state` | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | passes |
+| `never_retried` | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | passes |
+| `lease` | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | passes |
+| `udp_retry` | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | passes |
+| `udp_order` | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | passes |
+| `udp_no_timeout` | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | passes |
+| `stale_read` | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | passes |
+| `replica` | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | passes |
+| `(one long stretch)` | 0/20 | 1/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | |
+| `(many short stretches)` | 20/20 | 20/20 | 0/20 | 0/20 | 0/20 | 0/20 | 0/20 | 0/20 | |
+
+The last two rows are not examples. They are in the benchmark's own
+source (`src/cmd/bugbench/main.zig`), two tasks and one assertion each,
+with no faults: in the first the bug shows when one task does all forty of
+its operations while the other does its one; in the second, when the two
+tasks have taken turns twelve times.
+
+What the table says:
+
+- **Most of the benchmark does not care.** Twenty-two of the 25 programs
+  that run give the same count in every column: their bugs come from a
+  fault, a power loss or the network, or from an order that a task
+  blocking is enough to reach.
+- **Bugs that need a switch at one exact place are found sooner at
+  random.** `check_then_act` and `lin_register` need a task stopped
+  between two particular operations. Under `.random` every operation may
+  be such a stop; under `.pct` a run has at most two, at steps drawn from
+  a length the run does not know in advance. At depth 1 there are none,
+  and `check_then_act` is never found.
+- **Bugs that need a long stretch are found only by priority.** One task
+  running forty operations without the other starting has a chance near
+  one in two under `.pct`, and about one in a thousand runs under
+  `.random`: 1 campaign of 20 at 50 iterations.
+- **Bugs that need many switches are found only at random.** Twelve
+  alternations in one run are out of reach of two priority changes.
+
+**The recommendation: `.random` stays the default.** On the bugs people
+planted here it is never worse by more than one campaign in twenty
+(`livelock` at 10 iterations), and it is far better on two. `.pct` is
+for a suspicion of the first shape: a starved task, a queue that fills
+because its reader never runs, a timeout that fires only if something
+else runs for a long time. A nightly campaign can run both, as two checks
+of the same body.
+
+Limits: the two shapes were written to tell the schedules apart, so they
+say what each can do, not how often such bugs occur; the examples are
+small (two to four tasks, tens of operations), and PCT's guarantee is
+about depth, which matters more as programs grow; `pct_steps` was left at
+0, where each run draws a length from 16 to 16,384, and a length close to
+the run's own would place the change points better.
+
+Measured on Windows at revision 90.

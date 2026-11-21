@@ -100,6 +100,7 @@ pub const CrashMode = vfs.CrashMode;
 pub const OpKind = fault.OpKind;
 pub const FaultOptions = fault.FaultOptions;
 pub const Limits = Sim.Limits;
+pub const Schedule = Sim.Schedule;
 pub const Ppm = decide.Ppm;
 pub const Generator = fuzz.Generator;
 pub const NodeId = net.NodeId;
@@ -123,6 +124,22 @@ pub const Options = struct {
     personas: []const Persona = &.{.linux_ext4},
     /// Probability of switching tasks at each `std.Io` call.
     preempt_ppm: Ppm = 250_000,
+    /// How the next task is chosen: `.random` (with probability
+    /// `preempt_ppm` the next task is drawn again among those that can
+    /// run) or `.pct` (priorities with a few change points; see
+    /// `Schedule`). `docs/measurements.md`
+    /// compares them on the bug benchmark.
+    schedule: Schedule = .random,
+    /// `.pct`: the depth of ordering bug aimed at (1 to 8). A run changes
+    /// a priority at `pct_depth - 1` points.
+    pct_depth: u8 = 3,
+    /// `.pct`: the number of steps among which those points are drawn;
+    /// 0 lets each run draw a length (16 to 16,384). `exhaustive` does
+    /// not use `schedule`: it enumerates the random schedule's choices.
+    /// Under `.pct` a runnable task can wait 4,096 steps
+    /// (`Sim.pct_spin_max`) before the task above it is made to give
+    /// way, so an `expectProgress` bound in steps should be above that.
+    pct_steps: u32 = 0,
     /// Probability that `io.async` runs the task inline.
     async_inline_ppm: Ppm = 200_000,
     /// Draw a random subset of fault classes per iteration.
@@ -181,10 +198,20 @@ pub const Options = struct {
     /// files. Two checks that share a name share a file: harmless (each
     /// run still replays from its token) but it dilutes both corpora.
     corpus_name: ?[]const u8 = null,
-    /// The `std.Io` that reads and writes the corpus file. Tests use
-    /// `std.testing.io` when this is null; elsewhere nothing is kept
-    /// without it.
+    /// The `std.Io` that reads and writes the corpus file and writes
+    /// the trace files of `trace_dir`. Tests use `std.testing.io` when
+    /// this is null; elsewhere nothing is kept or written without it.
     corpus_io: ?std.Io = null,
+    /// A directory where a failure leaves its trace: the last
+    /// `limits.trace_ring_len` events of the failing run, in the format
+    /// of `traceJson` (`docs/trace.md`), in
+    /// `<test>-<persona>-<seed>.trace.json`, and of the shrunk run in
+    /// `...shrunk.trace.json` (a name that is taken gets a number). A continuous-integration job uploads the
+    /// directory (`docs/reproducing.md`). In tests `TARDIS_TRACE_DIR`
+    /// sets it for every check that left this null, and then only a
+    /// failure that is reported (`report`) leaves files: a test that
+    /// expects its failure leaves none. Null and no variable: no file.
+    trace_dir: ?[]const u8 = null,
     /// Threads for the campaign (M5), each with its own simulator. Results
     /// (which failure is reported, `sometimes` outcomes) do not depend on
     /// thread timing. Guided exploration with several workers runs in
@@ -391,6 +418,80 @@ fn replayCommand() []const u8 {
     };
 }
 
+var trace_dir_state: std.atomic.Value(u8) = .init(0); // 0 unknown, 1 being read, 2 known
+var trace_dir_buf: [512]u8 = undefined;
+var trace_dir_len: usize = 0;
+
+/// `TARDIS_TRACE_DIR`, read once, in test builds; null when it is unset,
+/// empty or too long.
+fn traceDirFromEnv() ?[]const u8 {
+    if (!builtin.is_test) return null;
+    while (true) switch (trace_dir_state.load(.acquire)) {
+        2 => return if (trace_dir_len == 0) null else trace_dir_buf[0..trace_dir_len],
+        1 => std.atomic.spinLoopHint(),
+        else => if (trace_dir_state.cmpxchgStrong(0, 1, .acquire, .monotonic) == null) {
+            const a = std.heap.page_allocator;
+            if (std.testing.environ.getAlloc(a, "TARDIS_TRACE_DIR")) |text| {
+                defer a.free(text);
+                const trimmed = std.mem.trim(u8, text, " \t\r\n");
+                if (trimmed.len <= trace_dir_buf.len) {
+                    @memcpy(trace_dir_buf[0..trimmed.len], trimmed);
+                    trace_dir_len = trimmed.len;
+                }
+            } else |_| {}
+            trace_dir_state.store(2, .release);
+        },
+    };
+}
+
+/// The number in the name of the last trace file this thread wrote for a
+/// run as found.
+threadlocal var trace_number_last: u32 = 0;
+
+/// Writes the trace ring, which holds the run that has just failed, to
+/// `Options.trace_dir`. `print`: the failure is being reported. One that
+/// is not leaves a file only when the options named the directory.
+fn writeFailureTrace(s: *Sim, persona: Persona, seed: u64, shrunk: bool, print: bool) void {
+    if (!print and !s.config.trace_always) return;
+    const dir = s.config.trace_dir orelse return;
+    const io = s.config.trace_io orelse return;
+    var out: std.Io.Writer.Allocating = .init(s.gpa);
+    defer out.deinit();
+    s.trace.writeChromeTrace(&out.writer) catch return;
+    // The name of the function that called `check` when the program has
+    // debug info (its last 64 bytes: the test's own name is at the end).
+    var who_buf: [256]u8 = undefined;
+    var safe: [64]u8 = undefined;
+    const full = callerName(s.config.trace_caller, &who_buf) orelse "run";
+    const who = full[full.len - @min(full.len, safe.len) ..];
+    const n = who.len;
+    for (who, safe[0..n]) |c, *o| o.* = if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.') c else '_';
+    const cwd = std.Io.Dir.cwd();
+    cwd.createDirPath(io, dir) catch |err| {
+        if (print) std.debug.print("tardis: cannot create trace directory {s} ({s})\n", .{ dir, @errorName(err) });
+        return;
+    };
+    // Seeds follow from the campaign seed and the iteration, which two
+    // checks share: a name that is taken gets a number. The shrunk run
+    // takes the number of the run it was shrunk from.
+    var number: u32 = if (shrunk) trace_number_last else 0;
+    const path = while (true) : (number += 1) {
+        var suffix_buf: [16]u8 = undefined;
+        const suffix = if (number == 0) "" else std.fmt.bufPrint(&suffix_buf, "-{d}", .{number}) catch unreachable;
+        const p = std.fmt.allocPrint(s.gpa, "{s}{c}{s}-{s}-{x:0>16}{s}{s}.trace.json", .{ dir, std.fs.path.sep, safe[0..n], @tagName(persona), seed, suffix, if (shrunk) ".shrunk" else "" }) catch return;
+        if (shrunk or number == 999) break p;
+        cwd.access(io, p, .{}) catch break p;
+        s.gpa.free(p);
+    };
+    defer s.gpa.free(path);
+    if (!shrunk) trace_number_last = number;
+    cwd.writeFile(io, .{ .sub_path = path, .data = out.written() }) catch |err| {
+        if (print) std.debug.print("tardis: cannot write trace {s} ({s})\n", .{ path, @errorName(err) });
+        return;
+    };
+    if (print) std.debug.print("tardis: trace of the {s} run (its last {d} events at most) written to {s}\n", .{ if (shrunk) "shrunk" else "failing", s.config.limits.trace_ring_len, path });
+}
+
 var trap_env: std.atomic.Value(u8) = .init(0); // 0 unknown, 1 off, 2 on
 
 fn trapSyscallsFromEnv() bool {
@@ -412,6 +513,9 @@ fn trapSyscallsFromEnv() bool {
 fn simConfig(o: Options) Sim.Config {
     return .{
         .preempt_ppm = o.preempt_ppm,
+        .schedule = o.schedule,
+        .pct_depth = o.pct_depth,
+        .pct_steps = o.pct_steps,
         .async_inline_ppm = o.async_inline_ppm,
         .swarm = o.swarm,
         .trap_syscalls = o.mode == .syscalls or (o.trap_syscalls orelse trapSyscallsFromEnv()),
@@ -423,6 +527,9 @@ fn simConfig(o: Options) Sim.Config {
         .nodes = o.nodes,
         .net = o.net,
         .report = o.report,
+        .trace_dir = o.trace_dir orelse traceDirFromEnv(),
+        .trace_always = o.trace_dir != null,
+        .trace_io = o.corpus_io orelse (if (builtin.is_test) std.testing.io else null),
         .security = o.security orelse sec_default.default_security,
     };
 }
@@ -1020,7 +1127,7 @@ fn reportFailure(s: *Sim, err: anyerror, iteration: u32, iterations: u32, seed: 
         s.reported[s.reported_len] = r;
         s.reported_len += 1;
     }
-    if (!s.config.report) return;
+    if (!s.config.report) return writeFailureTrace(s, persona, seed, false, false);
     std.debug.print(
         \\
         \\tardis: FAILED  iteration {d}/{d}  persona={s}  seed=0x{x:0>16}
@@ -1028,6 +1135,7 @@ fn reportFailure(s: *Sim, err: anyerror, iteration: u32, iterations: u32, seed: 
         \\
     , .{ iteration + 1, iterations, @tagName(persona), seed, @errorName(err) });
     s.trace.dump(16);
+    writeFailureTrace(s, persona, seed, false, true);
     s.printRefused();
     if (syscalls.dropped_in_call_seed) |earlier| if (earlier != seed) std.debug.print(
         "tardis: an earlier run (seed=0x{x}) dropped a task inside a system call, and a C library's state outlives a run: if this failure does not come back on replay, that run's leftovers are the likely cause\n",
@@ -1096,9 +1204,10 @@ fn reportShrunk(s: *Sim, sh: *shrink.Shrinker, persona: Persona, seed: u64, repo
     report.runs = sh.runs;
     report.shrunk = true;
     if (shrink.formatToken(&report.token_buf, @tagName(persona), seed, sh.keep(), sh.forcedResult())) |t| report.token_len = t.len;
-    if (!print) return;
+    if (!print) return writeFailureTrace(s, persona, seed, true, false);
     std.debug.print("tardis: shrunk {d} -> {d} decisions and lowered {d} values in {d} runs (every other decision is benign: no fault, no preemption, nothing lost in a crash, minimal input)\n", .{ report.before, report.after, report.values, report.runs });
     s.trace.dump(16);
+    writeFailureTrace(s, persona, seed, true, true);
     if (report.token_len > 0) {
         std.debug.print("tardis: replay the shrunk run with:  TARDIS_REPLAY={s} {s}\n\n", .{ report.token(), replayCommand() });
     } else {
@@ -1309,6 +1418,7 @@ fn runToken(gpa: Allocator, s: *Sim, comptime body: fn (*Env) anyerror!void, tex
             std.debug.print("\ntardis: FAILED  replay token  persona={s}  seed=0x{x:0>16}\ntardis: error.{s}\n", .{ tok.persona, tok.seed, @errorName(err) });
             s.trace.dump(32);
         }
+        writeFailureTrace(s, persona, tok.seed, false, s.config.report);
         return err;
     };
     if (delta != 0) try fuzzyReplay(gpa, s, body, &tok, persona, &anchors, options, delta, report);
@@ -1582,7 +1692,9 @@ pub fn check(gpa: Allocator, comptime body: fn (*Env) anyerror!void, options: Op
         // A forked child is not trapped.
         o.fork = false;
     }
-    const s = try Sim.create(gpa, simConfig(o));
+    var config = simConfig(o);
+    config.trace_caller = caller;
+    const s = try Sim.create(gpa, config);
     defer s.destroy();
     applySetup(s, o);
     // The shrunk token, for a security layer's emitter (seam 4).
@@ -2631,7 +2743,11 @@ pub const ExhaustiveResult = struct {
 /// the start, and no partial-order reduction is applied yet.
 pub fn exhaustive(gpa: Allocator, comptime body: fn (*Env) anyerror!void, options: Options, x: ExhaustiveOptions) !ExhaustiveResult {
     var result: ExhaustiveResult = .{};
-    const s = try Sim.create(gpa, simConfig(options));
+    var config = simConfig(options);
+    // What is enumerated is the random schedule's choice at each point;
+    // priorities drawn from a million values would all be benign.
+    config.schedule = .random;
+    const s = try Sim.create(gpa, config);
     defer s.destroy();
     applySetup(s, options);
     s.config.report = false;
@@ -2992,7 +3108,9 @@ pub const Simulation = struct {
 pub fn sim(gpa: Allocator, options: Options) !Simulation {
     // The loop form has no run for the trap to cover.
     if (options.mode == .syscalls) return error.SyscallModeUnsupported;
-    const s = try Sim.create(gpa, simConfig(options));
+    var config = simConfig(options);
+    config.trace_caller = @returnAddress();
+    const s = try Sim.create(gpa, config);
     errdefer s.destroy();
     const env_replay = replayFromEnv(gpa);
     var o = options;
@@ -3051,6 +3169,7 @@ test {
     _ = @import("sim/forkserver.zig");
     _ = @import("tests/scheduler_test.zig");
     _ = @import("tests/liveness_test.zig");
+    _ = @import("tests/pct_test.zig");
     _ = @import("tests/weak_test.zig");
     _ = @import("tests/syscall_test.zig");
     _ = @import("tests/sysmode_test.zig");

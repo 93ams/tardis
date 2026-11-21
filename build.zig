@@ -238,6 +238,11 @@ pub fn build(b: *std.Build) void {
     run_baselines.addArg("--baselines");
     const baselines_step = b.step("bugbench-baselines", "Print whether each planted bug is still found without faults, and without preemption");
     baselines_step.dependOn(&run_baselines.step);
+    // `zig build bugbench-schedules`: the schedule table (plan3.md E5).
+    const run_schedules = b.addRunArtifact(bugbench);
+    run_schedules.addArg("--schedules");
+    const schedules_step = b.step("bugbench-schedules", "Print how often each planted bug is found with tasks switched at random and by priority (PCT)");
+    schedules_step.dependOn(&run_schedules.step);
 
     // `zig build run`: demo of a crash-consistency bug found per persona.
     const demo = b.addExecutable(.{

@@ -309,6 +309,17 @@ section 1, under "The loop form".
 **The schedule.** `Options.preempt_ppm` (250,000) is the chance of
 switching tasks at each `std.Io` call. `Options.async_inline_ppm`
 (200,000) is the chance that `io.async` runs its task inline.
+`Options.schedule = .pct` picks tasks by priority instead: the runnable
+task with the highest priority always runs, and a run lowers the running
+task at `pct_depth - 1` points (3 by default, so two). It reaches orders
+where one task runs for a long time while another waits, which a switch
+at every fourth call almost never gives, and it is worse at bugs that
+need a switch at one exact place
+([measurements.md](measurements.md), section 4). When a task that could
+run has waited more than 4,096 steps, the task above it gives way, so a
+task that polls without blocking does not keep the others out for ever.
+An `expectProgress` bound in steps should be above that under `.pct`.
+`tardis.exhaustive` does not use the option.
 
 **The network.** `Options.net` is a `tardis.NetOptions`: segment latency
 (`latency_min_ns`, `latency_max_ns`: 50,000 and 2,000,000), the connect
@@ -596,7 +607,9 @@ and `TARDIS_PERSONA`, one with `TARDIS_REPLAY` for the shrunk run.
 [reproducing.md](reproducing.md) explains the report, how to take it from
 a CI log to your machine, and what must match for the replay to fail the
 same way. [trace.md](trace.md) shows how to look at a run as a timeline
-instead of reading its last events.
+instead of reading its last events; with `Options.trace_dir`, or
+`TARDIS_TRACE_DIR=<dir>` in tests, a failing check writes that timeline
+to a file by itself.
 
 From code, `Options.seed` and `Options.replay` do what the variables do.
 

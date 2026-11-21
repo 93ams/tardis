@@ -55,8 +55,60 @@ pub const Limits = struct {
     hosts_max: u8 = 16,
 };
 
+/// How the next task to run is chosen.
+pub const Schedule = enum {
+    /// At each simulated operation, with probability `preempt_ppm`, the
+    /// next task is drawn again, uniformly among those that can run (the
+    /// current one included).
+    random,
+    /// Priorities (PCT: Burckhardt, Kothari, Musuvathi and Nagarakatte,
+    /// "A randomized scheduler with probabilistic guarantees of finding
+    /// bugs", ASPLOS 2010). Every task gets a random priority when it
+    /// starts, and the runnable task with the highest one always runs. At
+    /// `pct_depth - 1` points of the run, drawn at its start, the task
+    /// that is running drops below every task that has not been dropped.
+    /// A run is then a few long stretches, not many short ones. The
+    /// paper's bound: a bug of depth `d` (one that `d` ordering
+    /// constraints are enough to reach) is found by one run with
+    /// probability at least `1 / (n * k^(d-1))`, for `n` tasks and `k`
+    /// steps, when the change points are drawn among the run's `k` steps.
+    /// Here `k` is `pct_steps`, or a drawn length when that is 0, and
+    /// steps are counted only while more than one task can run; a run
+    /// longer than `k` has no change point past it.
+    ///
+    /// Two departures from the paper. A runnable task that has not run
+    /// for `pct_spin_max` steps makes the running task drop below every
+    /// other, or a task that polls without blocking would keep the task
+    /// it waits for out for ever. And `preempt_ppm` is not used, nor the
+    /// probability the security layer gives its own preemption points:
+    /// a task stops only where it blocks, at a change point, or when a
+    /// task above it becomes runnable.
+    pct,
+};
+
+/// Most change points of a `.pct` run (`pct_depth - 1`).
+pub const pct_points_max = 7;
+/// Priorities: a task that starts gets one at or above `pct_base`; a
+/// change point gives one in `pct_changed..pct_base`; a task that kept
+/// another waiting for `pct_spin_max` steps gets the next one below
+/// `pct_changed`, counting down.
+const pct_base: u32 = 1 << 30;
+const pct_changed: u32 = 1 << 29;
+/// Steps a runnable task may wait. PCT as published starves every task
+/// below one that never blocks; a task that polls without blocking would
+/// then run for ever.
+pub const pct_spin_max = 4096;
+
 pub const Config = struct {
     preempt_ppm: Ppm = 250_000,
+    schedule: Schedule = .random,
+    /// `.pct`: the bug depth aimed at, 1 to `pct_points_max + 1`. 1 never
+    /// changes a priority: each run is one order of the tasks.
+    pct_depth: u8 = 3,
+    /// `.pct`: the steps among which the change points are drawn. 0: each
+    /// run draws a length from 16 to 16,384, a power of two, since the
+    /// length of a run is not known before it ends.
+    pct_steps: u32 = 0,
     async_inline_ppm: Ppm = 200_000,
     swarm: bool = true,
     faults: fault.FaultOptions = .{},
@@ -67,6 +119,14 @@ pub const Config = struct {
     net: net_mod.Options = .{},
     /// Print failure reports and diagnostics to stderr.
     report: bool = true,
+    /// Where a reported failure's trace is written, and through which
+    /// `std.Io` (`Options.trace_dir`); `trace_caller` names the file.
+    trace_dir: ?[]const u8 = null,
+    /// The directory came from the options, not the environment: a
+    /// failure that is not reported leaves its trace too.
+    trace_always: bool = false,
+    trace_io: ?Io = null,
+    trace_caller: usize = 0,
     /// Fail a run whose code makes a real system call (`syscalls.zig`).
     trap_syscalls: bool = false,
     /// Answer the code's own system calls from the simulation
@@ -107,6 +167,11 @@ const Task = struct {
     node: NodeId,
     /// Spawned by `spawnOn` (or by such a task): exempt from task leak checks.
     daemon: bool,
+    /// `Schedule.pct`: the highest among the runnable tasks runs.
+    prio: u32 = 0,
+    /// `Schedule.pct`: when (`pct_clock`) the task last ran, or became
+    /// runnable.
+    last_ran: u64 = 0,
     /// Decision addressing (M3): spawn path and per-stream draw counters.
     keys: decide.KeyContext,
     /// Tasks spawned by this task so far (gives children stable paths).
@@ -276,6 +341,16 @@ refused_calls: u32 = 0,
 /// Scheduling points and simulated operations so far in this run (what a
 /// watch's steps count).
 sched_points: u64 = 0,
+/// `Schedule.pct` (`pctBegin`): steps counted, the steps at which the
+/// running task is dropped, and the last priority given to a task that
+/// kept another waiting.
+pct_step: u64 = 0,
+/// Counts those steps and every choice of a next task: what `last_ran`
+/// is measured in.
+pct_clock: u64 = 0,
+pct_points: [pct_points_max]u64 = @splat(0),
+pct_points_len: u8 = 0,
+pct_floor: u32 = pct_changed,
 /// Task running the test body under `check` (0 when none).
 control: TaskId,
 
@@ -528,6 +603,114 @@ pub fn beginRun(s: *Sim, seed: u64, persona: Persona) void {
     s.tasks[0].state = .runnable;
     s.runq.insert(0);
     s.rebuildFreeList();
+    s.pctBegin();
+}
+
+/// The keys of a `.pct` run's own draws. The task that runs the body
+/// starts its counters at 0 (`drive`), so draws made here on a task's
+/// keys would be the body's first draws over again.
+const pct_key_path: u64 = 0x5043_5400_0000_0001;
+
+/// Draws what a `.pct` run needs: where its change points are, and a
+/// priority for each task that exists. At the start of a run and again
+/// at `reseed`, so that a run started from a snapshot of its setup and
+/// one that ran its setup continue alike.
+fn pctBegin(s: *Sim) void {
+    s.pct_step = 0;
+    s.pct_clock = 0;
+    s.pct_floor = pct_changed;
+    s.pct_points_len = 0;
+    if (s.config.schedule != .pct) return;
+    var keys: decide.KeyContext = .{ .path = pct_key_path, .counters = @splat(0) };
+    const ctx = s.decider.ctx;
+    s.decider.ctx = &keys;
+    defer s.decider.ctx = ctx;
+    const depth: usize = @max(1, @min(s.config.pct_depth, pct_points_max + 1));
+    const steps: u64 = if (s.config.pct_steps != 0) s.config.pct_steps else @as(u64, 16) << @intCast(s.decider.uniform(.schedule, 11));
+    // A point is a step number from 1; 0, the benign draw, is no point.
+    for (s.pct_points[0 .. depth - 1]) |*p| p.* = s.decider.uniform(.schedule, steps + 1);
+    s.pct_points_len = @intCast(depth - 1);
+    for (s.tasks) |*t| {
+        if (t.state == .free) continue;
+        t.prio = pct_base + @as(u32, @intCast(s.decider.uniform(.schedule, 1 << 20)));
+        t.last_ran = 0;
+    }
+}
+
+/// The priority of a task that starts: the first scheduling decision on
+/// the task's own keys, which no other draw has.
+fn pctSpawned(s: *Sim, t: *Task) void {
+    const ctx = s.decider.ctx;
+    s.decider.ctx = &t.keys;
+    defer s.decider.ctx = ctx;
+    t.prio = pct_base + @as(u32, @intCast(s.decider.uniform(.schedule, 1 << 20)));
+}
+
+/// The runnable task with the highest priority. Among equals the current
+/// task stays, or else the lowest id runs: with every draw benign (a
+/// shrink candidate) that is the order the random schedule has too,
+/// until a task has waited `pct_spin_max` steps.
+fn pctBest(s: *Sim) TaskId {
+    assert(s.runq.count > 0);
+    var best: TaskId = 0;
+    var best_prio: u32 = 0;
+    var found = false;
+    for (s.runq.words, 0..) |word, w| {
+        var rest = word;
+        while (rest != 0) : (rest &= rest - 1) {
+            const id: TaskId = @intCast(w * 64 + @ctz(rest));
+            const p = s.tasks[id].prio;
+            if (!found or p > best_prio or (p == best_prio and id == s.current)) {
+                best = id;
+                best_prio = p;
+                found = true;
+            }
+        }
+    }
+    return best;
+}
+
+/// A simulated operation under `.pct`, with more than one task runnable:
+/// counts the step, drops the current task at a change point or when
+/// another has waited too long, and says whether another task must run
+/// now.
+fn pctStep(s: *Sim) bool {
+    const t = &s.tasks[s.current];
+    s.pct_step += 1;
+    s.pct_clock += 1;
+    t.last_ran = s.pct_clock;
+    for (s.pct_points[0..s.pct_points_len], 0..) |p, i| {
+        if (p == s.pct_step) t.prio = pct_base - 1 - @as(u32, @intCast(i));
+    }
+    s.pctFair();
+    return s.pctBest() != s.current;
+}
+
+/// A task that could run and has not for `pct_spin_max` steps: the task
+/// about to run, which is above it, goes below every other. Tasks above
+/// it that take turns by blocking go one at a time, `pct_spin_max` steps
+/// apart.
+fn pctFair(s: *Sim) void {
+    var starved = false;
+    for (s.runq.words, 0..) |word, w| {
+        var rest = word;
+        while (rest != 0) : (rest &= rest - 1) {
+            starved = starved or s.pct_clock - s.tasks[w * 64 + @ctz(rest)].last_ran > pct_spin_max;
+        }
+    }
+    if (!starved) return;
+    const best = &s.tasks[s.pctBest()];
+    // The one that waited is the one about to run.
+    if (s.pct_clock - best.last_ran > pct_spin_max) return;
+    s.pct_floor -= 1;
+    best.prio = s.pct_floor;
+    for (s.runq.words, 0..) |word, w| {
+        var rest = word;
+        while (rest != 0) : (rest &= rest - 1) {
+            const other = &s.tasks[w * 64 + @ctz(rest)];
+            if (s.pct_clock - other.last_ran > pct_spin_max) other.last_ran = s.pct_clock;
+        }
+    }
 }
 
 pub fn endRun(s: *Sim) void {
@@ -1141,6 +1324,7 @@ fn wake(s: *Sim, id: TaskId) void {
     t.deadline_ns = null;
     s.timers[id] = no_timer;
     s.runq.insert(id);
+    t.last_ran = s.pct_clock;
     if (!s.in_timers) s.secSync(.wake, s.current, id);
     if (!s.in_timers) if (s.stepNow()) |st| {
         if (id < 64) st.woke |= @as(u64, 1) << @as(u6, @intCast(id)) else st.global = true;
@@ -1250,8 +1434,13 @@ fn reschedule(s: *Sim) void {
                 return;
             }
             s.historyPoint();
-            const rank = s.decider.uniform(.schedule, s.runq.count);
-            const next = s.runq.pickNth(rank);
+            const next = if (s.config.schedule == .pct) next: {
+                s.pct_clock += 1;
+                s.pctFair();
+                const best = s.pctBest();
+                s.tasks[best].last_ran = s.pct_clock;
+                break :next best;
+            } else s.runq.pickNth(s.decider.uniform(.schedule, s.runq.count));
             s.beginStep(next);
             s.switchToTask(next);
             return;
@@ -1419,6 +1608,10 @@ pub fn atomicPoint(s: *Sim, hold_ppm: decide.Ppm) void {
     if (s.tasks[s.current].stores_len > 0 and !s.decider.chance(.schedule, hold_ppm)) s.atomicFlush();
     if (s.watches_armed > 0) s.watchStep();
     if (s.runq.count <= 1) return;
+    if (s.config.schedule == .pct) {
+        if (s.pctStep()) s.reschedule();
+        return;
+    }
     if (!s.decider.chance(.schedule, s.config.preempt_ppm)) return;
     s.reschedule();
 }
@@ -1428,6 +1621,10 @@ fn maybeYield(s: *Sim) void {
     s.atomicFlush(); // a simulated operation: the store buffer has drained
     if (s.watches_armed > 0) s.watchStep();
     if (s.runq.count <= 1) return;
+    if (s.config.schedule == .pct) {
+        if (s.pctStep()) s.reschedule();
+        return;
+    }
     if (!s.decider.chance(.schedule, s.config.preempt_ppm)) return;
     s.reschedule();
 }
@@ -1504,6 +1701,8 @@ fn spawn(s: *Sim, start: Start, context: []const u8, group: ?*Io.Group, result_l
     t.keys = parent.keys.child(parent.children);
     t.children = 0;
     parent.children += 1;
+    t.last_ran = s.pct_clock;
+    if (s.config.schedule == .pct) s.pctSpawned(t);
     t.start = start;
     t.group = group;
     t.result_len = result_len;
@@ -1898,6 +2097,10 @@ fn secVfs(s: *Sim, op: seam.VfsOp, parent: vfs_mod.InodeId, path: []const u8) vo
 /// as a keyed scheduling decision, another task runs first.
 pub fn preemptionPoint(s: *Sim, ppm: Ppm) void {
     if (s.runq.count <= 1) return;
+    if (s.config.schedule == .pct) {
+        if (s.pctStep()) s.reschedule();
+        return;
+    }
     if (!s.decider.chance(.schedule, ppm)) return;
     s.reschedule();
 }
@@ -3984,5 +4187,6 @@ pub fn reseed(s: *Sim, seed: u64) void {
     s.plan = .init(s.config.faults);
     if (s.config.swarm) s.plan.drawSwarm(&s.decider);
     for (s.nodes) |*n| n.heap.oom_ppm = if (s.plan.isEnabled(.oom)) s.config.faults.oom_ppm else 0;
+    s.pctBegin();
     s.record(.note, 0, 0, 0, "reseed");
 }

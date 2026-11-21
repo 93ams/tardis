@@ -22,9 +22,32 @@ It runs `body` once and writes the trace to `w`. The run is the token in
 the run fails, the trace is written first and the run's error is returned
 after, so a failing run is traced like any other.
 
-There is no environment variable and no command for this: it is called
-from code, usually from a test written for the purpose. Take the token
-from the failure report ([reproducing.md](reproducing.md)):
+A failing check writes the same file by itself when it has a directory
+for it: `Options.trace_dir`, or `TARDIS_TRACE_DIR=<dir>` in tests.
+
+```
+TARDIS_TRACE_DIR=traces zig build test
+```
+
+The report names the files. There are two for a failure that was shrunk:
+`<test>-<persona>-<seed>.trace.json` for the run as it was found and
+`<test>-<persona>-<seed>.shrunk.trace.json` for the shrunk one. A replay
+(`TARDIS_SEED`, `TARDIS_REPLAY`) that fails writes its run as well.
+`<test>` is the name of the function that called `check` or `sim` when
+the program has debug info (its last 64 bytes), and `run` otherwise.
+Seeds follow from the campaign seed and the iteration, so two checks in
+one test can fail on the same one: when a name is taken the file gets a
+number before the extension (`...-<seed>-1.trace.json`), and the shrunk
+run takes the number of the run it came from. Each file holds the last
+`limits.trace_ring_len` events of its run (64 by default), so a long run
+is cut at its start; raise the limit in the check's options for all of
+it. With the variable, only a failure that is reported leaves files: a
+test that expects a failure and sets `report = false` leaves none. With
+the option, every failure of that check does.
+
+To trace a run that did not fail, or to choose where the bytes go, call
+`traceJson` from code, usually from a test written for the purpose. Take
+the token from the failure report ([reproducing.md](reproducing.md)):
 
 ```zig
 test "trace the failure" {

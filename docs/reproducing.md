@@ -157,7 +157,7 @@ simulation, see [threads.md](threads.md)) or in TARDIS.
 
 | Workflow | On failure |
 |---|---|
-| `test.yml` | Up to ten annotations on the run page: the `tardis: FAILED` line (iteration, persona, seed), the property, the error, cut at 300 characters. An artifact `test-failure-<os>`, kept 14 days, with `test.log` (the whole output of the test step that failed, replay lines included) and `diff_fs.trace`, the last sequence the filesystem comparison ran (the failing one only when that test is what failed). On Linux the first test step runs with `TARDIS_TRAP_SYSCALLS=1`; set it when replaying a `StraySyscall` failure from that step. |
+| `test.yml` | Up to ten annotations on the run page: the `tardis: FAILED` line (iteration, persona, seed), the property, the error, cut at 300 characters. An artifact `test-failure-<os>`, kept 14 days, with `test.log` (the whole output of the test step that failed, replay lines included), `diff_fs.trace`, the last sequence the filesystem comparison ran (the failing one only when that test is what failed), and `traces/`, a Chrome trace of each failing run that was reported and of its shrunk form ([trace.md](trace.md)). On Linux the first test step runs with `TARDIS_TRAP_SYSCALLS=1`; set it when replaying a `StraySyscall` failure from that step. |
 | `campaign.yml` | A step that prints the `FAILED` and replay lines. An artifact `campaign-<os>`, uploaded on success too: `campaign.log`, one `failure-N.txt` per failure (its report, the last events, its replay line), `replay-tokens.txt` and `failures.json`. A table in the job summary. One issue per new failure when issues are on. |
 | `evidence.yml` | Nothing extra. The `tardis-evidence` artifact and the SARIF upload happen only when the steps before them passed. |
 | `zig-master.yml` | Nothing. Read the log. |
@@ -172,10 +172,10 @@ Limits of this:
   check uploads nothing useful, and a failure in the bug benchmark, the
   API reference or the benchmarks, which run after the upload step,
   uploads nothing.
-- No workflow uploads a Chrome trace. The library writes one only through
-  `tardis.traceJson`, called from code ([trace.md](trace.md)); there is no
-  environment variable that makes a failing check write a trace file. What
-  the logs hold is the last 16 events of the failing run, as text.
+- A trace file holds the last 64 events of its run unless the check
+  raised `limits.trace_ring_len`. Tests that print a failure report on
+  purpose and pass leave trace files too; they are uploaded with the
+  rest when another test fails. Only `test.yml` sets `TARDIS_TRACE_DIR`.
 - The artifact step in `test.yml` and the whole of `campaign.yml` have not
   been run on GitHub yet.
 
