@@ -42,12 +42,12 @@ build test`; file names are under `src/tests/` unless they say otherwise.
 | R6 | answer filesystem calls as the real filesystem does when no fault is injected | `diff_fs_test.zig`: random operation sequences compared with the host's filesystem (NTFS, ext4) |
 | R7 | answer stream-socket calls as the real loopback does when no fault is injected | `diff_net_test.zig`: five scenarios compared with the host |
 | R8 | schedule tasks only at `std.Io` calls, and explore their interleavings from the seed | `scheduler_test.zig`; `examples/counter.zig`, `examples/check_then_act.zig` (races found) |
-| R9 | detect a run in which every task is blocked, and a run that leaves a handle, a task or memory behind | `scheduler_test.zig`, `fs_test.zig`, `net_test.zig`; `examples/deadlock.zig`, `examples/error_leak.zig` |
+| R9 | detect a run in which every task is blocked, a run that makes no progress within a stated bound (`Env.expectProgress`), and a run that leaves a handle, a task or memory behind | `scheduler_test.zig`, `liveness_test.zig`, `fs_test.zig`, `net_test.zig`; `examples/deadlock.zig`, `examples/livelock.zig`, `examples/error_leak.zig` |
 | R10 | deliver, delay, reorder, drop and duplicate network traffic only as its options allow, and hold stream data across a partition | `net_test.zig`, `udp_test.zig`, `chaos_test.zig` |
 | R11 | check linearizability and transactional anomalies correctly on recorded histories | `lin_test.zig`, `elle_test.zig` (histories with known verdicts) |
 | R12 | in the exhaustive search, visit every schedule within the stated depth, and with reduction or merging reach the same set of outcomes | `sec/tests/pillar45_test.zig` (the vote model: with reduction and with merging, fewer executions, the same verdicts and the same outcomes); `zig build bench` holds the counts, 9,216 and 3,073, to their recorded values |
 | R13 | never let an unsimulated `std.Io` call reach the real system | by construction: the simulator's call table starts as `std.Io.failing` (`plan.md` §11) |
-| R14 | find each bug in its benchmark of planted bugs, and pass each fix | `zig build bugbench` (twenty-one programs), run in CI |
+| R14 | find each bug in its benchmark of planted bugs, and pass each fix | `zig build bugbench` (twenty-four programs), run in CI; how often by campaign size: `docs/measurements.md` |
 | R15 | in system-call mode (`Options.mode = .syscalls`, Linux x86_64), answer the file, clock, sleep and random-byte system calls from the simulation as the kernel would answer them with no fault, and fail the run that makes any other call | `sysmode_test.zig`: random sequences of file calls compared with the real kernel (ext4); the same program by system call and by `std.Io` gives one trace and one result after a crash; a call that is not emulated fails the run. `test/sqlite.zig` (not part of `zig build test`) |
 
 Requirements R5, R6 and R7 are the ones that carry the tool's fidelity,
@@ -80,7 +80,10 @@ ran, no run broke a property the test stated. It does not mean more.
 - Shared memory between tasks, except through `tardis.atomic.Value`.
 - A property the test did not state.
 - Liveness in general: `eventually` covers convergence after a fault
-  heals; nothing checks fairness or progress otherwise.
+  heals, and `expectProgress` fails a run that makes no stated progress
+  within a bound. Both are bounded checks: a property that holds only
+  after the bound is reported as a failure, and a task that loops without
+  any simulated operation is not seen at all.
 
 **Where the models are known to be incomplete**
 

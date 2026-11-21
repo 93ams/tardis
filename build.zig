@@ -190,7 +190,7 @@ pub fn build(b: *std.Build) void {
     // `zig build test-examples`: each example plants one class of bug and
     // shows its fix (examples/, plan3.md C2). Part of `test`.
     const examples_step = b.step("test-examples", "Run the examples: each finds its planted bug and passes its fix");
-    for ([_][]const u8{ "examples/wal_kv.zig", "examples/counter.zig", "examples/jobs.zig", "examples/replica.zig", "examples/dir_sync.zig", "examples/deadlock.zig", "examples/short_write.zig", "examples/error_leak.zig", "examples/check_then_act.zig", "examples/rename_unsynced.zig", "examples/oom_partial.zig", "examples/lease.zig", "examples/in_place_rewrite.zig", "examples/index_before_data.zig", "examples/id_reuse.zig", "examples/short_read.zig", "examples/udp_retry.zig", "examples/udp_order.zig", "examples/udp_no_timeout.zig", "examples/stale_read.zig", "examples/syscall_rename.zig" }) |path| {
+    for ([_][]const u8{ "examples/wal_kv.zig", "examples/counter.zig", "examples/jobs.zig", "examples/replica.zig", "examples/dir_sync.zig", "examples/deadlock.zig", "examples/livelock.zig", "examples/hidden_state.zig", "examples/never_retried.zig", "examples/short_write.zig", "examples/error_leak.zig", "examples/check_then_act.zig", "examples/rename_unsynced.zig", "examples/oom_partial.zig", "examples/lease.zig", "examples/in_place_rewrite.zig", "examples/index_before_data.zig", "examples/id_reuse.zig", "examples/short_read.zig", "examples/udp_retry.zig", "examples/udp_order.zig", "examples/udp_no_timeout.zig", "examples/stale_read.zig", "examples/syscall_rename.zig" }) |path| {
         const t = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path(path),
@@ -213,7 +213,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "tardis", .module = mod }},
     });
-    for ([_][]const u8{ "wal_kv", "counter", "jobs", "replica", "dir_sync", "deadlock", "short_write", "error_leak", "check_then_act", "rename_unsynced", "oom_partial", "lease", "in_place_rewrite", "index_before_data", "id_reuse", "short_read", "udp_retry", "udp_order", "udp_no_timeout", "stale_read", "syscall_rename" }) |name| {
+    for ([_][]const u8{ "wal_kv", "counter", "jobs", "replica", "dir_sync", "deadlock", "livelock", "hidden_state", "never_retried", "short_write", "error_leak", "check_then_act", "rename_unsynced", "oom_partial", "lease", "in_place_rewrite", "index_before_data", "id_reuse", "short_read", "udp_retry", "udp_order", "udp_no_timeout", "stale_read", "syscall_rename" }) |name| {
         bugbench_mod.addImport(name, b.createModule(.{
             .root_source_file = b.path(b.fmt("examples/{s}.zig", .{name})),
             .target = target,
@@ -223,7 +223,13 @@ pub fn build(b: *std.Build) void {
     }
     const bugbench = b.addExecutable(.{ .name = "tardis-bugbench", .root_module = bugbench_mod });
     const bugbench_step = b.step("bugbench", "Run the bug benchmark: planted bugs, found or not, and what they shrink to");
-    bugbench_step.dependOn(&b.addRunArtifact(bugbench).step);
+    const run_bugbench = b.addRunArtifact(bugbench);
+    bugbench_step.dependOn(&run_bugbench.step);
+    // `zig build bugbench-rates`: the detection table (plan3.md A5).
+    const run_rates = b.addRunArtifact(bugbench);
+    run_rates.addArg("--rates");
+    const rates_step = b.step("bugbench-rates", "Print which oracle catches each planted bug, and how often by campaign size");
+    rates_step.dependOn(&run_rates.step);
 
     // `zig build run`: demo of a crash-consistency bug found per persona.
     const demo = b.addExecutable(.{
@@ -240,6 +246,39 @@ pub fn build(b: *std.Build) void {
     run_demo.step.dependOn(b.getInstallStep());
     const run_step = b.step("run", "Run the TARDIS demo");
     run_step.dependOn(&run_demo.step);
+
+    // `zig build docs`: the API reference, generated from the doc comments
+    // of `src/root.zig` and what it exports, into zig-out/docs (plan3.md
+    // C4). `scripts/doc_check.py` lists public declarations without one.
+    const docs_obj = b.addObject(.{
+        .name = "tardis",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .optimize = .Debug,
+            .imports = &.{.{ .name = "tardis_sec_default", .module = no_sec }},
+        }),
+    });
+    const install_docs = b.addInstallDirectory(.{
+        .source_dir = docs_obj.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs",
+    });
+    const docs_step = b.step("docs", "Build the API reference into zig-out/docs");
+    docs_step.dependOn(&install_docs.step);
+
+    // `zig build membench`: memory per simulator, by option (plan3.md E3).
+    const membench = b.addExecutable(.{
+        .name = "tardis-membench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cmd/membench/main.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+            .imports = sec_imports,
+        }),
+    });
+    const membench_step = b.step("membench", "Print the memory one simulator takes, by option");
+    membench_step.dependOn(&b.addRunArtifact(membench).step);
 
     // `zig build bench`: simulator throughput, always optimized.
     const bench_mod = b.createModule(.{

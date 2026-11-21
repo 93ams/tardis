@@ -30,6 +30,9 @@ const AtomicOrder = std.builtin.AtomicOrder;
 /// operation.
 pub const hold_ppm = 500_000;
 
+/// An atomic of type `T` (at most 8 bytes) with `std.atomic.Value`'s
+/// operations: the real atomic outside a simulation, and inside one a
+/// scheduling point with a store buffer for weak orderings (see above).
 pub fn Value(comptime T: type) type {
     comptime std.debug.assert(@sizeOf(T) >= 1 and @sizeOf(T) <= @sizeOf(u64));
     return struct {
@@ -37,6 +40,7 @@ pub fn Value(comptime T: type) type {
 
         const Self = @This();
 
+        /// An atomic holding `value`.
         pub fn init(value: T) Self {
             return .{ .raw = value };
         }
@@ -57,6 +61,8 @@ pub fn Value(comptime T: type) type {
             return value;
         }
 
+        /// Reads the value: the task's own latest buffered store if it has one,
+        /// else what is in memory. Another task may run before and after.
         pub fn load(self: *const Self, comptime order: AtomicOrder) T {
             const s = Sim.activeOrNull() orelse return @atomicLoad(T, &self.raw, order);
             s.atomicPoint(hold_ppm);
@@ -67,6 +73,9 @@ pub fn Value(comptime T: type) type {
             return value;
         }
 
+        /// Writes `value`. With `.seq_cst` it reaches memory at once, after the
+        /// task's earlier buffered stores; with a weaker ordering it may wait in
+        /// the task's store buffer, where other tasks do not see it yet.
         pub fn store(self: *Self, value: T, comptime order: AtomicOrder) void {
             const s = Sim.activeOrNull() orelse return @atomicStore(T, &self.raw, value, order);
             s.atomicPoint(hold_ppm);
@@ -78,6 +87,8 @@ pub fn Value(comptime T: type) type {
             }
         }
 
+        /// Stores `value` and returns what was there, as one step. Drains the
+        /// task's store buffer first, like every read-modify-write here.
         pub fn swap(self: *Self, value: T, comptime order: AtomicOrder) T {
             const s = Sim.activeOrNull() orelse return @atomicRmw(T, &self.raw, .Xchg, value, order);
             s.atomicPoint(hold_ppm);
@@ -105,6 +116,7 @@ pub fn Value(comptime T: type) type {
             return self.cmpxchgStrong(expected, new, success, failure);
         }
 
+        /// Adds `operand` (wrapping) as one step and returns the value before.
         pub fn fetchAdd(self: *Self, operand: T, comptime order: AtomicOrder) T {
             const s = Sim.activeOrNull() orelse return @atomicRmw(T, &self.raw, .Add, operand, order);
             s.atomicPoint(hold_ppm);
@@ -114,6 +126,7 @@ pub fn Value(comptime T: type) type {
             return old;
         }
 
+        /// Subtracts `operand` (wrapping) as one step and returns the value before.
         pub fn fetchSub(self: *Self, operand: T, comptime order: AtomicOrder) T {
             const s = Sim.activeOrNull() orelse return @atomicRmw(T, &self.raw, .Sub, operand, order);
             s.atomicPoint(hold_ppm);

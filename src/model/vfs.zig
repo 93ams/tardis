@@ -72,6 +72,10 @@ pub const Persona = enum {
     }
 };
 
+/// Pages per chunk of the page pool (256 KiB).
+const chunk_pages = 64;
+const chunk_bytes = chunk_pages * page_bytes;
+
 pub const Limits = struct {
     pages_max: u32 = 2048,
     file_pages_max: u32 = 256,
@@ -189,7 +193,11 @@ pub const Vfs = struct {
     /// Pages written to media by fsync, rename flushes and crashes (cost ledger).
     flushed_pages: u64 = 0,
 
-    pages: []align(page_bytes) u8,
+    /// The page pool, in chunks of `chunk_pages` allocated when a page of
+    /// theirs is first taken, and kept until `deinit`: a filesystem costs
+    /// the memory of the pages its fullest run used, not of `pages_max`
+    /// (plan3.md E3). Chunk 0 (the zero page) is always there.
+    chunks: []?[*]align(page_bytes) u8,
     page_refs: []u16,
     free_pages: []u32,
     free_pages_len: u32,
@@ -229,8 +237,11 @@ pub const Vfs = struct {
         v.persona = persona;
         v.now_ns = 0;
         v.epoch = 0;
-        v.pages = try gpa.alignedAlloc(u8, .fromByteUnits(page_bytes), @as(usize, limits.pages_max) * page_bytes);
-        errdefer gpa.free(v.pages);
+        v.chunks = try gpa.alloc(?[*]align(page_bytes) u8, (limits.pages_max + chunk_pages - 1) / chunk_pages);
+        errdefer gpa.free(v.chunks);
+        @memset(v.chunks, null);
+        v.chunks[0] = (try gpa.alignedAlloc(u8, .fromByteUnits(page_bytes), chunk_bytes)).ptr;
+        errdefer gpa.free(v.chunks[0].?[0..chunk_bytes]);
         v.page_refs = try gpa.alloc(u16, limits.pages_max);
         errdefer gpa.free(v.page_refs);
         v.free_pages = try gpa.alloc(u32, limits.pages_max);
@@ -269,7 +280,8 @@ pub const Vfs = struct {
         v.gpa.free(v.inodes);
         v.gpa.free(v.free_pages);
         v.gpa.free(v.page_refs);
-        v.gpa.free(v.pages);
+        for (v.chunks) |c| if (c) |ptr| v.gpa.free(ptr[0..chunk_bytes]);
+        v.gpa.free(v.chunks);
     }
 
     /// Formats a fresh, empty filesystem.
@@ -279,7 +291,7 @@ pub const Vfs = struct {
         v.epoch = 1; // handle values must be identical across runs of a seed
         v.flushed_pages = 0;
         @memset(v.page_refs[0..v.page_hwm], 0);
-        @memset(v.pages[0..page_bytes], 0); // page 0: the shared zero page
+        @memset(v.pageData(0), 0); // page 0: the shared zero page
         // The free list is pages `pages_max - 1` down to 1, so that pages
         // are handed out from 1 up. Only the top of it, the pages below
         // the high-water mark, can have changed.
@@ -324,6 +336,13 @@ pub const Vfs = struct {
         v.free_pages_len -= 1;
         const p = v.free_pages[v.free_pages_len];
         assert(v.page_refs[p] == 0);
+        const chunk = &v.chunks[p / chunk_pages];
+        if (chunk.* == null) {
+            // Not a full disk: that would be a finding the program under
+            // test did not earn.
+            const mem = v.gpa.alignedAlloc(u8, .fromByteUnits(page_bytes), chunk_bytes) catch @panic("tardis: out of memory growing a simulated disk");
+            chunk.* = mem.ptr;
+        }
         v.page_refs[p] = 1;
         v.page_hwm = @max(v.page_hwm, p + 1);
         return p;
@@ -346,7 +365,7 @@ pub const Vfs = struct {
     }
 
     fn pageData(v: *Vfs, p: u32) *[page_bytes]u8 {
-        return v.pages[@as(usize, p) * page_bytes ..][0..page_bytes];
+        return v.chunks[p / chunk_pages].?[@as(usize, p % chunk_pages) * page_bytes ..][0..page_bytes];
     }
 
     fn curSlots(v: *Vfs, ino: InodeId) []u32 {

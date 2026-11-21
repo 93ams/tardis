@@ -258,6 +258,19 @@ root_bounds: fiber.Bounds,
 free_ids: []TaskId,
 free_len: u32,
 deadlocked: bool,
+/// Progress watches (`Env.expectProgress`): a run that goes on without
+/// feeding one for longer than its bound is a livelock.
+watches: [watches_max]Watch = @splat(.{}),
+watches_armed: u8 = 0,
+/// In a forked iteration's child: reports the run's failure to the parent
+/// and exits. The driver the child inherited belongs to the parent's
+/// campaign; a deadlock or a livelock must not return through it.
+child_abort: ?*const fn (s: *Sim, err: anyerror) noreturn = null,
+/// The watch that ran out, once: `drive` then ends the run.
+stalled: ?u8 = null,
+/// Scheduling points and simulated operations so far in this run (what a
+/// watch's steps count).
+sched_points: u64 = 0,
 /// Task running the test body under `check` (0 when none).
 control: TaskId,
 
@@ -395,6 +408,8 @@ pub fn create(gpa: Allocator, config: Config) !*Sim {
     s.root_bounds = .{ .base = 0, .limit = 0 };
     s.free_len = 0;
     s.deadlocked = false;
+    s.watchReset();
+    s.child_abort = null;
     s.control = 0;
     s.persona = .linux_ext4;
     s.seed = 0;
@@ -495,6 +510,7 @@ pub fn beginRun(s: *Sim, seed: u64, persona: Persona) void {
     s.boot_count = 1;
     s.crash_count = 0;
     s.deadlocked = false;
+    s.watchReset();
     s.control = 0;
     s.root_bounds = fiber.currentBounds();
 
@@ -734,6 +750,8 @@ fn warmOnlySnapshotState(s: *const Sim) bool {
     // waits for it.
     const me = s.current;
     if (me != s.control or s.runq.count != 1 or s.timer_heap_len != 0) return false;
+    // A progress watch armed by setup is not in a snapshot.
+    if (s.watches_armed != 0) return false;
     for (s.tasks, 0..) |t, i| {
         if (i != 0 and i != me and t.state != .free) return false;
     }
@@ -1217,6 +1235,14 @@ fn reschedule(s: *Sim) void {
     while (true) {
         s.fireTimers();
         if (s.runq.count > 0) {
+            s.sched_points += 1;
+            if (s.watches_armed > 0 and s.watchStalls()) {
+                // As a deadlock: the driver ends the run. It runs next, not
+                // by a draw, so the run ends here whatever else is runnable.
+                s.beginStep(0);
+                s.switchToTask(0);
+                return;
+            }
             s.historyPoint();
             const rank = s.decider.uniform(.schedule, s.runq.count);
             const next = s.runq.pickNth(rank);
@@ -1243,6 +1269,91 @@ fn reschedule(s: *Sim) void {
         s.trace.dump(16);
         @panic("tardis: deadlock");
     }
+}
+
+pub const watches_max = 8;
+
+/// One progress watch. A bound of 0 is not checked.
+pub const Watch = struct {
+    armed: bool = false,
+    label: u64 = 0,
+    name: []const u8 = "",
+    within_ns: u64 = 0,
+    within_steps: u64 = 0,
+    last_ns: u64 = 0,
+    last_step: u64 = 0,
+};
+
+fn watchReset(s: *Sim) void {
+    s.watches = @splat(.{});
+    s.watches_armed = 0;
+    s.stalled = null;
+    s.sched_points = 0;
+}
+
+fn watchSlot(s: *Sim, label: u64) ?*Watch {
+    for (&s.watches) |*w| if (w.armed and w.label == label) return w;
+    return null;
+}
+
+/// Arms (or re-arms with new bounds) the watch `label`, fed now.
+pub fn watchArm(s: *Sim, label: u64, name: []const u8, within_ns: u64, within_steps: u64) void {
+    const w = s.watchSlot(label) orelse blk: {
+        for (&s.watches) |*free| if (!free.armed) {
+            s.watches_armed += 1;
+            break :blk free;
+        };
+        @panic("tardis: too many progress watches in one run (8)");
+    };
+    w.* = .{ .armed = true, .label = label, .name = name, .within_ns = within_ns, .within_steps = within_steps, .last_ns = s.now_ns, .last_step = s.sched_points };
+}
+
+/// Progress was made on `label`. False when no such watch is armed.
+pub fn watchFeed(s: *Sim, label: u64) bool {
+    const w = s.watchSlot(label) orelse return false;
+    w.last_ns = s.now_ns;
+    w.last_step = s.sched_points;
+    return true;
+}
+
+pub fn watchDisarm(s: *Sim, label: u64) void {
+    const w = s.watchSlot(label) orelse return;
+    w.armed = false;
+    s.watches_armed -= 1;
+}
+
+/// Whether a watch has just run out: the driver is then runnable and must
+/// run next. Once per run, and only under `check` (a driver to end it).
+fn watchStalls(s: *Sim) bool {
+    if (s.stalled != null) return false;
+    const w = s.watchExpired() orelse return false;
+    const root = &s.tasks[0];
+    if (root.state != .blocked or root.block != .driver) return false;
+    s.stalled = w;
+    s.record(.note, 0, 0, 0, "livelock");
+    s.wake(0);
+    return true;
+}
+
+/// A simulated operation is a step for the watches whether or not the
+/// simulator switches tasks at it: a task that spins is found when it runs
+/// alone, and when no preemption is drawn (a shrink candidate, a replay,
+/// `preempt_ppm = 0`), where it would otherwise spin for ever.
+fn watchStep(s: *Sim) void {
+    s.sched_points += 1;
+    if (!s.watchStalls()) return;
+    s.endStep();
+    s.beginStep(0);
+    s.switchToTask(0);
+}
+
+fn watchExpired(s: *Sim) ?u8 {
+    for (&s.watches, 0..) |*w, i| {
+        if (!w.armed) continue;
+        if (w.within_ns != 0 and s.now_ns - w.last_ns > w.within_ns) return @intCast(i);
+        if (w.within_steps != 0 and s.sched_points - w.last_step > w.within_steps) return @intCast(i);
+    }
+    return null;
 }
 
 fn block(s: *Sim, reason: Block, deadline_ns: ?u64, cancelable: bool) void {
@@ -1298,6 +1409,7 @@ pub fn atomicBuffered(s: *Sim, addr: usize) ?u64 {
 pub fn atomicPoint(s: *Sim, hold_ppm: decide.Ppm) void {
     s.touchGlobal();
     if (s.tasks[s.current].stores_len > 0 and !s.decider.chance(.schedule, hold_ppm)) s.atomicFlush();
+    if (s.watches_armed > 0) s.watchStep();
     if (s.runq.count <= 1) return;
     if (!s.decider.chance(.schedule, s.config.preempt_ppm)) return;
     s.reschedule();
@@ -1306,6 +1418,7 @@ pub fn atomicPoint(s: *Sim, hold_ppm: decide.Ppm) void {
 /// A scheduling point: possibly yield to another runnable task.
 fn maybeYield(s: *Sim) void {
     s.atomicFlush(); // a simulated operation: the store buffer has drained
+    if (s.watches_armed > 0) s.watchStep();
     if (s.runq.count <= 1) return;
     if (!s.decider.chance(.schedule, s.config.preempt_ppm)) return;
     s.reschedule();
@@ -1484,8 +1597,24 @@ pub fn drive(s: *Sim, body: Body, ctx: *anyopaque) DriveResult {
     defer s.control = 0;
     while (t.state != .finished) {
         if (s.deadlocked) {
+            if (s.child_abort) |abort| abort(s, error.Deadlock);
             if (s.config.report) s.dumpTasks();
             return .{ .outcome = error.Deadlock, .control = id };
+        }
+        if (s.stalled) |i| {
+            if (s.child_abort) |abort| abort(s, error.Livelock);
+            const w = &s.watches[i];
+            if (s.config.report) {
+                std.debug.print("tardis: livelock: no progress on \"{s}\" for {d} ms of virtual time and {d} scheduling points (bounds: {d} ms, {d} points; 0 is unchecked)\n", .{
+                    w.name,
+                    (s.now_ns - w.last_ns) / std.time.ns_per_ms,
+                    s.sched_points - w.last_step,
+                    w.within_ns / std.time.ns_per_ms,
+                    w.within_steps,
+                });
+                s.dumpTasks();
+            }
+            return .{ .outcome = error.Livelock, .control = id };
         }
         t.awaiter = 0;
         s.block(.driver, null, false);

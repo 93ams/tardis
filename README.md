@@ -13,7 +13,7 @@ secret tracking, lock-order checks, Byzantine peers, constant-time checks,
 MC/DC and signed evidence bundles.
 
 New here? The [tutorial](docs/tutorial.md) goes from an empty test to a found,
-shrunk and fixed bug, and [`examples/`](examples) has twenty-one small programs,
+shrunk and fixed bug, and [`examples/`](examples) has twenty-four small programs,
 each with one planted bug and its fix. [docs/stability.md](docs/stability.md)
 says what may change between releases, and what a seed is and is not
 promised to mean. [docs/qualification.md](docs/qualification.md) lists what
@@ -101,6 +101,7 @@ events, and prints two ways to run it again:
 | `TARDIS_ITERATIONS_SCALE=<n>` | nothing: it multiplies every `check`'s iterations |
 | `TARDIS_CORPUS_DIR=<dir>` | nothing: each `check` keeps a file there, and the next campaign runs the runs that failed first and goes on exploring where the last stopped |
 | `TARDIS_EXPLORE=guided` | nothing: every `check` explores guided by coverage |
+| `TARDIS_PRESET=quick\|thorough\|nightly` | nothing: it sizes every `check` that left `iterations` at its default (20, 1,000 or 10,000; `nightly` is also guided) |
 | `TARDIS_REPLAY_FUZZY=2` | with `TARDIS_REPLAY`: if the token no longer fails because the code now draws a little differently, try it with its decisions moved by up to 2 draws |
 
 `Options.seed`, `Options.replay` and `Options.replay_fuzzy` do the same from
@@ -264,6 +265,9 @@ worked example.
 | `zig build evidence` | the certification campaigns, bundles in `zig-out/tardis-evidence` |
 | `zig build bench` | throughput benchmarks, always optimized |
 | `zig build bugbench` | the bug benchmark: each example's planted bug, whether a plain run sees it, whether a campaign finds it, what it shrinks to |
+| `zig build bugbench-rates` | which oracle catches each planted bug, and in how many of 20 campaigns by size ([`docs/measurements.md`](docs/measurements.md)) |
+| `zig build membench` | the memory one simulator takes, by option |
+| `zig build docs` | the API reference, into `zig-out/docs` |
 | `zig build run` | the demo |
 
 `scripts/verify.sh` runs the formatting check and the suite in all four

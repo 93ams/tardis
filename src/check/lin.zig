@@ -19,7 +19,9 @@
 //!   `fn step(state: State, input: Input, output: ?Output) ?State`
 //!       (null: this output is impossible here; `output == null` means the
 //!       operation's outcome is unknown, so accept any result),
-//!   `fn hash(state: State) u64`,
+//!   `fn hash(state: State) u64` (two different states must hash
+//!   differently: the search remembers visited states by this hash alone,
+//!   so a collision can report a history that is linearizable as not),
 //!   optionally `fn partition(input: Input) u64`.
 
 const std = @import("std");
@@ -27,17 +29,26 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const decide = @import("../sim/decide.zig");
 
+/// Limits for `check`.
 pub const Options = struct {
     /// Search steps per partition before giving up with `.unknown`.
     steps_max: u64 = 10_000_000,
 };
 
+/// A recorded history of operations against model `M` (see the file header
+/// for what a model must declare). Operations are timestamped by a logical
+/// clock that ticks on every `invoke` and `ok`, so call them in the order
+/// the events happened.
 pub fn History(comptime M: type) type {
     return struct {
         const Self = @This();
 
+        /// Outcome of an operation. `pending`: no answer was recorded, so it may
+        /// or may not have taken effect. `failed`: it definitely did not.
         pub const Status = enum(u8) { pending, ok, failed };
 
+        /// One recorded operation. `call` and `ret` are logical clock values;
+        /// `output` is null and `ret` is the maximum `u64` unless `status` is `.ok`.
         pub const Op = struct {
             client: u32,
             input: M.Input,
@@ -51,10 +62,13 @@ pub fn History(comptime M: type) type {
         ops: std.ArrayList(Op),
         clock: u64,
 
+        /// An empty history. `gpa` is kept and used by `invoke` to grow the
+        /// operation list; release it with `deinit`.
         pub fn init(gpa: Allocator) Self {
             return .{ .gpa = gpa, .ops = .empty, .clock = 0 };
         }
 
+        /// Frees the operation list. The history must not be used afterwards.
         pub fn deinit(h: *Self) void {
             h.ops.deinit(h.gpa);
             h.* = undefined;
@@ -102,6 +116,8 @@ pub fn History(comptime M: type) type {
     };
 }
 
+/// Why a history is not linearizable: the partition that has no legal order
+/// and how far the search got in it. Pass it to `History.dump` to print it.
 pub const Violation = struct {
     partition: u64,
     /// Operations in that partition.
@@ -113,6 +129,8 @@ pub const Violation = struct {
     stuck: usize,
 };
 
+/// Verdict of `check`. Partitions are checked in first-seen order and the
+/// first one that is not `linearizable` decides the result.
 pub const Result = union(enum) {
     linearizable,
     not_linearizable: Violation,
@@ -325,25 +343,34 @@ pub fn expectLinearizable(gpa: Allocator, comptime M: type, h: *const History(M)
 /// A single read/write/compare-and-set register, initially 0.
 pub const Register = struct {
     pub const State = u64;
+    /// An operation on the register. `cas` writes `to` only if the value is `from`.
     pub const Input = union(enum) {
         read,
         write: u64,
         cas: struct { from: u64, to: u64 },
     };
+    /// What an operation returned: `value` for a read, `ok` for a write, and
+    /// `cas` (whether the swap happened) for a compare-and-set.
     pub const Output = union(enum) {
         value: u64,
         ok,
         cas: bool,
     };
 
+    /// The initial state: the register holds 0.
     pub fn init() State {
         return 0;
     }
 
+    /// The state is its own hash (the register's value).
     pub fn hash(s: State) u64 {
         return s;
     }
 
+    /// The state after applying `input` to `s`, or null if `output` cannot be
+    /// its result in `s`: a read of another value, or a `cas` reporting the
+    /// wrong outcome. A null `output` (unknown outcome) is always accepted.
+    /// The output of a write is not inspected.
     pub fn step(s: State, input: Input, output: ?Output) ?State {
         switch (input) {
             .read => {
@@ -365,21 +392,27 @@ pub const Register = struct {
 /// A map of independent registers (checked one key at a time).
 pub const Kv = struct {
     pub const State = u64;
+    /// A `Register` operation applied to the register stored under `key`.
     pub const Input = struct { key: u64, op: Register.Input };
     pub const Output = Register.Output;
 
+    /// The initial state of one key: every key starts at 0.
     pub fn init() State {
         return 0;
     }
 
+    /// The state is its own hash (the value of the key being checked).
     pub fn hash(s: State) u64 {
         return s;
     }
 
+    /// Operations on different keys are independent, so the key is the partition.
     pub fn partition(input: Input) u64 {
         return input.key;
     }
 
+    /// `Register.step` on the one key of the partition being checked; `s` is
+    /// that key's value and `input.key` is not consulted.
     pub fn step(s: State, input: Input, output: ?Output) ?State {
         return Register.step(s, input.op, output);
     }

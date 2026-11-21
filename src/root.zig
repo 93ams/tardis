@@ -104,8 +104,14 @@ pub const Generator = fuzz.Generator;
 pub const NodeId = net.NodeId;
 pub const NetOptions = net.Options;
 
+/// `Options.campaign_seed` unless a test sets its own: every check of every
+/// test run draws the same run seeds from it, so a suite's results repeat.
 pub const default_campaign_seed: u64 = 0x7A2D_1500_0000_0001;
 
+/// What a `check` runs: how many iterations, on which filesystem personas,
+/// with which faults, and how it explores, reports and replays. Every field
+/// has a default, so `.{}` is a campaign of 100 iterations on one persona;
+/// `.quick`, `.thorough` and `.nightly` are the same with another size.
 pub const Options = struct {
     /// Replay exactly this run seed (one iteration per persona). When null,
     /// the `TARDIS_SEED` environment variable is consulted (in tests).
@@ -242,13 +248,75 @@ pub const Options = struct {
     /// Guided exploration on several workers still stops at the first
     /// failure.
     keep_going: ?*FailureLog = null,
+
+    /// Presets (plan3.md C7): `tardis.check(gpa, body, .quick)`. Each is
+    /// the defaults with a campaign of another size; a test that needs one
+    /// more option starts from one: `var o: tardis.Options = .thorough;`.
+    /// Most tests pass `.{}` and let `TARDIS_PRESET` choose (see `Preset`).
+    ///
+    /// While writing a test: seconds, not coverage.
+    pub const quick: Options = .{ .iterations = Preset.quick.iterations() };
+    /// Before a release, or for a test of something subtle.
+    pub const thorough: Options = .{ .iterations = Preset.thorough.iterations() };
+    /// A scheduled job: long, and guided by coverage. With
+    /// `TARDIS_CORPUS_DIR` it goes on where the last one stopped.
+    pub const nightly: Options = .{ .iterations = Preset.nightly.iterations(), .explore = .guided };
+};
+
+/// `TARDIS_PRESET=quick|thorough|nightly` (in tests) sizes every check
+/// whose `iterations` is 100, the default: it gets the preset's. A check
+/// with any other number keeps it, so a test that needs exactly 5
+/// iterations has them. A check that writes `.iterations = 100` cannot be
+/// told from one that left it out and is sized too: a test that needs its
+/// 100 (to find a planted bug, say) should ask for 101, or not run under
+/// `quick`. With `nightly`, a check whose `explore` is the default also
+/// gets guided exploration, unless it uses `fork` or `keep_going`, which
+/// guided exploration would change. `TARDIS_ITERATIONS_SCALE` then
+/// multiplies the result as before.
+pub const Preset = enum {
+    quick,
+    thorough,
+    nightly,
+
+    /// Iterations per persona a check of this size runs.
+    pub fn iterations(p: Preset) u32 {
+        return switch (p) {
+            .quick => 20,
+            .thorough => 1000,
+            .nightly => 10_000,
+        };
+    }
+
+    /// Fills in what `o` left at its default.
+    pub fn apply(p: Preset, o: *Options) void {
+        const defaults: Options = .{};
+        if (o.iterations == defaults.iterations) o.iterations = p.iterations();
+        if (p == .nightly and o.explore == defaults.explore and !o.fork and o.keep_going == null) o.explore = .guided;
+    }
+};
+
+/// `Env.expectProgress`: how long a run may go without progress. A limit
+/// of 0 is not checked; at least one must be set.
+pub const ProgressBound = struct {
+    /// Virtual time. Catches retries that sleep between attempts.
+    within_ns: u64 = 0,
+    /// Simulated operations (file, network and atomic operations: every
+    /// point where the simulator may switch tasks) and scheduling points.
+    /// Catches tasks that spin without sleeping, where virtual time stands
+    /// still. Reading a clock or drawing random bytes is not a step, and
+    /// neither is code that calls nothing.
+    within_steps: u64 = 0,
 };
 
 /// `Options.keep_going`: the failures of a campaign that ran to the end.
 pub const FailureLog = struct {
+    /// Failures logged in full; later ones are only counted (`dropped`).
     pub const entries_max = 32;
+    /// The longest replay token an entry holds; a longer one is left empty
+    /// and the run replays from its `seed`.
     pub const token_bytes_max = 1024;
 
+    /// One failing run of the campaign.
     pub const Entry = struct {
         iteration: u32,
         persona: Persona,
@@ -259,6 +327,8 @@ pub const FailureLog = struct {
         token_buf: [token_bytes_max]u8,
         token_len: u16,
 
+        /// The run's replay token (`Options.replay`, `TARDIS_REPLAY`); empty when
+        /// it did not fit.
         pub fn token(e: *const Entry) []const u8 {
             return e.token_buf[0..e.token_len];
         }
@@ -269,10 +339,12 @@ pub const FailureLog = struct {
     /// Failing runs beyond `entries_max`: counted, not shrunk or logged.
     dropped: u32 = 0,
 
+    /// The logged failures, in iteration order.
     pub fn slice(l: *const FailureLog) []const Entry {
         return l.entries[0..l.len];
     }
 
+    /// How many runs failed, logged or not.
     pub fn failures(l: *const FailureLog) u32 {
         return l.len + l.dropped;
     }
@@ -325,8 +397,15 @@ pub fn runSeed(campaign_seed: u64, iteration: u32, persona_index: usize) u64 {
     return decide.mix(campaign_seed +% @as(u64, iteration) *% decide.golden_gamma, persona_index);
 }
 
+/// What `check` itself returns, besides whatever error the body returned:
+/// a run in which every task is blocked (`Deadlock`) or none makes progress
+/// (`Livelock`, `Env.expectProgress`), something left behind (`ResourceLeak`),
+/// a seed that did not repeat (`NonDeterministic`), a `sometimes` that never
+/// held in the whole campaign, a failed `always`, and what the platform or
+/// the mode cannot do.
 pub const Error = error{
     Deadlock,
+    Livelock,
     ResourceLeak,
     NonDeterministic,
     SometimesNeverTrue,
@@ -385,10 +464,13 @@ pub const Env = struct {
         env.sim.advanceTime(delta_ns);
     }
 
+    /// Virtual time since the run began, in nanoseconds. It moves only when
+    /// every task waits (a sleep, a timeout), never with the host's clock.
     pub fn nowNs(env: *const Env) u64 {
         return env.sim.now_ns;
     }
 
+    /// Crashes so far in this run (`crashAndReboot` and injected ones).
     pub fn crashCount(env: *const Env) u32 {
         return env.sim.crash_count;
     }
@@ -456,6 +538,47 @@ pub const Env = struct {
         }
     }
 
+    /// Liveness: from now on the run must report progress on `name`
+    /// (`progress`) at least once within each of `bound`'s limits, or it
+    /// fails with `error.Livelock`, like a deadlock: found at the point it
+    /// happens, replayable and shrunk. This is what finds a system that
+    /// stays busy without getting anywhere: tasks that retry for ever,
+    /// yield to each other for ever, or wait on timeouts that only restart
+    /// the same wait. Such a run otherwise never ends.
+    ///
+    /// Choose bounds far above what progress takes on a fair schedule: the
+    /// scheduler picks among the runnable tasks at random, so it starves
+    /// none of them for long, and a task that could run but was not chosen
+    /// for the whole bound is not the finding you want. After `heal` (no
+    /// faults, every link up) a bound that runs out means the system itself
+    /// stopped: nothing outside it is in its way any more.
+    ///
+    /// Up to eight watches per run, each with its own name. Calling this
+    /// again for an armed name sets new bounds and counts as progress.
+    /// Under `check`; `sim`'s loop form does not watch. A watch armed in
+    /// `Options.setup` is in force in every iteration (and turns the
+    /// warm-start snapshot off). In system-call mode a run ended here may
+    /// leave a C library's lock held, like one ended by a deadlock
+    /// (`droppedInCallSeed`).
+    pub fn expectProgress(env: *Env, comptime name: []const u8, bound: ProgressBound) void {
+        if (bound.within_ns == 0 and bound.within_steps == 0) @panic("tardis: expectProgress needs a bound (within_ns or within_steps)");
+        env.sim.watchArm(explore.labelHash(name), name, bound.within_ns, bound.within_steps);
+    }
+
+    /// Progress was made on `name`: its watch starts counting again. Call
+    /// it where the system does what it is for (a request answered, an
+    /// entry committed), not where it merely runs. Without a watch armed
+    /// for `name` this does nothing, so the code under test can call it
+    /// unconditionally.
+    pub fn progress(env: *Env, comptime name: []const u8) void {
+        _ = env.sim.watchFeed(explore.labelHash(name));
+    }
+
+    /// Ends the watch on `name` (the work it watched is done).
+    pub fn progressDone(env: *Env, comptime name: []const u8) void {
+        env.sim.watchDisarm(explore.labelHash(name));
+    }
+
     /// Cost counters for this run so far.
     pub fn stats(env: *const Env) Sim.Stats {
         return env.sim.stats;
@@ -496,6 +619,7 @@ pub const Env = struct {
         return env.sim.nodes[node].heap.allocator();
     }
 
+    /// `Options.nodes`.
     pub fn nodeCount(env: *const Env) u8 {
         return @intCast(env.sim.nodes.len);
     }
@@ -534,6 +658,7 @@ pub const Env = struct {
         env.sim.crashNode(node, mode);
     }
 
+    /// Times `node` has crashed in this run.
     pub fn nodeCrashCount(env: *const Env, node: NodeId) u32 {
         return env.sim.nodes[node].crash_count;
     }
@@ -543,6 +668,7 @@ pub const Env = struct {
         env.sim.setLink(from, to, false);
     }
 
+    /// Restores the directed link `from -> to`.
     pub fn healLink(env: *Env, from: NodeId, to: NodeId) void {
         env.sim.setLink(from, to, true);
     }
@@ -588,6 +714,8 @@ pub const Env = struct {
     }
 };
 
+/// `Options.chaos`: a nemesis that runs from the start of every iteration
+/// for a drawn time, then heals.
 pub const Chaos = struct {
     nemesis: Nemesis = .{},
     /// Chaos lasts a duration drawn from this range, then heals. The draw is
@@ -612,6 +740,9 @@ fn healer(env: *Env, generation: u32, duration_ns: u64) !void {
     if (s.chaos_active and s.chaos_generation == generation) env.heal();
 }
 
+/// What a nemesis does and how often (`Env.startChaos`). Between two
+/// actions it waits a time drawn from the interval; each kind of action is
+/// chosen only if its switch is on.
 pub const Nemesis = struct {
     interval_min_ns: u64 = 10 * std.time.ns_per_ms,
     interval_max_ns: u64 = 200 * std.time.ns_per_ms,
@@ -689,6 +820,7 @@ pub fn isSimulated(io: std.Io) bool {
 const Replay = struct { seed: ?u64, persona: ?Persona };
 
 /// Long campaigns without editing tests (plan3.md I1), in tests only:
+/// `TARDIS_PRESET` sizes the checks that chose no size (`Preset`),
 /// `TARDIS_CAMPAIGN_SALT=<number>` gives every `check` other seeds than
 /// its usual ones (a nightly job passes a new number each night), and
 /// `TARDIS_ITERATIONS_SCALE=<n>` multiplies its iterations. A failure's
@@ -700,6 +832,12 @@ fn campaignFromEnv(gpa: Allocator, o: *Options) void {
         if (std.fmt.parseInt(u64, std.mem.trim(u8, text, " \t\r\n"), 0)) |salt| {
             o.campaign_seed = decide.mix(o.campaign_seed, salt);
         } else |_| std.debug.print("tardis: ignoring unparsable TARDIS_CAMPAIGN_SALT=\"{s}\"\n", .{text});
+    } else |_| {}
+    if (std.testing.environ.getAlloc(gpa, "TARDIS_PRESET")) |text| {
+        defer gpa.free(text);
+        if (std.meta.stringToEnum(Preset, std.mem.trim(u8, text, " \t\r\n"))) |p| {
+            p.apply(o);
+        } else std.debug.print("tardis: ignoring TARDIS_PRESET=\"{s}\" (quick, thorough or nightly)\n", .{text});
     } else |_| {}
     if (std.testing.environ.getAlloc(gpa, "TARDIS_ITERATIONS_SCALE")) |text| {
         defer gpa.free(text);
@@ -740,6 +878,8 @@ const RunOutcome = struct {
     finding: u64 = 0,
 };
 
+/// `Options.setup`: runs before each iteration's body, always with the same
+/// seed.
 pub const SetupFn = *const fn (env: *Env) anyerror!void;
 
 /// Runs `Options.setup` (if any) and switches to the iteration's seed.
@@ -875,8 +1015,11 @@ pub const ShrinkReport = struct {
     token_buf: [token_bytes_max]u8 = undefined,
     token_len: usize = 0,
 
+    /// The longest replay token a report holds.
     pub const token_bytes_max = 16 * 1024;
 
+    /// The replay token of the shrunk run (of the run as found when `shrunk`
+    /// is false); empty when it did not fit.
     pub fn token(r: *const ShrinkReport) []const u8 {
         return r.token_buf[0..r.token_len];
     }
@@ -985,6 +1128,7 @@ pub const ReplayReport = struct {
     token_buf: [ShrinkReport.token_bytes_max]u8 = undefined,
     token_len: usize = 0,
 
+    /// The token that fails on the current code; empty when none was found.
     pub fn token(r: *const ReplayReport) []const u8 {
         return r.token_buf[0..r.token_len];
     }
@@ -1320,6 +1464,7 @@ fn runKept(gpa: Allocator, s: *Sim, comptime body: fn (*Env) anyerror!void, opti
 // ===========================================================================
 // Guided exploration (M3)
 
+/// `Options.explore`: where an iteration's decisions come from.
 pub const Explore = enum {
     /// Every iteration uses a fresh seed.
     random,
@@ -1548,7 +1693,7 @@ fn campaignRange(gpa: Allocator, s: *Sim, comptime body: fn (*Env) anyerror!void
                 const again = runOnce(s, body, seed, persona, iteration, options.leak_check);
                 s.rerun = false;
                 if (again.trace_hash != out.trace_hash) {
-                    std.debug.print(
+                    if (options.report) std.debug.print(
                         "tardis: NON-DETERMINISM: seed=0x{x:0>16} persona={s} produced trace 0x{x} then 0x{x}\n" ++
                             "tardis: the code under test reads state that does not come from env.io/env.allocator\n",
                         .{ seed, @tagName(persona), out.trace_hash, again.trace_hash },
@@ -1982,6 +2127,18 @@ fn runGuidedParallel(gpa: Allocator, s: *Sim, comptime body: fn (*Env) anyerror!
 // ===========================================================================
 // Fork server campaigns (M5)
 
+/// The result pipe of a forked iteration's child (`Sim.child_abort`).
+var child_fd: forkserver.Fd = -1;
+
+/// A deadlock or a livelock in a forked child: the run failed. Without
+/// this the child would return through the parent's driver and carry on as
+/// a second copy of the test process.
+fn childAbort(s: *Sim, err: anyerror) noreturn {
+    const msg: ForkMessage = .{ .failed = 1, .catalog_len = 0, .trace_hash = decide.mix(s.trace.hash, @intFromError(err)) };
+    forkserver.writeAll(child_fd, std.mem.asBytes(&msg));
+    forkserver.exitNow(0);
+}
+
 const ForkMessage = extern struct {
     failed: u8,
     catalog_len: u32,
@@ -2095,6 +2252,8 @@ fn ForkServer(comptime body: fn (*Env) anyerror!void) type {
             const s = c.env.sim;
             switch (try forkserver.fork()) {
                 .child => |fd| {
+                    child_fd = fd;
+                    s.child_abort = childAbort;
                     s.config.report = false;
                     // Report only this child's counts: the parent already has its own.
                     s.catalog.resetCounts();
@@ -2342,6 +2501,8 @@ pub fn traceJson(gpa: Allocator, comptime body: fn (*Env) anyerror!void, seed: u
 // ===========================================================================
 // Bounded exhaustive exploration (plan2.md §7.2)
 
+/// Bounds for `exhaustive`: how deep and how wide it enumerates, and
+/// which reductions it may use.
 pub const ExhaustiveOptions = struct {
     /// Branchable decisions per execution that are enumerated; later ones
     /// take their benign value (0: no fault, no preemption, first choice).
@@ -2377,6 +2538,8 @@ pub const ExhaustiveOptions = struct {
     seed: u64 = 0,
 };
 
+/// What `exhaustive` did: how much it ran, what it could not
+/// enumerate, and whether the result is complete within its bounds.
 pub const ExhaustiveResult = struct {
     executions: u32 = 0,
     /// The most branchable decisions any execution made.
@@ -2405,6 +2568,8 @@ pub const ExhaustiveResult = struct {
     token_buf: [ShrinkReport.token_bytes_max]u8 = undefined,
     token_len: usize = 0,
 
+    /// The failing execution's replay token; empty when nothing failed or it
+    /// did not fit.
     pub fn token(r: *const ExhaustiveResult) []const u8 {
         return r.token_buf[0..r.token_len];
     }
@@ -2556,6 +2721,10 @@ pub fn exhaustive(gpa: Allocator, comptime body: fn (*Env) anyerror!void, option
 // ===========================================================================
 // sim: the while-loop form
 
+/// The loop form of a campaign (`sim`): the test's own `while` loop runs
+/// the iterations on the calling thread, without a task for the body. It has
+/// no driver, so a deadlock panics instead of failing the run, and
+/// `Env.expectProgress` does not watch.
 pub const Simulation = struct {
     s: *Sim,
     gpa: Allocator,
@@ -2835,6 +3004,7 @@ test {
     _ = @import("check/ledger.zig");
     _ = @import("sim/forkserver.zig");
     _ = @import("tests/scheduler_test.zig");
+    _ = @import("tests/liveness_test.zig");
     _ = @import("tests/weak_test.zig");
     _ = @import("tests/syscall_test.zig");
     _ = @import("tests/sysmode_test.zig");

@@ -65,6 +65,14 @@ jobs:
       - name: Bug benchmark
         working-directory: tardis
         run: zig build bugbench
+      # Every public declaration of the API has a doc comment, and the
+      # reference builds from them (plan3.md C4).
+      - name: API reference
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: tardis
+        run: |
+          python3 scripts/doc_check.py
+          zig build docs
       - name: Benchmarks against their budgets
         if: matrix.os == 'ubuntu-latest'
         working-directory: tardis

@@ -33,8 +33,12 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 
+/// How a transaction ended. `unknown`: the outcome was never learned, so its
+/// writes may or may not be visible to others; its own reads are not checked.
 pub const Status = enum(u8) { committed, aborted, unknown };
 
+/// One operation of a transaction, with the result it observed. `append` and
+/// `read` are for list-append keys, `write` and `read_reg` for register keys.
 pub const Op = union(enum) {
     // List-append keys.
     append: struct { key: u64, value: u64 },
@@ -46,6 +50,9 @@ pub const Op = union(enum) {
     read_reg: struct { key: u64, value: ?u64 },
 };
 
+/// A recorded transaction: its operations in execution order, and the
+/// history's logical clock at its `begin` (`start`) and `finish` (`end`).
+/// The times are used only for real-time edges.
 pub const Txn = struct {
     status: Status,
     ops: []const Op,
@@ -53,15 +60,20 @@ pub const Txn = struct {
     end: u64,
 };
 
+/// The transactions of one test run, in the order they finished. A
+/// transaction's index in `txns` is the id that `Report` refers to.
 pub const History = struct {
     arena: std.heap.ArenaAllocator,
     txns: std.ArrayList(Txn),
     clock: u64,
 
+    /// An empty history. Everything recorded is allocated from an arena backed
+    /// by `gpa`; release it with `deinit`.
     pub fn init(gpa: Allocator) History {
         return .{ .arena = .init(gpa), .txns = .empty, .clock = 0 };
     }
 
+    /// Frees every recorded transaction. The history must not be used afterwards.
     pub fn deinit(h: *History) void {
         h.arena.deinit();
         h.* = undefined;
@@ -89,6 +101,9 @@ pub const History = struct {
     }
 };
 
+/// The kinds of anomaly `check` reports (see the file header). The cycle
+/// kinds `g0` to `realtime` are declared from most to least severe, and that
+/// order decides which cycle a `Report` keeps.
 pub const Anomaly = enum(u8) {
     duplicate_element,
     incompatible_order,
@@ -108,16 +123,24 @@ pub const Anomaly = enum(u8) {
     realtime,
 };
 
+/// The kind of a dependency edge between two transactions: write-write,
+/// write-read, read-write (anti-dependency) or real time. See the file header.
 pub const EdgeKind = enum(u8) { ww, wr, rw, rt };
 
+/// What `check` should look for beyond plain serializability.
 pub const Options = struct {
     /// Add real-time edges (check strict serializability, not just
     /// serializability).
     realtime: bool = false,
 };
 
+/// Capacity of a `Report`'s cycle buffer, in transactions. A longer cycle
+/// is still an anomaly (`Report.cycle_too_long`), but it is not printed
+/// and its kind is not worked out.
 pub const cycle_max = 16;
 
+/// The result of `check`: every kind of anomaly found, and one example cycle
+/// if there was any. Holds no allocations.
 pub const Report = struct {
     found: std.EnumSet(Anomaly) = .empty,
     /// The most severe cycle found: transaction indices and the kind of
@@ -126,16 +149,26 @@ pub const Report = struct {
     cycle_edges: [cycle_max]EdgeKind = undefined,
     cycle_len: usize = 0,
     cycle_kind: ?Anomaly = null,
+    /// Some transactions lie on cycles, all longer than `cycle_max`: the
+    /// anomaly is in `found` (as `g2`, or `realtime` when a real-time edge
+    /// may be part of it; the true kind may be more severe) and there is
+    /// no cycle to print for it.
+    cycle_too_long: bool = false,
 
+    /// True if no anomaly of any kind was found.
     pub fn ok(r: *const Report) bool {
         return r.found.count() == 0;
     }
 
+    /// Prints the anomalies found and, if there is a cycle, each of its
+    /// transactions with its operations and the edge leading to the next, to
+    /// stderr. `h` must be the history this report was computed from.
     pub fn print(r: *const Report, h: *const History) void {
         std.debug.print("tardis: transactional anomalies:", .{});
         var it = r.found.iterator();
         while (it.next()) |a| std.debug.print(" {s}", .{@tagName(a)});
         std.debug.print("\n", .{});
+        if (r.cycle_too_long) std.debug.print("tardis: some cycles are longer than {d} transactions and are not shown\n", .{cycle_max});
         if (r.cycle_kind) |k| {
             std.debug.print("tardis: {s} cycle:\n", .{@tagName(k)});
             for (r.cycle[0..r.cycle_len], r.cycle_edges[0..r.cycle_len]) |t, e| {
@@ -156,6 +189,10 @@ const Edge = struct { from: u32, to: u32, kind: EdgeKind };
 const Loc = struct { txn: u32, op: u32 };
 const KeyValue = struct { key: u64, value: u64 };
 
+/// Checks `h` for the anomalies described in the file header. Anomalies are
+/// reported in the returned `Report`, not as errors: the only failure is
+/// running out of memory. `gpa` is used for scratch memory only, all of
+/// which is freed before returning.
 pub fn check(gpa: Allocator, h: *const History, options: Options) !Report {
     var report: Report = .{};
     const txns = h.txns.items;
@@ -618,7 +655,17 @@ fn classify(a: Allocator, g: *const Graph, comp: []const u32, report: *Report) !
                 }
             }
         }
-        const k = kind orelse continue;
+        // A component of two or more transactions has a cycle through
+        // each of them. When none of the searches above found one short
+        // enough to hold (`cycle_max`), it is still an anomaly: reported
+        // as the weakest kind, without a cycle to print.
+        const k = kind orelse {
+            var has_rt = false;
+            for (g.out(v)) |e| has_rt = has_rt or (e.kind == .rt and comp[e.to] == c);
+            report.found.insert(if (has_rt) .realtime else .g2);
+            report.cycle_too_long = true;
+            continue;
+        };
         report.found.insert(k);
         if (best == null or @backingInt(k) < @backingInt(best.?)) {
             best = k;
@@ -669,6 +716,25 @@ test "write skew is G2" {
     try testing.expect(r.found.contains(.g2));
     try testing.expectEqual(Anomaly.g2, r.cycle_kind.?);
     try testing.expectEqual(@as(usize, 2), r.cycle_len);
+}
+
+test "a cycle longer than the report can hold is still an anomaly" {
+    // A ring of write skew: T_i reads key i+1 empty and appends key i, so
+    // each must come before the next, all the way round. Found by review
+    // (revision 85): with every cycle longer than `cycle_max` the history
+    // passed as serializable.
+    const n = cycle_max + 4;
+    var h = History.init(testing.allocator);
+    defer h.deinit();
+    for (0..n) |i| {
+        try txn(&h, .committed, &.{ .{ .read = .{ .key = (i + 1) % n, .values = &.{} } }, .{ .append = .{ .key = i, .value = 1 } } });
+    }
+    for (0..n) |i| try txn(&h, .committed, &.{.{ .read = .{ .key = i, .values = &.{1} } }});
+    const r = try check(testing.allocator, &h, .{});
+    try testing.expect(!r.ok());
+    try testing.expect(r.found.contains(.g2));
+    try testing.expect(r.cycle_too_long);
+    try testing.expectEqual(@as(?Anomaly, null), r.cycle_kind);
 }
 
 test "read skew is G-single" {

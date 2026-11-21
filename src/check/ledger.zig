@@ -21,6 +21,7 @@ pub const Histogram = struct {
 
     const sub_bits = 4;
     const sub = 1 << sub_bits;
+    /// Number of buckets: 16 exact ones, then 16 for each power of two up to 2^63.
     pub const bucket_count = sub + (64 - sub_bits) * sub;
 
     fn bucketOf(v: u64) usize {
@@ -40,6 +41,8 @@ pub const Histogram = struct {
         return lo + (width - 1);
     }
 
+    /// Adds one sample `v`, in whatever unit the caller measures (for example
+    /// nanoseconds of virtual time, or bytes). Never fails or allocates.
     pub fn record(h: *Histogram, v: u64) void {
         h.counts[bucketOf(v)] += 1;
         h.total += 1;
@@ -64,6 +67,7 @@ pub const Histogram = struct {
         unreachable;
     }
 
+    /// The exact arithmetic mean of the recorded samples, rounded down. 0 if empty.
     pub fn mean(h: *const Histogram) u64 {
         if (h.total == 0) return 0;
         return @intCast(h.sum / h.total);
