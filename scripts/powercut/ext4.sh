@@ -70,6 +70,9 @@ cp "$sqlite/sqlite3.c" "$sqlite/sqlite3.h" "$here/sqlite_commit.c" "$work/" || e
 # the build of `zig build test-sqlite`, and none to the file calls.
 gcc -O1 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_THREADSAFE=0 -o "$work/sqlite_commit" "$work/sqlite_commit.c" "$work/sqlite3.c" || exit 1
 
+gcc -O1 -o "$work/tight" "$here/tight.c" || exit 1
+echo "block size $(stat -f -c %S "$mnt")"
+
 for round in $(seq 1 "$rounds"); do
   # 1. A finished unlink whose directory is not synced.
   echo data > "$mnt/a"; sync "$mnt/a"; sync "$mnt"
@@ -236,6 +239,45 @@ for round in $(seq 1 "$rounds"); do
   [ -e "$mnt/fresh" ] && n=there || n=gone
   echo "round $round: a create, unlink, then fdatasync of the created file: the file is $r, the created file is $n"
   rm -f "$mnt/q" "$mnt/fresh"; sync "$mnt"
+
+  # 4o. As 4n from one program (tight.c), with nothing between the calls.
+  # It prints whether the file's last change and the overwrite fell within
+  # one tick of the kernel's clock; with a commit between them they did
+  # not, where this was run.
+  echo data > "$mnt/victim"; sync
+  tick="$("$work/tight" "$mnt" fsync)" || exit 1
+  power_cut
+  [ -e "$mnt/victim" ] && r=back || r=gone
+  echo "round $round: one program: a file synced, unlink, an overwrite inside it and its fsync, at once ($tick): the file is $r, the overwritten file holds $(head -c 4 "$mnt/over")"
+  rm -f "$mnt/victim" "$mnt/over"; sync "$mnt"
+
+  # 4p. As 4f with an append of 16 KiB, which needs new blocks.
+  echo data > "$mnt/s"; echo 0123456789 > "$mnt/grown"; echo other > "$mnt/carrier"; sync
+  head -c 16384 /dev/zero >> "$mnt/grown"
+  echo more >> "$mnt/carrier"; sync "$mnt/carrier"
+  rm "$mnt/s"; sync "$mnt/grown"
+  power_cut
+  [ -e "$mnt/s" ] && r=back || r=gone
+  echo "round $round: an append of 16 KiB, a commit, unlink, then the appended file's fsync: the file is $r, the appended file has $(stat -c %s "$mnt/grown") bytes"
+  rm -f "$mnt/s" "$mnt/grown" "$mnt/carrier"; sync "$mnt"
+
+  # 4q. Unlink, then a write into a hole of another file (no new length,
+  # a new block) and its fdatasync.
+  echo data > "$mnt/t"; truncate -s 1M "$mnt/holey"; sync
+  sleep 0.2
+  rm "$mnt/t"; printf XXXX | dd of="$mnt/holey" bs=4096 seek=10 conv=notrunc status=none; sync -d "$mnt/holey"
+  power_cut
+  [ -e "$mnt/t" ] && r=back || r=gone
+  echo "round $round: unlink, then a write into a hole of another file and its fdatasync: the file is $r"
+  rm -f "$mnt/t" "$mnt/holey"; sync "$mnt"
+
+  # 4r. Unlink, then another file shortened and its fdatasync.
+  echo data > "$mnt/u"; echo 0123456789 > "$mnt/short"; sync
+  rm "$mnt/u"; truncate -s 4 "$mnt/short"; sync -d "$mnt/short"
+  power_cut
+  [ -e "$mnt/u" ] && r=back || r=gone
+  echo "round $round: unlink, then another file shortened and its fdatasync: the file is $r, the shortened file has $(stat -c %s "$mnt/short") bytes"
+  rm -f "$mnt/u" "$mnt/short"; sync "$mnt"
 
   # 5. SQLite: commit, acknowledgement, power cut, reopen.
   for mode in OFF FULL EXTRA; do

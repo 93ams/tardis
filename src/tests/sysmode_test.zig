@@ -648,6 +648,9 @@ fn unlinkThenSync(env: *Env, comptime data_only: bool) !void {
     try fsync(dir);
     close(dir);
     try testing.expectEqual(@as(isize, 0), sys(.unlink, @intFromPtr("a"), 0, 0, 0));
+    // Past the tick of the clock in which the file was last changed, or
+    // the write would change nothing in its inode (`Persona.clockTickNs`).
+    try env.io.sleep(.fromMilliseconds(20), .awake);
     // The simulation may write less than was asked.
     var done: usize = 0;
     while (done < 4) {

@@ -99,6 +99,18 @@ pub const Persona = enum {
             else => null,
         };
     }
+    /// Where `syncNeedsOwnChange` holds: the tick of the clock a file's
+    /// time of modification is taken from. A write inside a file's length
+    /// changes nothing in its inode but that time, so one made in the tick
+    /// of the file's last change is no change of the file's own, and its
+    /// `fsync` commits nothing else. Not seen: on the ext4 that was run a
+    /// commit took five ticks, so no write could follow one within a tick
+    /// (`docs/power-cut.md`, row 4o). Inferred from rows 4j and 4k, and
+    /// taken because it loses more. Ten milliseconds is the longest tick
+    /// of a common kernel (`HZ=100`).
+    pub fn clockTickNs(p: Persona) ?u64 {
+        return if (p.syncNeedsOwnChange()) 10 * std.time.ns_per_ms else null;
+    }
     /// ext4 `auto_da_alloc`: rename over an existing file flushes the source's data.
     pub fn renameFlushesData(p: Persona) bool {
         return p == .linux_ext4 or p == .freebsd_zfs;
@@ -1268,6 +1280,9 @@ pub const Vfs = struct {
             if (v.persona.sharingViolations() and v.inodes[victim].open_count > 0) return error.FileBusy;
             v.cur_dentries[dst_idx].used = false;
             v.inodes[victim].cur_links -= 1;
+            // A full journal is committed now and not by the append below,
+            // which would take the victim's change for one already out.
+            if (v.journal_len == v.journal.len) v.commitJournal(v.journal_len);
             v.touch(victim);
             replaced = true;
             // The victim may be freed only after the journal op is appended,
@@ -1325,9 +1340,10 @@ pub const Vfs = struct {
         }
         const i = &v.inodes[ino];
         const grew = offset + done > i.cur_len_bytes;
+        const same_tick = if (v.persona.clockTickNs()) |tick| v.now_ns / tick == i.mtime_ns / tick else false;
         i.cur_len_bytes = @max(i.cur_len_bytes, offset + done);
         i.mtime_ns = v.now_ns;
-        v.touch(ino);
+        if (grew or !same_tick) v.touch(ino);
         if (grew) v.touchData(ino);
         return done;
     }
@@ -1383,8 +1399,9 @@ pub const Vfs = struct {
     /// (`Persona.syncNeedsOwnChange`), fewer changes count: the file's
     /// creation and a change of its length. A write inside the file's
     /// length and a change to its names do not. Seen on ext4
-    /// (`docs/power-cut.md`); a write into a hole was not tried and does
-    /// not count here. Of a directory it is `sync`.
+    /// (`docs/power-cut.md`). A write into a hole commits there too (row
+    /// 4q) and does not count here, which loses more. Of a directory it
+    /// is `sync`.
     pub fn dataSync(v: *Vfs, ino: InodeId) void {
         v.syncAs(ino, true);
     }
@@ -2300,6 +2317,29 @@ test "a change older than the commit interval is no longer waiting with its file
     }
 }
 
+test "a file replaced by a rename when the journal is full: its fsync still commits the rename" {
+    for ([_]Persona{ .linux_ext4, .linux_xfs }) |persona| {
+        var v = try testVfs(persona);
+        defer v.deinit();
+        const other = try v.createFile(root_inode, "other", .{});
+        _ = try v.createFile(root_inode, "carrier", .{});
+        _ = try v.createFile(root_inode, "x", .{});
+        v.sync(root_inode);
+        // Fill the journal to its last place.
+        var flip = false;
+        while (v.journalPending() < v.journal.len) : (flip = !flip) {
+            try v.rename(root_inode, if (flip) "y" else "x", root_inode, if (flip) "x" else "y");
+        }
+        const h = try v.openHandle(other, true, false);
+        defer v.closeHandle(h);
+        try v.rename(root_inode, "carrier", root_inode, "other");
+        try testing.expectEqual(@as(u32, 1), v.journalPending());
+        v.sync(other);
+        try testing.expectEqual(@as(u32, 0), v.journalPending());
+        try v.checkPageConservation();
+    }
+}
+
 test "a file and its directory synced long after the file was made: the file is kept" {
     // What a correct program does, at any pace: on no persona may the
     // periodic commit leave the file's creation beyond the reach of both.
@@ -2333,16 +2373,17 @@ test "a file and its directory synced long after the file was made: the file is 
 }
 
 test "fdatasync of a file commits a waiting unlink only for the file's creation or a change of its length (ext4, XFS)" {
-    // Rows 4i to 4m of `docs/power-cut.md`, as measured on ext4; the row
-    // `shortened` is by its source and was not run.
-    const Row = enum { appended, overwritten, renamed, created, shortened };
+    // Rows 4i to 4m and 4r of `docs/power-cut.md`, as measured on ext4.
+    // `overwritten_at_once` is not measured: see `Persona.clockTickNs`.
+    const Row = enum { appended, overwritten, overwritten_at_once, renamed, created, shortened };
     for (std.enums.values(Persona)) |persona| {
         if (!persona.fileSyncCommitsJournal()) continue;
         for (std.enums.values(Row)) |row| {
             for ([_]bool{ true, false }) |data_only| {
-                const commits = !data_only or !persona.syncNeedsOwnChange() or switch (row) {
+                const commits = !persona.syncNeedsOwnChange() or switch (row) {
                     .appended, .created, .shortened => true,
-                    .overwritten, .renamed => false,
+                    .overwritten, .renamed => !data_only,
+                    .overwritten_at_once => false,
                 };
                 var back = false;
                 var seed: u64 = 0;
@@ -2362,7 +2403,11 @@ test "fdatasync of a file commits a waiting unlink only for the file's creation 
                     var target = other;
                     switch (row) {
                         .appended => _ = try v.write(other, 10, "more"),
-                        .overwritten => _ = try v.write(other, 0, "XXXX"),
+                        .overwritten => {
+                            v.now_ns += 20 * std.time.ns_per_ms;
+                            _ = try v.write(other, 0, "XXXX");
+                        },
+                        .overwritten_at_once => _ = try v.write(other, 0, "XXXX"),
                         .renamed => try v.rename(root_inode, "other", root_inode, "other2"),
                         .created => target = try v.createFile(root_inode, "fresh", .{}),
                         .shortened => try v.setLength(other, 4),
@@ -2377,7 +2422,7 @@ test "fdatasync of a file commits a waiting unlink only for the file's creation 
                     } else |_| {}
                     if (commits and row == .created) _ = try v.lookup(root_inode, "fresh");
                     if (commits and row == .renamed) _ = try v.lookup(root_inode, "other2");
-                    if (row == .overwritten) {
+                    if (row == .overwritten or row == .overwritten_at_once) {
                         var buf: [16]u8 = undefined;
                         try testing.expectEqualStrings("XXXX456789", readAll(&v, try v.lookup(root_inode, "other"), &buf));
                     }

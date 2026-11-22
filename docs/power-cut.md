@@ -42,9 +42,9 @@ write, the filesystem is unmounted (so what it still held in memory never
 reaches the disk), the target is switched back, and the filesystem is
 mounted again, which replays its journal.
 
-Each round does twenty-one things, each followed by a power cut. They are
-numbered as in the script; 4a to 4f were added in revision 96 and 4g to
-4n in revision 98:
+Each round does twenty-five things, each followed by a power cut. They
+are numbered as in the script; 4a to 4f were added in revision 96, 4g to
+4n in revision 98 and 4o to 4r in revision 100:
 
 1. Create a file, sync it and its directory, unlink it.
 2. The same, then sync the directory.
@@ -70,6 +70,14 @@ numbered as in the script; 4a to 4f were added in revision 96 and 4g to
      synced just before.
    - 4l. As 4d with `fdatasync`.
    - 4m. As 4c with `fdatasync`.
+   - 4o. As 4n from one C program (`scripts/powercut/tight.c`), with
+     nothing between the calls. It prints how far apart, by the kernel's
+     coarse clock, the file's last change and the overwrite were.
+   - 4p. As 4f with an append of 16 KiB, which needs new blocks (the
+     filesystem's blocks are of 1 KiB).
+   - 4q. Unlink, then a write into a hole of another file (a new block,
+     no new length) and its `fdatasync`.
+   - 4r. Unlink, then another file shortened and its `fdatasync`.
 5. `scripts/powercut/sqlite_commit.c`, which is the program of
    `test/sqlite.zig` in C (create a table, insert a row, commit a second
    row and print the acknowledgement), with `synchronous=OFF`.
@@ -96,7 +104,9 @@ with the same results, its SQLite being 3.54.0, another amalgamation that
 was on the machine. Rows 4g to 4m: three rounds in a third run on the
 same day, and five in a fourth, which added row 4n and looked for the
 created file in 4g; the same in every round, and both runs repeated every
-other row with the same results.
+other row with the same results. Rows 4o to 4r: five rounds in a fifth
+run on the same day and eight in a sixth, the same in each, every other
+row again as before. The filesystem, 256 MiB, has blocks of 1 KiB.
 
 | Step | After the power cut | The model |
 |---|---|---|
@@ -118,6 +128,10 @@ other row with the same results.
 | 4n: as 4k, at once after the other file's last change | the file is gone, the overwritten data is there | requires it |
 | 4l: a rename, then `fdatasync` of the renamed file | the rename is undone | allows it since revision 98 |
 | 4m: a create, unlink, then `fdatasync` of the created file | the file is gone, the created file is there | requires both |
+| 4o: one program: a file synced, unlink, an overwrite inside it and its `fsync`, at once (20 ms apart by the coarse clock, once 24) | the file is gone, the overwritten data is there | requires it at that distance |
+| 4p: an append of 16 KiB, a commit, unlink, then the appended file's `fsync` | **the file is gone** | allows it back: loses more, see below |
+| 4q: unlink, then a write into a hole of another file and its `fdatasync` | **the file is gone** | allows it back: loses more, see below |
+| 4r: unlink, then another file shortened and its `fdatasync` | the file is gone | requires it |
 | SQLite, `synchronous=OFF` | the database file is gone, so there is no table to read | (not compared) |
 | SQLite, `synchronous=FULL` | the database file is there, the integrity check passes, the journal is back, the acknowledged row is lost | finds such a run |
 | SQLite, `synchronous=EXTRA` | the acknowledged row is kept, no journal | passes |
@@ -159,7 +173,7 @@ the rule:
   else: the commit in between had already taken the file's own change.
   This held for an append too, which a reading of the kernel had
   predicted otherwise (the append stayed inside the file's first block; a
-  larger one was not tried).
+  larger one, row 4p, does commit).
 
 Two unit tests in `src/model/vfs.zig` run these rows on the model.
 
@@ -214,27 +228,36 @@ What the rule still gets wrong, or does not cover:
   on ext4 unless such a commit fell between the two. Unsafe direction; it
   needs another writer or a great deal of metadata. A program that wants
   the unlink durable syncs the directory.
-- **`fdatasync` of a file with a hole filled, or with blocks allocated
-  inside its length,** was not tried. By ext4's source as remembered it
-  commits; the model takes it not to, which loses more.
-- **A shortened file and `fdatasync`** commits in the model (a change of
-  length); by the source, not run.
+- **A sync that has to allot new blocks commits on ext4, and not in the
+  model** (rows 4p and 4q, revision 100). ext4 allots the blocks of
+  unsynced data when it writes the data out, and at an `fsync` or
+  `fdatasync` that is a change of the file's own, made now: the call
+  commits, and the unlink goes with it. Compare 4f and 4j, where the
+  data fitted blocks the file had and nothing was committed. The model
+  does not take this over, and loses more than ext4 there, on purpose:
+  the kernel writes unsynced data out by itself after some seconds or
+  under pressure of memory, and blocks allotted then belong to an earlier
+  commit, after which the same `fsync` commits nothing. A program that
+  needs the unlink kept syncs the directory.
 - **`fdatasync` of a directory** is `fsync` in the model; not run.
-- **A write that changes nothing in the inode.** An overwrite made within
-  the same tick of the kernel's clock as the file's last change may leave
-  its time of modification as it was, and then the `fsync` of 4k would
-  commit nothing. Row 4n tried for it, without the pause, and the `fsync`
-  still committed in all five rounds; but a shell puts milliseconds
-  between the calls, and a program that writes twice within one tick was
-  not run. The model always counts a write for `fsync`. If the kernel
-  does not, that is the unsafe direction, on the fast path of a database.
+- **A write that changes nothing in the inode** was looked for and could
+  not be made. A write inside a file's length changes nothing in its
+  inode but its time of modification (that is the difference between rows
+  4j and 4k), and the time comes from a clock that moves in ticks, of
+  four milliseconds on the kernel that was run. A write in the tick of
+  the file's last change would leave the inode alone, and the `fsync`
+  after it would commit nothing. Row 4o tried for it from one program,
+  but the file's last change has to be committed first, and that commit
+  took five ticks: the two writes were 20 ms apart, and the `fsync`
+  committed, in all thirteen rounds. On a faster disk they could share a
+  tick. The model therefore takes the cautious side since revision 100
+  (`Persona.clockTickNs`): on `linux_ext4` and `linux_xfs` a write inside
+  a file's length, within the same ten milliseconds of simulated time as
+  the file's last change, is no change of the file's own. Inferred, not
+  seen; it loses more.
 - **The interval's edge.** Seven seconds were measured, and none. The
   model takes a change of 4.99 seconds ago to be the file's own. A real
   transaction may have begun earlier than the program's first change.
-- **A write that needs a new block** was not tried in 4e, 4f or after the
-  interval: every append stayed inside a block the file had. By the
-  source, the block is allotted at the `fsync` itself, which then
-  commits; the model takes it not to, which loses more.
 - **XFS and `fdatasync` after a rename.** By its source as remembered XFS
   commits there, where ext4 (4l) and the model do not. Loses more.
 - **Changes the model does not see.** A change of length to the same

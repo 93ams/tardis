@@ -5,6 +5,16 @@ numbers (§) are `plan2.md`'s unless an entry names `plan.md`. Revision 1
 was the first draft of `plan2.md`; the core's earlier history is in
 `plan.md` §9 and §14.
 
+## Revision 100 (model: four more cases on ext4, and a rename over a file with the journal full)
+
+Four cases the reviews of revisions 96 and 98 said were untried, run on the real ext4 as before (`scripts/powercut/ext4.sh` 4o to 4r, five rounds and then eight, the same each time).
+
+- **4r** confirms the model: a shortened file's `fdatasync` commits the waiting unlink.
+- **4p and 4q** show ext4 keeping what the model lets go: a sync that has to allot new blocks, for an append of 16 KiB or a write into a hole, commits everything. The model is left as it is there, losing more, because the kernel may have allotted those blocks earlier by itself.
+- **4o** was meant to show whether a write inside a file, in the same tick of the kernel's clock as the file's last change, still makes the file's `fsync` commit. It could not: `scripts/powercut/tight.c` makes the calls with nothing between them, but the commit that has to come between the two writes took five ticks (the review saw this before the program measured it). The `fsync` committed, 20 ms apart. Since the case is possible on a faster disk and would be the unsafe direction, the model now takes the cautious side: on `linux_ext4` and `linux_xfs` a write inside a file's length within the same ten milliseconds of simulated time as the file's last change is no change of the file's own (`Persona.clockTickNs`). Inferred from 4j and 4k, not seen. A program that overwrites a file at once after syncing it and relies on that file's `fsync` for some other file's unlink now fails in simulation; a replay token of such a run may no longer reproduce.
+
+One fault in the model, found by the review of revision 98 and older than it: a file replaced by a rename when the journal was full had its change counted as already committed, so its own `fsync` did not commit the rename (`linux_ext4`, `linux_xfs`). Fixed, with a test that fails without the fix.
+
 ## Revision 99 (core: a Rust program in system-call mode, and the two faults it found)
 
 Revision 97 listed Rust, an async runtime, several workers and release builds as not run. `test/rust` is a Rust crate that knows nothing of TARDIS, built by cargo as a static library for `x86_64-unknown-linux-musl`; `test/rust.zig` links it and runs it under system-call mode (`zig build test-rust -Drust=<library>`, Linux x86_64). Seven tests pass, each over 50 seeds: four `std::thread`s with a `Mutex` and a channel; an hour's `thread::sleep` waited for with `Condvar::wait_timeout`, in virtual time; `std::fs` writing, syncing and renaming a file that a power loss then keeps, on three personas; a blocking TCP echo with a thread for each connection; a `HashMap` whose order follows the seed; tokio 1.54's single-threaded runtime (`epoll`, an `eventfd`, timers, a TCP echo, a channel, a timeout); and tokio's work-stealing runtime with two workers and with four. The same in Debug, ReleaseSafe and ReleaseFast with the crate built `--release`. Rust 1.99, musl, WSL2 with kernel 6.18.
