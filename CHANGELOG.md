@@ -5,6 +5,10 @@ numbers (§) are `plan2.md`'s unless an entry names `plan.md`. Revision 1
 was the first draft of `plan2.md`; the core's earlier history is in
 `plan.md` §9 and §14.
 
+## Revision 95 (documents: a guide to testing a C library)
+
+`plan3.md` D6. `docs/c-libraries.md` says how to bring a C library that does its own I/O into the simulation with system-call mode, from what the SQLite test needed: build the library into the test, where its paths land, the task's stack, crashing with the library's handle still open, resetting state the library keeps for the life of the process (the cause of `error.NonDeterministic`), what one thread under every task means for recursive locks and `errno`, and what to do about a stray call. It names what has been run (SQLite 3.46.0, static against musl) and what has not (a library that uses the network, glibc). `docs/guide.md` links to it. No code changed.
+
 ## Revision 94 (evidence: a power cut on a real ext4, and one rule of the model found wrong)
 
 `plan3.md` A3, first step. `scripts/powercut/ext4.sh` makes an ext4 filesystem in a file behind a loop device and a `dm-flakey` target, and cuts the power as xfstests does (drop every write, unmount, mount again). On kernel 6.18.58.1 under WSL2, five rounds, the same each time. A finished unlink whose directory is not synced is back after the cut, and one whose directory is synced is gone, as the model says. Real SQLite 3.46.0 (`scripts/powercut/sqlite_commit.c`, the program of `test/sqlite.zig` in C) loses an acknowledged commit with `synchronous=FULL`, with the rollback journal back and the integrity check passing, and keeps it with `EXTRA`: what the simulation finds. SQLite's documentation of `PRAGMA synchronous`, read on its site, says the same of `EXTRA`.

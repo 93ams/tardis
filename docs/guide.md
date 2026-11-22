@@ -718,7 +718,8 @@ answer. Elsewhere `check` returns `error.SyscallModeUnsupported`;
 ["Choosing a mode"](../README.md#choosing-a-mode) in the README has the
 table of what is simulated and the list of limits.
 [`examples/syscall_rename.zig`](../examples/syscall_rename.zig) is a
-worked example.
+worked example, and [c-libraries.md](c-libraries.md) is the guide to
+testing a C library this way.
 
 In the default mode, `TARDIS_TRAP_SYSCALLS=1` (or `Options.trap_syscalls`)
 on the same platform fails a run that makes a real system call, and names
