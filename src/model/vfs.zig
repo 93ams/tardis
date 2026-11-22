@@ -434,8 +434,12 @@ pub const Vfs = struct {
         cur_dentries: []Dentry,
         dur_dentries: []Dentry,
         journal: []JournalOp,
+        /// The contents of pages 1 up to `page_hwm`, once `savePages` has
+        /// copied them out; empty before that.
+        data: []u8 = &.{},
 
         pub fn deinit(sn: *Snapshot, gpa: Allocator) void {
+            gpa.free(sn.data);
             gpa.free(sn.slot_counts);
             gpa.free(sn.journal);
             gpa.free(sn.dur_dentries);
@@ -514,6 +518,36 @@ pub const Vfs = struct {
             .dur_dentries = dur_dentries,
             .journal = journal,
         };
+    }
+
+    /// Copies the contents of the pages `sn` shares out of the filesystem,
+    /// so that the filesystem can hold another state and `loadPages` can
+    /// bring this one back. The pages must still hold what they held when
+    /// `sn` was taken: call it before anything writes a `reset` filesystem.
+    pub fn savePages(v: *Vfs, sn: *Snapshot, gpa: Allocator) Allocator.Error!void {
+        assert(sn.data.len == 0);
+        const data = try gpa.alloc(u8, @as(usize, sn.page_hwm - 1) * page_bytes);
+        var p: u32 = 1;
+        while (p < sn.page_hwm) : (p += 1) @memcpy(data[@as(usize, p - 1) * page_bytes ..][0..page_bytes], v.pageData(p));
+        sn.data = data;
+    }
+
+    /// Writes the contents `savePages` kept back into the pages of a
+    /// freshly `reset` filesystem, for `restore`.
+    pub fn loadPages(v: *Vfs, sn: *const Snapshot) void {
+        assert(v.page_hwm == 1 and sn.data.len == @as(usize, sn.page_hwm - 1) * page_bytes);
+        var p: u32 = 1;
+        while (p < sn.page_hwm) : (p += 1) @memcpy(v.pageData(p), sn.data[@as(usize, p - 1) * page_bytes ..][0..page_bytes]);
+    }
+
+    /// True if the filesystem's pages in use hold what `savePages` kept.
+    pub fn pagesMatch(v: *Vfs, sn: *const Snapshot) bool {
+        var p: u32 = 1;
+        while (p < sn.page_hwm) : (p += 1) {
+            if (sn.page_refs[p] == 0) continue;
+            if (!std.mem.eql(u8, v.pageData(p), sn.data[@as(usize, p - 1) * page_bytes ..][0..page_bytes])) return false;
+        }
+        return true;
     }
 
     /// True if the filesystem's tables are those of `sn` (before pinning):

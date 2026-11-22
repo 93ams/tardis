@@ -851,7 +851,8 @@ pub const StepLog = struct {
 /// from a copy of it instead of running setup again.
 ///
 /// Setup is deterministic (it runs with the campaign's setup seed), so
-/// every iteration's setup leaves the same state. The snapshot holds what
+/// every iteration's setup on one persona leaves the same state. There is
+/// one snapshot per persona (`Shot`). A snapshot holds what
 /// setup can change in a simulator that is otherwise as `beginRun` leaves
 /// it: each node's filesystem (sharing its pages, `Vfs.Snapshot`) and
 /// clock offset, the virtual time, the body task's decision counters, the
@@ -861,59 +862,88 @@ pub const StepLog = struct {
 /// assertion was counted, and no security layer or decision overlay is
 /// attached. Otherwise setup runs every iteration, as before.
 ///
-/// Every `check_every`-th warm start runs setup for real and compares the
-/// result with the snapshot. A difference turns warm starts off for the
-/// rest of the simulator's life.
+/// A filesystem's snapshot shares its pages with the running filesystem,
+/// and a filesystem holds the pages of one state: when a run on another
+/// persona begins, the snapshot whose pages are there (`resident`) copies
+/// them out, and a warm start on its persona later copies them back. A
+/// campaign on one persona never copies.
+///
+/// Every `check_every`-th use of a snapshot runs setup for real and
+/// compares the result with it. A difference turns warm starts off for
+/// the rest of the simulator's life.
 pub const Warm = struct {
-    state: enum { none, ready, off } = .none,
+    /// Warm starts are given up for the rest of the simulator's life.
+    off: bool = false,
     /// False: setup runs every iteration (`Options.warm_restore`).
     enabled: bool = true,
-    /// This run re-runs setup to compare it with the snapshot.
+    /// This run re-runs setup to compare it with the snapshot of
+    /// `verified`. Still set at the next run: setup did not finish.
     verifying: bool = false,
+    verified: Persona = undefined,
     /// Assertion catalog totals before setup: setup must not count any.
     catalog_len: usize = 0,
     catalog_reached: u64 = 0,
-    /// Warm starts made from the snapshot, and setups re-run to check it.
+    /// Warm starts made from a snapshot, and setups re-run to check one.
     restores: u64 = 0,
     checks: u64 = 0,
     mismatches: u64 = 0,
     interruptions: u8 = 0,
+    /// One snapshot per persona: a campaign takes its personas in turn.
+    shots: [personas_len]Shot = @splat(.{}),
+    /// The persona whose snapshot's pages are in the filesystems now,
+    /// pinned. Any other snapshot holds a copy of its pages.
+    resident: ?Persona = null,
 
-    persona: Persona = undefined,
-    setup_seed: u64 = 0,
-    now_ns: u64 = 0,
-    stats: Stats = .{},
-    keys: decide.KeyContext = .root,
-    keyed_draws: u64 = 0,
-    last_key: u64 = 0,
-    prev_kind: u64 = 0,
-    trace_hash: u64 = 0,
-    trace_count: u64 = 0,
-    ring_next: usize = 0,
-    ring: []trace_mod.Event = &.{},
-    coverage: []u64 = &.{},
-    hosts: []Host = &.{},
-    clocks: []Clock = &.{},
-    files: []vfs_mod.Vfs.Snapshot = &.{},
-
+    pub const personas_len = std.enums.values(Persona).len;
     pub const check_every = 64;
-    /// Runs that could not use the snapshot before warm starts give up.
+    /// Runs that could not use the snapshots before warm starts give up.
     pub const interruptions_max = 4;
 
     const Clock = struct { drift_ppm: i32, real_offset_ns: i64 };
 
+    /// What setup left on one persona.
+    pub const Shot = struct {
+        ready: bool = false,
+        /// The filesystems' pages are copied into `files` (`Vfs.savePages`).
+        saved: bool = false,
+        /// Warm starts from this snapshot and checks of it.
+        uses: u64 = 0,
+        setup_seed: u64 = 0,
+        now_ns: u64 = 0,
+        stats: Stats = .{},
+        keys: decide.KeyContext = .root,
+        keyed_draws: u64 = 0,
+        last_key: u64 = 0,
+        prev_kind: u64 = 0,
+        trace_hash: u64 = 0,
+        trace_count: u64 = 0,
+        ring_next: usize = 0,
+        ring: []trace_mod.Event = &.{},
+        coverage: []u64 = &.{},
+        hosts: []Host = &.{},
+        clocks: []Clock = &.{},
+        files: []vfs_mod.Vfs.Snapshot = &.{},
+
+        fn drop(t: *Shot, gpa: Allocator) void {
+            for (t.files) |*f| f.deinit(gpa);
+            gpa.free(t.files);
+            gpa.free(t.clocks);
+            gpa.free(t.hosts);
+            gpa.free(t.coverage);
+            gpa.free(t.ring);
+            t.* = .{};
+        }
+    };
+
+    /// True if a snapshot is held.
+    pub fn active(w: *const Warm) bool {
+        for (w.shots) |t| if (t.ready) return true;
+        return false;
+    }
+
     fn drop(w: *Warm, gpa: Allocator) void {
-        for (w.files) |*f| f.deinit(gpa);
-        gpa.free(w.files);
-        gpa.free(w.clocks);
-        gpa.free(w.hosts);
-        gpa.free(w.coverage);
-        gpa.free(w.ring);
-        w.files = &.{};
-        w.clocks = &.{};
-        w.hosts = &.{};
-        w.coverage = &.{};
-        w.ring = &.{};
+        for (&w.shots) |*t| t.drop(gpa);
+        w.resident = null;
     }
 };
 
@@ -926,7 +956,7 @@ fn catalogReached(s: *const Sim) u64 {
 /// True if this run may start from a snapshot, or have one taken: a plain
 /// campaign run, with nothing that changes or watches setup's decisions.
 fn warmPlainRun(s: *const Sim) bool {
-    return s.warm.enabled and s.warm.state != .off and s.sec == null and s.overlay == null and
+    return s.warm.enabled and !s.warm.off and s.sec == null and s.overlay == null and
         s.recorder == null and s.domain_log == null and s.anchors == null and
         s.step_log == null and s.history == null and s.auto_chaos == null;
 }
@@ -955,54 +985,86 @@ fn warmOnlySnapshotState(s: *const Sim) bool {
     return true;
 }
 
+/// Another persona's run is about to write the filesystems, whose pages
+/// the resident snapshot shares: the snapshot gets its own copy of them.
+/// Called on freshly reset filesystems, before anything is written.
+fn warmEvict(s: *Sim) void {
+    const w = &s.warm;
+    const r = w.resident orelse return;
+    w.resident = null;
+    const t = &w.shots[@backingInt(r)];
+    if (!t.ready or t.saved) return;
+    for (s.nodes, t.files) |*n, *f| {
+        n.vfs.savePages(f, s.gpa) catch {
+            t.drop(s.gpa);
+            return;
+        };
+    }
+    t.saved = true;
+}
+
 /// Before setup: starts the run from the snapshot if there is one. True
 /// if it did, and setup must not run.
 pub fn warmRestore(s: *Sim) bool {
     const w = &s.warm;
+    if (w.verifying) {
+        // The last check's setup never reached `warmCapture`: the pages
+        // it was rewriting may not be the snapshot's any more.
+        w.shots[@backingInt(w.verified)].drop(s.gpa);
+        if (w.resident == w.verified) w.resident = null;
+    }
     w.verifying = false;
     if (!s.warmPlainRun()) {
         // This run's setup may decide differently (a shrink candidate, a
-        // replay) and write other bytes into the pages the snapshot
-        // shares, which `reset` has just freed: the snapshot goes.
-        if (w.state == .ready) {
+        // replay) and write other bytes into the pages a snapshot
+        // shares, which `reset` has just freed: the snapshots go.
+        if (w.active()) {
             w.drop(s.gpa);
             w.interruptions += 1;
-            w.state = if (w.interruptions > Warm.interruptions_max) .off else .none;
+            w.off = w.interruptions > Warm.interruptions_max;
         }
+        w.resident = null;
         return false;
     }
     w.catalog_len = s.catalog.len;
     w.catalog_reached = s.catalogReached();
-    if (w.state != .ready) return false;
-    if (w.persona != s.persona or w.setup_seed != s.seed) {
-        // Another persona: its setup leaves another state.
-        w.drop(s.gpa);
-        w.state = .none;
+    if (w.resident != s.persona) s.warmEvict();
+    const t = &w.shots[@backingInt(s.persona)];
+    if (!t.ready) return false;
+    if (t.setup_seed != s.seed) {
+        // Another setup seed: its setup leaves another state.
+        t.drop(s.gpa);
+        w.resident = null;
         return false;
     }
-    if ((w.restores + w.checks) % Warm.check_every == 0) {
+    if (t.uses % Warm.check_every == 0) {
+        // Setup runs and writes the pages itself; `warmCapture` compares.
         w.verifying = true;
+        w.verified = s.persona;
         return false;
     }
+    t.uses += 1;
     w.restores += 1;
-    for (s.nodes, w.files, w.clocks) |*n, *f, c| {
+    for (s.nodes, t.files, t.clocks) |*n, *f, c| {
+        if (w.resident == null) n.vfs.loadPages(f);
         n.vfs.restore(f);
         n.drift_ppm = c.drift_ppm;
         n.real_offset_ns = c.real_offset_ns;
     }
-    s.now_ns = w.now_ns;
-    s.stats = w.stats;
-    s.tasks[s.current].keys = w.keys;
-    s.decider.keyed_draws = w.keyed_draws;
-    s.decider.last_key = w.last_key;
-    s.prev_kind = w.prev_kind;
-    s.trace.hash = w.trace_hash;
-    s.trace.count = w.trace_count;
-    s.trace.ring_next = w.ring_next;
-    @memcpy(s.trace.ring, w.ring);
-    if (s.coverage) |m| @memcpy(m.words, w.coverage);
-    @memcpy(s.hosts[0..w.hosts.len], w.hosts);
-    s.hosts_len = @intCast(w.hosts.len);
+    w.resident = s.persona;
+    s.now_ns = t.now_ns;
+    s.stats = t.stats;
+    s.tasks[s.current].keys = t.keys;
+    s.decider.keyed_draws = t.keyed_draws;
+    s.decider.last_key = t.last_key;
+    s.prev_kind = t.prev_kind;
+    s.trace.hash = t.trace_hash;
+    s.trace.count = t.trace_count;
+    s.trace.ring_next = t.ring_next;
+    @memcpy(s.trace.ring, t.ring);
+    if (s.coverage) |m| @memcpy(m.words, t.coverage);
+    @memcpy(s.hosts[0..t.hosts.len], t.hosts);
+    s.hosts_len = @intCast(t.hosts.len);
     return true;
 }
 
@@ -1013,41 +1075,45 @@ pub fn warmCapture(s: *Sim) void {
     if (!s.warmPlainRun()) return;
     if (!s.warmOnlySnapshotState()) {
         w.drop(s.gpa);
-        w.state = .off;
+        w.off = true;
         return;
     }
-    if (w.state == .ready) {
+    const t = &w.shots[@backingInt(s.persona)];
+    if (t.ready) {
         if (!w.verifying) return;
+        w.verifying = false;
+        t.uses += 1;
         w.checks += 1;
-        var same = s.now_ns == w.now_ns and s.trace.hash == w.trace_hash and s.trace.count == w.trace_count and
-            std.meta.eql(s.tasks[s.current].keys, w.keys) and s.hosts_len == w.hosts.len;
-        for (s.nodes, w.files, w.clocks) |*n, *f, c| {
+        var same = s.now_ns == t.now_ns and s.trace.hash == t.trace_hash and s.trace.count == t.trace_count and
+            std.meta.eql(s.tasks[s.current].keys, t.keys) and s.hosts_len == t.hosts.len;
+        for (s.nodes, t.files, t.clocks) |*n, *f, c| {
             same = same and n.vfs.matches(f) and n.drift_ppm == c.drift_ppm and n.real_offset_ns == c.real_offset_ns;
+            if (same and t.saved) same = n.vfs.pagesMatch(f);
         }
         if (!same) {
             w.mismatches += 1;
             w.drop(s.gpa);
-            w.state = .off;
+            w.off = true;
             return;
         }
         // The pages this setup wrote are the snapshot's: pin them again.
-        for (s.nodes, w.files) |*n, *f| n.vfs.restore(f);
+        for (s.nodes, t.files) |*n, *f| n.vfs.restore(f);
+        w.resident = s.persona;
         return;
     }
-    s.warmTake() catch {
+    s.warmTake(t) catch {
         w.drop(s.gpa);
-        w.state = .off;
+        w.off = true;
     };
 }
 
-fn warmTake(s: *Sim) !void {
-    const w = &s.warm;
+fn warmTake(s: *Sim, t: *Warm.Shot) !void {
     const gpa = s.gpa;
-    w.ring = try gpa.dupe(trace_mod.Event, s.trace.ring);
-    w.coverage = if (s.coverage) |m| try gpa.dupe(u64, m.words[0..]) else &.{};
-    w.hosts = try gpa.dupe(Host, s.hosts[0..s.hosts_len]);
-    w.clocks = try gpa.alloc(Warm.Clock, s.nodes.len);
-    for (s.nodes, w.clocks) |n, *c| c.* = .{ .drift_ppm = n.drift_ppm, .real_offset_ns = n.real_offset_ns };
+    t.ring = try gpa.dupe(trace_mod.Event, s.trace.ring);
+    t.coverage = if (s.coverage) |m| try gpa.dupe(u64, m.words[0..]) else &.{};
+    t.hosts = try gpa.dupe(Host, s.hosts[0..s.hosts_len]);
+    t.clocks = try gpa.alloc(Warm.Clock, s.nodes.len);
+    for (s.nodes, t.clocks) |n, *c| c.* = .{ .drift_ppm = n.drift_ppm, .real_offset_ns = n.real_offset_ns };
     const files = try gpa.alloc(vfs_mod.Vfs.Snapshot, s.nodes.len);
     var taken: usize = 0;
     errdefer {
@@ -1058,19 +1124,19 @@ fn warmTake(s: *Sim) !void {
         f.* = try n.vfs.snapshot(gpa);
         taken += 1;
     }
-    w.files = files;
-    w.persona = s.persona;
-    w.setup_seed = s.seed;
-    w.now_ns = s.now_ns;
-    w.stats = s.stats;
-    w.keys = s.tasks[s.current].keys;
-    w.keyed_draws = s.decider.keyed_draws;
-    w.last_key = s.decider.last_key;
-    w.prev_kind = s.prev_kind;
-    w.trace_hash = s.trace.hash;
-    w.trace_count = s.trace.count;
-    w.ring_next = s.trace.ring_next;
-    w.state = .ready;
+    t.files = files;
+    t.setup_seed = s.seed;
+    t.now_ns = s.now_ns;
+    t.stats = s.stats;
+    t.keys = s.tasks[s.current].keys;
+    t.keyed_draws = s.decider.keyed_draws;
+    t.last_key = s.decider.last_key;
+    t.prev_kind = s.prev_kind;
+    t.trace_hash = s.trace.hash;
+    t.trace_count = s.trace.count;
+    t.ring_next = s.trace.ring_next;
+    t.ready = true;
+    s.warm.resident = s.persona;
 }
 
 /// What a run has done so far, kept so that two runs that did the same

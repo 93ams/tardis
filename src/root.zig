@@ -239,11 +239,11 @@ pub const Options = struct {
     /// start later iterations from it instead of running setup again, when
     /// setup left only files, clock steps, host names and time passed
     /// (`Sim.Warm`). The iterations are the same either way; false runs
-    /// setup every time. A snapshot is of one persona, and a campaign
-    /// takes its personas in turn at each iteration: with more than one
-    /// persona only the second run of a determinism check starts warm.
-    /// No run starts warm under guided exploration, chaos or a security
-    /// layer.
+    /// setup every time, with one difference: the disk pages setup wrote
+    /// stay taken in a warm run when the body deletes or overwrites them,
+    /// so a body that fills the disk is refused sooner. One snapshot is
+    /// kept per persona. No run starts warm under guided exploration,
+    /// chaos or a security layer.
     warm_restore: bool = true,
     warm_report: ?*WarmReport = null,
     /// Fail a run with `error.StraySyscall` when its code makes a real
@@ -1709,7 +1709,7 @@ pub fn check(gpa: Allocator, comptime body: fn (*Env) anyerror!void, options: Op
         .restores = s.warm.restores,
         .checks = s.warm.checks,
         .mismatches = s.warm.mismatches,
-        .active = s.warm.state == .ready,
+        .active = s.warm.active(),
     };
     if (s.sec != null) {
         const failed = if (result) |_| false else |_| true;

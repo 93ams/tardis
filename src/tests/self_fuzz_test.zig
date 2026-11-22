@@ -181,7 +181,9 @@ test "fuzz oracles (files): without the directory's sync the durable step fails 
 var observed_sum: std.atomic.Value(u64) = .init(0);
 
 fn setup(env: *Env) !void {
-    try env.dir.writeFile(env.io, .{ .sub_path = "a", .data = "from setup" });
+    // Another content on each persona: a warm start that brought back
+    // another persona's pages would be seen.
+    try env.dir.writeFile(env.io, .{ .sub_path = "a", .data = @tagName(env.persona) });
     try env.dir.createDir(env.io, "d", .default_dir);
     try env.dir.writeFile(env.io, .{ .sub_path = "d/x", .data = "nested" });
     try syncDir(env.io, env.dir);
@@ -217,7 +219,7 @@ test "simulator agreement: the same runs cold and warm, on one worker and on fou
     // Each configuration runs the same seeds; a run that saw anything
     // else in any of them changes the sum. Not when the environment
     // changes which runs a check makes, or keeps runs between checks.
-    for ([_][]const u8{ "TARDIS_EXPLORE", "TARDIS_PRESET", "TARDIS_SEED", "TARDIS_REPLAY", "TARDIS_CORPUS_DIR" }) |name| {
+    for ([_][]const u8{ "TARDIS_EXPLORE", "TARDIS_PRESET", "TARDIS_SEED", "TARDIS_REPLAY", "TARDIS_CORPUS_DIR", "TARDIS_CAMPAIGN_SALT" }) |name| {
         if (testing.environ.getAlloc(testing.allocator, name)) |value| {
             testing.allocator.free(value);
             return error.SkipZigTest;
@@ -242,9 +244,10 @@ test "simulator agreement: the same runs cold and warm, on one worker and on fou
     other.campaign_seed = 12345;
     try testing.expect(want != try observe(other));
 
-    // Warm starts need the same persona twice in a row, so one persona.
+    // Warm starts keep a snapshot of setup per persona, and bring its
+    // pages back when the personas take turns. Every 64th use of a
+    // snapshot is a check: 7 per persona in 400 runs.
     var cold = base;
-    cold.personas = &.{.posix_strict};
     cold.iterations = 400;
     var report: tardis.WarmReport = .{};
     var warm = cold;
@@ -253,6 +256,17 @@ test "simulator agreement: the same runs cold and warm, on one worker and on fou
     const cold_sum = try observe(cold);
     try testing.expectEqual(cold_sum, try observe(warm));
     // The security layer on every check turns warm starts off.
+    if (!tardis.security_by_default) {
+        try testing.expectEqual(@as(u64, 0), report.mismatches);
+        try testing.expect(report.restores > 1100 and report.checks >= 21 and report.active);
+    }
+    // One persona, where the snapshot's pages never leave the filesystem.
+    var one = warm;
+    one.personas = &.{.posix_strict};
+    var cold_one = one;
+    cold_one.warm_restore = false;
+    cold_one.warm_report = null;
+    try testing.expectEqual(try observe(cold_one), try observe(one));
     if (!tardis.security_by_default) try testing.expect(report.restores > 300 and report.mismatches == 0);
     // On four workers the report says nothing (it is the calling
     // thread's): the same sum, whether or not the workers started warm.
