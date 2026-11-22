@@ -21,7 +21,8 @@
 //! directory after that, and a power loss that undoes the unlink leaves a
 //! journal which the next open takes for an unfinished transaction and
 //! rolls back. SQLite's documentation gives exactly this as what `EXTRA`
-//! adds. The third test pins it.
+//! adds. The third test pins it, and `docs/power-cut.md` records the same
+//! result from real SQLite on a real ext4 with the power cut.
 //!
 //! SQLite keeps state for the life of the process (its random number
 //! generator is seeded once, from `/dev/urandom`). A run must not inherit
