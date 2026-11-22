@@ -46,6 +46,8 @@ const linux = std.os.linux;
 const Sim = @import("Sim.zig");
 const vfs_mod = @import("../model/vfs.zig");
 const sysnet = @import("sysnet.zig");
+const sysfd = @import("sysfd.zig");
+const systhread = @import("systhread.zig");
 
 /// Set in every simulated descriptor.
 pub const fd_bit: u32 = 0x4000_0000;
@@ -204,18 +206,15 @@ fn poll(s: *Sim, fds_ptr: u64, nfds: u64, deadline: ?u64) ?u64 {
     if (nfds > 4096) return fail(.INVAL);
     if (nfds > 0 and fds_ptr == 0) return fail(.FAULT);
     const fds: []align(1) PollFd = if (nfds == 0) &.{} else @as([*]align(1) PollFd, @ptrFromInt(fds_ptr))[0..nfds];
-    for (fds) |p| if (p.fd >= 0 and !simulated(p.fd) and !sysnet.isSocketFd(p.fd)) return null;
+    // A real descriptor, or an epoll set (not emulated inside a `poll`).
+    for (fds) |p| if (p.fd >= 0 and (descriptorKind(s, p.fd) == .real or sysfd.isEpoll(p.fd))) return null;
+    s.yieldPoint();
     while (true) {
         var ready: u64 = 0;
         for (fds) |*p| {
             p.revents = 0;
             if (p.fd < 0) continue;
-            const mask: u16 = if (sysnet.isSocketFd(p.fd))
-                sysnet.pollMask(s, p.fd)
-            else if (p.fd == root_fd or p.fd == random_fd or handleOf(s, p.fd) != null)
-                sysnet.pollin | sysnet.pollout | 0x40 | 0x100
-            else
-                sysnet.pollnval;
+            const mask: u16 = descriptorMask(s, p.fd);
             const want: u16 = @as(u16, @bitCast(p.events)) | sysnet.pollerr | sysnet.pollhup | sysnet.pollnval;
             p.revents = @bitCast(mask & want);
             if (p.revents != 0) ready += 1;
@@ -229,9 +228,40 @@ fn poll(s: *Sim, fds_ptr: u64, nfds: u64, deadline: ?u64) ?u64 {
     }
 }
 
-/// A run begins: no socket is open (`sysnet.zig`).
+/// What a descriptor number is, for the calls that take a set of them
+/// (`poll`, `epoll_ctl`).
+pub const DescriptorKind = enum {
+    /// Not one the simulator issued.
+    real,
+    /// In a simulated range, and not open.
+    closed,
+    /// A simulated file or directory: always ready.
+    file,
+    /// A socket, a pipe, an eventfd or an epoll set.
+    pollable,
+};
+
+pub fn descriptorKind(s: *Sim, fd: i32) DescriptorKind {
+    if (sysnet.isSocketFd(fd)) return if (sysnet.pollMask(s, fd) == sysnet.pollnval) .closed else .pollable;
+    if (sysfd.isFd(fd)) return if (sysfd.pollMask(fd) == sysfd.poll_nval and !sysfd.isEpoll(fd)) .closed else .pollable;
+    if (!simulated(fd)) return .real;
+    return if (fd == root_fd or fd == random_fd or handleOf(s, fd) != null) .file else .closed;
+}
+
+/// The events a simulated descriptor has now, as `poll` names them.
+pub fn descriptorMask(s: *Sim, fd: i32) u16 {
+    if (sysnet.isSocketFd(fd)) return sysnet.pollMask(s, fd);
+    if (sysfd.isFd(fd)) return sysfd.pollMask(fd);
+    if (fd == root_fd or fd == random_fd or (simulated(fd) and handleOf(s, fd) != null))
+        return sysnet.pollin | sysnet.pollout | 0x40 | 0x100;
+    return sysnet.pollnval;
+}
+
+/// A run begins: no socket, pipe, eventfd or epoll set is open.
 pub fn resetRun() void {
     sysnet.reset();
+    sysfd.reset();
+    systhread.reset();
 }
 
 /// Entry point for `syscalls.zig`: the value for `rax`, or null for a
@@ -241,14 +271,34 @@ pub fn emulate(number: u64, a: *const [6]u64) ?u64 {
     if (!s.config.emulate_syscalls) return null;
     const fd = fdOf(a[0]);
     // Sockets, and any call on a socket descriptor (`sysnet.zig`).
-    if ((number >= 41 and number <= 55) or number == 288) return sysnet.emulate(s, number, a);
+    if ((number >= 41 and number <= 55) or number == 288) {
+        if (number != 41) sysfd.touched(fd);
+        return sysnet.emulate(s, number, a);
+    }
+    // Threads, and what a thread asks of the kernel (`systhread.zig`).
+    switch (number) {
+        56, 435, 334, 273, 24, 14, 60, 186, 218, 131, 11 => return systhread.emulate(s, number, a),
+        else => {},
+    }
+    // Pipes, eventfds and epoll sets (`sysfd.zig`).
+    switch (number) {
+        22, 293, 284, 290, 213, 291, 232, 233, 281, 441 => return sysfd.emulate(s, number, a),
+        else => {},
+    }
     // Only a call whose first argument is a descriptor: in another, it is
     // a pointer or a number that may happen to fall in the range.
     const on_descriptor = switch (number) {
         0, 1, 3, 5, 8, 16, 17, 18, 19, 20, 72, 74, 75, 77, 91, 93, 217, 295, 296 => true,
         else => false,
     };
-    if (on_descriptor and sysnet.isSocketFd(fd)) return sysnet.emulate(s, number, a);
+    if (on_descriptor and sysnet.isSocketFd(fd)) {
+        sysfd.touched(fd);
+        return sysnet.emulate(s, number, a);
+    }
+    if (on_descriptor and sysfd.isFd(fd)) {
+        sysfd.touched(fd);
+        return sysfd.emulate(s, number, a);
+    }
     return switch (number) {
         7 => poll(s, a[0], a[1], pollDeadline(s, a[2])),
         271 => ppoll(s, a[0], a[1], a[2]),

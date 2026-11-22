@@ -116,7 +116,7 @@ pub fn install() bool {
     }
     const sa_onstack = 0x08000000;
     const act: syscalls.KernelSigaction = .{
-        .handler = @intFromPtr(&onSegv),
+        .handler = syscalls.handlerAddress(&onSegv),
         .flags = (4 | 0x04000000 | 0x40000000) | (previous.flags & sa_onstack), // SA_SIGINFO | SA_RESTORER | SA_NODEFER
         .restorer = @intFromPtr(&syscalls.restorer),
         .mask = 0,

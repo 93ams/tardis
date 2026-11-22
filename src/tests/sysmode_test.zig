@@ -1025,14 +1025,14 @@ test "system-call mode: datagrams and socket errors, by system calls" {
     try tardis.check(gpa, socketErrors, .{ .iterations = 20, .mode = .syscalls });
 }
 
-fn usesEpoll(env: *Env) !void {
+fn usesIoUring(env: *Env) !void {
     _ = env;
-    _ = sys(.epoll_create1, 0, 0, 0, 0); // epoll: not emulated
+    _ = sys(.io_uring_setup, 8, 0, 0, 0); // io_uring: not emulated
 }
 
-test "system-call mode: epoll is not emulated, and fails the run" {
+test "system-call mode: io_uring is not emulated, and fails the run" {
     if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
-    try testing.expectError(error.StraySyscall, tardis.check(gpa, usesEpoll, .{ .iterations = 1, .mode = .syscalls, .report = false, .shrink = false }));
+    try testing.expectError(error.StraySyscall, tardis.check(gpa, usesIoUring, .{ .iterations = 1, .mode = .syscalls, .report = false, .shrink = false }));
 }
 
 // --- non-blocking sockets and poll (revision 82) -----------------------------------
@@ -1313,4 +1313,661 @@ test "system-call mode: an address in the socket range is not a descriptor (foun
     if (@as(isize, @bitCast(map)) < 0 or map != 0x2000_0000) return error.SkipZigTest;
     defer _ = linux.munmap(@ptrFromInt(0x2000_0000), 4096);
     try tardis.check(gpa, futexInSocketRange, .{ .iterations = 2, .mode = .syscalls });
+}
+
+// --- pipes, eventfd and epoll (revision 97, `sysfd.zig`) ------------------------------
+
+const epipe = -32;
+const o_nonblock = 0o4000;
+
+fn pipe2(flags: usize) ![2]i32 {
+    var fds: [2]i32 = undefined;
+    _ = try ok(sys(.pipe2, @intFromPtr(&fds), flags, 0, 0));
+    return fds;
+}
+
+fn fdu(fd: i32) usize {
+    return @intCast(fd);
+}
+
+fn writesLater(fd: usize) void {
+    sleepsMs(3);
+    _ = sys(.write, fd, @intFromPtr("late"), 4, 0);
+}
+
+fn pipes(env: *Env) !void {
+    const p = try pipe2(0);
+    const r = fdu(p[0]);
+    const w = fdu(p[1]);
+    // Bytes come out in the order they went in, across the buffer's end.
+    var block: [4096]u8 = undefined;
+    for (&block, 0..) |*b, i| b.* = @truncate(i *% 31);
+    var back: [4096]u8 = undefined;
+    for (0..40) |_| {
+        try testing.expectEqual(@as(usize, 4096), try ok(sys(.write, w, @intFromPtr(&block), block.len, 0)));
+        try testing.expectEqual(@as(usize, 3000), try ok(sys(.read, r, @intFromPtr(&back), 3000, 0)));
+        try testing.expectEqualSlices(u8, block[0..3000], back[0..3000]);
+        try testing.expectEqual(@as(usize, 1096), try ok(sys(.read, r, @intFromPtr(&back), back.len, 0)));
+        try testing.expectEqualSlices(u8, block[3000..], back[0..1096]);
+    }
+    // It is a FIFO, and says so.
+    var st: [144]u8 = undefined;
+    _ = try ok(sys(.fstat, r, @intFromPtr(&st), 0, 0));
+    try testing.expectEqual(@as(u32, 0o010000), std.mem.readInt(u32, st[24..28], .little) & 0o170000);
+    try testing.expectEqual(errOf(.SPIPE), sys(.lseek, r, 0, 0, 0));
+    try testing.expectEqual(errOf(.BADF), sys(.write, r, @intFromPtr("x"), 1, 0));
+    try testing.expectEqual(errOf(.BADF), sys(.read, w, @intFromPtr(&back), 1, 0));
+
+    // An empty pipe makes a reader wait, until another task writes.
+    var other = try env.io.concurrent(writesLater, .{w});
+    const before = try monotonicNs();
+    try testing.expectEqual(@as(usize, 4), try ok(sys(.read, r, @intFromPtr(&back), back.len, 0)));
+    try testing.expectEqualStrings("late", back[0..4]);
+    try testing.expect(try monotonicNs() - before >= 3 * std.time.ns_per_ms);
+    other.await(env.io);
+
+    // Non-blocking: empty says so, and so does full.
+    _ = try ok(sys(.fcntl, r, 4, o_nonblock, 0));
+    _ = try ok(sys(.fcntl, w, 4, o_wronly | o_nonblock, 0));
+    try testing.expectEqual(@as(isize, eagain), sys(.read, r, @intFromPtr(&back), back.len, 0));
+    var filled: usize = 0;
+    while (true) {
+        const rc = sys(.write, w, @intFromPtr(&block), block.len, 0);
+        if (rc == eagain) break;
+        filled += try ok(rc);
+    }
+    try testing.expectEqual(@as(usize, 65536), filled);
+    var pending: i32 = 0;
+    _ = try ok(sys(.ioctl, r, 0x541B, @intFromPtr(&pending), 0)); // FIONREAD
+    try testing.expectEqual(@as(i32, 65536), pending);
+    // A small write is all or nothing: one byte of room is no room for two.
+    _ = try ok(sys(.read, r, @intFromPtr(&back), 1, 0));
+    try testing.expectEqual(@as(isize, eagain), sys(.write, w, @intFromPtr(&block), 2, 0));
+    try testing.expectEqual(@as(usize, 1), try ok(sys(.write, w, @intFromPtr(&block), 1, 0)));
+
+    // The writer closes: what is in the pipe is read, then the end.
+    _ = try ok(sys(.close, w, 0, 0, 0));
+    var left: usize = 65536;
+    while (left > 0) left -= try ok(sys(.read, r, @intFromPtr(&back), back.len, 0));
+    try testing.expectEqual(@as(usize, 0), try ok(sys(.read, r, @intFromPtr(&back), back.len, 0)));
+    _ = try ok(sys(.close, r, 0, 0, 0));
+    try testing.expectEqual(errOf(.BADF), sys(.read, r, @intFromPtr(&back), 1, 0));
+
+    // The reader closes: a write fails, and nothing is raised.
+    const q = try pipe2(0);
+    _ = try ok(sys(.close, fdu(q[0]), 0, 0, 0));
+    try testing.expectEqual(@as(isize, epipe), sys(.write, fdu(q[1]), @intFromPtr("x"), 1, 0));
+    _ = try ok(sys(.close, fdu(q[1]), 0, 0, 0));
+}
+
+test "system-call mode: a pipe carries bytes in order, waits when empty, and ends when its writer closes" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, pipes, .{ .iterations = 20, .mode = .syscalls });
+}
+
+fn addsLater(fd: usize) void {
+    sleepsMs(2);
+    const seven: u64 = 7;
+    _ = sys(.write, fd, @intFromPtr(&seven), 8, 0);
+}
+
+fn eventfds(env: *Env) !void {
+    const fd = try ok(sys(.eventfd2, 3, 0, 0, 0));
+    var value: u64 = 0;
+    // A read takes the whole count.
+    const two: u64 = 2;
+    _ = try ok(sys(.write, fd, @intFromPtr(&two), 8, 0));
+    try testing.expectEqual(@as(usize, 8), try ok(sys(.read, fd, @intFromPtr(&value), 8, 0)));
+    try testing.expectEqual(@as(u64, 5), value);
+    try testing.expectEqual(errOf(.INVAL), sys(.read, fd, @intFromPtr(&value), 4, 0));
+    // At zero a reader waits for another task's write.
+    var other = try env.io.concurrent(addsLater, .{fd});
+    _ = try ok(sys(.read, fd, @intFromPtr(&value), 8, 0));
+    try testing.expectEqual(@as(u64, 7), value);
+    other.await(env.io);
+    _ = try ok(sys(.close, fd, 0, 0, 0));
+
+    // A semaphore gives one at a time; non-blocking, it says when empty.
+    const sem = try ok(sys(.eventfd2, 2, 1 | o_nonblock, 0, 0));
+    for (0..2) |_| {
+        _ = try ok(sys(.read, sem, @intFromPtr(&value), 8, 0));
+        try testing.expectEqual(@as(u64, 1), value);
+    }
+    try testing.expectEqual(@as(isize, eagain), sys(.read, sem, @intFromPtr(&value), 8, 0));
+    // The count cannot pass its maximum.
+    const most: u64 = std.math.maxInt(u64) - 1;
+    _ = try ok(sys(.write, sem, @intFromPtr(&most), 8, 0));
+    const one: u64 = 1;
+    try testing.expectEqual(@as(isize, eagain), sys(.write, sem, @intFromPtr(&one), 8, 0));
+    const all_ones: u64 = std.math.maxInt(u64);
+    try testing.expectEqual(errOf(.INVAL), sys(.write, sem, @intFromPtr(&all_ones), 8, 0));
+    _ = try ok(sys(.close, sem, 0, 0, 0));
+}
+
+test "system-call mode: an eventfd counts, and a reader waits at zero" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, eventfds, .{ .iterations = 20, .mode = .syscalls });
+}
+
+const EpollEvent = extern struct { events: u32 align(1), data: u64 align(1) };
+const epollin = 0x1;
+const epollout = 0x4;
+const epollhup = 0x10;
+const epollet: u32 = 1 << 31;
+const epolloneshot: u32 = 1 << 30;
+
+fn epollAdd(ep: usize, op: usize, fd: usize, events: u32, data: u64) isize {
+    var ev: EpollEvent = .{ .events = events, .data = data };
+    return sys(.epoll_ctl, ep, op, fd, @intFromPtr(&ev));
+}
+
+fn epollWait(ep: usize, events: []EpollEvent, timeout_ms: i32) !usize {
+    return ok(sys(.epoll_wait, ep, @intFromPtr(events.ptr), events.len, @as(u32, @bitCast(timeout_ms))));
+}
+
+fn epollRules(env: *Env) !void {
+    const ep = try ok(sys(.epoll_create1, 0, 0, 0, 0));
+    defer _ = sys(.close, ep, 0, 0, 0);
+    const p = try pipe2(o_nonblock);
+    const r = fdu(p[0]);
+    const w = fdu(p[1]);
+    var events: [8]EpollEvent = undefined;
+
+    // What may not be in a set, and the errors of the three operations.
+    const file = try open("plain", o_creat | o_rdwr);
+    try testing.expectEqual(errOf(.PERM), epollAdd(ep, 1, file, epollin, 0));
+    _ = sys(.close, file, 0, 0, 0);
+    try testing.expectEqual(errOf(.INVAL), epollAdd(ep, 1, ep, epollin, 0));
+    try testing.expectEqual(errOf(.NOENT), epollAdd(ep, 3, r, epollin, 0));
+    try testing.expectEqual(errOf(.NOENT), sys(.epoll_ctl, ep, 2, r, 0));
+    _ = try ok(epollAdd(ep, 1, r, epollin, 11));
+    try testing.expectEqual(errOf(.EXIST), epollAdd(ep, 1, r, epollin, 11));
+    try testing.expectEqual(errOf(.INVAL), sys(.epoll_wait, ep, @intFromPtr(&events), 0, 0));
+    try testing.expectEqual(errOf(.INVAL), sys(.epoll_wait, r, @intFromPtr(&events), 8, 0));
+
+    // Nothing is ready: the timeout passes, in virtual time.
+    const before = try monotonicNs();
+    try testing.expectEqual(@as(usize, 0), try epollWait(ep, &events, 40));
+    try testing.expect(try monotonicNs() - before >= 40 * std.time.ns_per_ms);
+
+    // Level-triggered: reported for as long as it is so.
+    _ = try ok(sys(.write, w, @intFromPtr("ab"), 2, 0));
+    for (0..2) |_| {
+        try testing.expectEqual(@as(usize, 1), try epollWait(ep, &events, 0));
+        try testing.expectEqual(@as(u32, epollin), events[0].events);
+        try testing.expectEqual(@as(u64, 11), events[0].data);
+    }
+
+    // Edge-triggered: reported once, and again when more arrives after
+    // the pipe was drained.
+    _ = try ok(epollAdd(ep, 3, r, epollin | epollet, 12));
+    try testing.expectEqual(@as(usize, 1), try epollWait(ep, &events, 0));
+    try testing.expectEqual(@as(u64, 12), events[0].data);
+    try testing.expectEqual(@as(usize, 0), try epollWait(ep, &events, 0));
+    var buf: [8]u8 = undefined;
+    try testing.expectEqual(@as(usize, 2), try ok(sys(.read, r, @intFromPtr(&buf), buf.len, 0)));
+    try testing.expectEqual(@as(isize, eagain), sys(.read, r, @intFromPtr(&buf), buf.len, 0));
+    try testing.expectEqual(@as(usize, 0), try epollWait(ep, &events, 0));
+    _ = try ok(sys(.write, w, @intFromPtr("c"), 1, 0));
+    try testing.expectEqual(@as(usize, 1), try epollWait(ep, &events, 0));
+    try testing.expectEqual(@as(usize, 0), try epollWait(ep, &events, 0));
+
+    // One shot: silent after its report, until it is set again.
+    _ = try ok(epollAdd(ep, 3, r, epollin | epolloneshot, 13));
+    try testing.expectEqual(@as(usize, 1), try epollWait(ep, &events, 0));
+    try testing.expectEqual(@as(usize, 0), try epollWait(ep, &events, 0));
+    _ = try ok(epollAdd(ep, 3, r, epollin | epolloneshot, 14));
+    try testing.expectEqual(@as(usize, 1), try epollWait(ep, &events, 0));
+    try testing.expectEqual(@as(u64, 14), events[0].data);
+
+    // The writer closes: a hang-up nobody asked for is reported all the same.
+    _ = try ok(epollAdd(ep, 3, r, 0, 15));
+    try testing.expectEqual(@as(usize, 0), try epollWait(ep, &events, 0));
+    _ = try ok(sys(.close, w, 0, 0, 0));
+    try testing.expectEqual(@as(usize, 1), try epollWait(ep, &events, 0));
+    try testing.expectEqual(@as(u32, epollhup), events[0].events);
+
+    // A closed descriptor leaves the set.
+    _ = try ok(sys(.close, r, 0, 0, 0));
+    try testing.expectEqual(@as(usize, 0), try epollWait(ep, &events, 0));
+
+    // A waiter is woken by another task, through an eventfd, as a
+    // runtime's waker does it.
+    const waker = try ok(sys(.eventfd2, 0, o_nonblock, 0, 0));
+    defer _ = sys(.close, waker, 0, 0, 0);
+    _ = try ok(epollAdd(ep, 1, waker, epollin | epollet, 99));
+    var other = try env.io.concurrent(addsLater, .{waker});
+    try testing.expectEqual(@as(usize, 1), try epollWait(ep, &events, -1));
+    try testing.expectEqual(@as(u64, 99), events[0].data);
+    other.await(env.io);
+}
+
+test "system-call mode: epoll reports by level, by edge and once, and waits in virtual time" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, epollRules, .{ .iterations = 20, .mode = .syscalls });
+}
+
+/// An edge-triggered echo server on one task: it accepts, reads until the
+/// socket says it would wait, echoes, and stops when its eventfd fires.
+fn epollServer(listener: usize, stop: usize) void {
+    epollServe(listener, stop) catch |err| std.debug.panic("epoll server: {s}", .{@errorName(err)});
+}
+
+fn epollServe(listener: usize, stop: usize) !void {
+    const ep = try ok(sys(.epoll_create1, 0, 0, 0, 0));
+    defer _ = sys(.close, ep, 0, 0, 0);
+    _ = try ok(epollAdd(ep, 1, listener, epollin | epollet, listener));
+    _ = try ok(epollAdd(ep, 1, stop, epollin, stop));
+    var events: [8]EpollEvent = undefined;
+    // The connections still open, to close when told to stop.
+    var open_conns: [8]usize = undefined;
+    var open_len: usize = 0;
+    defer for (open_conns[0..open_len]) |conn| {
+        _ = sys(.close, conn, 0, 0, 0);
+    };
+    while (true) {
+        const n = try epollWait(ep, &events, -1);
+        for (events[0..n]) |ev| {
+            if (ev.data == stop) return;
+            if (ev.data == listener) {
+                while (true) {
+                    const rc = sys(.accept4, listener, 0, 0, o_nonblock);
+                    if (rc == eagain) break;
+                    const conn = try ok(rc);
+                    _ = try ok(epollAdd(ep, 1, conn, epollin | epollet | 0x2000, conn));
+                    open_conns[open_len] = conn;
+                    open_len += 1;
+                }
+                continue;
+            }
+            const conn: usize = @intCast(ev.data);
+            var buf: [64]u8 = undefined;
+            while (true) {
+                const rc = sys6(.recvfrom, conn, @intFromPtr(&buf), buf.len, 0, 0, 0);
+                if (rc == eagain) break;
+                const got = ok(rc) catch 0;
+                if (got == 0) {
+                    _ = sys(.close, conn, 0, 0, 0);
+                    const at = std.mem.indexOfScalar(usize, open_conns[0..open_len], conn).?;
+                    open_len -= 1;
+                    open_conns[at] = open_conns[open_len];
+                    break;
+                }
+                var sent: usize = 0;
+                while (sent < got) {
+                    const w = sys6(.sendto, conn, @intFromPtr(&buf) + sent, got - sent, 0x4000, 0, 0);
+                    if (w == eagain) {
+                        _ = try waitFor(conn, pollout);
+                        continue;
+                    }
+                    sent += try ok(w);
+                }
+            }
+        }
+    }
+}
+
+fn epollClient(port: u16, tag: u8) void {
+    epollClientRun(port, tag) catch |err| std.debug.panic("epoll client: {s}", .{@errorName(err)});
+}
+
+fn epollClientRun(port: u16, tag: u8) !void {
+    const to = sockaddr(.{ 127, 0, 0, 1 }, port);
+    const fd = try ok(sys(.socket, 2, 1, 0, 0));
+    defer _ = sys(.close, fd, 0, 0, 0);
+    _ = try ok(sys(.connect, fd, @intFromPtr(&to), @sizeOf(SockaddrIn), 0));
+    for (0..3) |round| {
+        const msg = [4]u8{ tag, @intCast(round), tag, @intCast(round) };
+        _ = try ok(sys6(.sendto, fd, @intFromPtr(&msg), msg.len, 0x4000, 0, 0));
+        var back: [4]u8 = undefined;
+        var got: usize = 0;
+        while (got < back.len) {
+            const n = try ok(sys6(.recvfrom, fd, @intFromPtr(&back) + got, back.len - got, 0, 0, 0));
+            if (n == 0) return error.EndOfStream;
+            got += n;
+        }
+        try testing.expectEqualSlices(u8, &msg, &back);
+    }
+}
+
+fn epollEcho(env: *Env) !void {
+    const listener = try ok(sys(.socket, 2, 1 | o_nonblock, 0, 0));
+    defer _ = sys(.close, listener, 0, 0, 0);
+    const at = sockaddr(.{ 127, 0, 0, 1 }, 7300);
+    _ = try ok(sys(.bind, listener, @intFromPtr(&at), @sizeOf(SockaddrIn), 0));
+    _ = try ok(sys(.listen, listener, 8, 0, 0));
+    const stop = try ok(sys(.eventfd2, 0, 0, 0, 0));
+    defer _ = sys(.close, stop, 0, 0, 0);
+    var server = try env.io.concurrent(epollServer, .{ listener, stop });
+    var a = try env.io.concurrent(epollClient, .{ 7300, 'a' });
+    var b = try env.io.concurrent(epollClient, .{ 7300, 'b' });
+    var c = try env.io.concurrent(epollClient, .{ 7300, 'c' });
+    a.await(env.io);
+    b.await(env.io);
+    c.await(env.io);
+    const one: u64 = 1;
+    _ = try ok(sys(.write, stop, @intFromPtr(&one), 8, 0));
+    server.await(env.io);
+}
+
+test "system-call mode: an edge-triggered epoll loop serves three clients and is stopped through an eventfd" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, epollEcho, .{ .iterations = 100, .mode = .syscalls });
+}
+
+fn descriptorsAndCrash(env: *Env) !void {
+    const p = try pipe2(0);
+    const ev = try ok(sys(.eventfd2, 1, 0, 0, 0));
+    const ep = try ok(sys(.epoll_create1, 0, 0, 0, 0));
+    try env.crashAndReboot(.power_loss);
+    // The process is gone, and its descriptors with it.
+    var buf: [8]u8 = undefined;
+    try testing.expectEqual(errOf(.BADF), sys(.read, fdu(p[0]), @intFromPtr(&buf), 8, 0));
+    try testing.expectEqual(errOf(.BADF), sys(.write, fdu(p[1]), @intFromPtr(&buf), 8, 0));
+    try testing.expectEqual(errOf(.BADF), sys(.read, ev, @intFromPtr(&buf), 8, 0));
+    try testing.expectEqual(errOf(.BADF), sys(.epoll_wait, ep, @intFromPtr(&buf), 1, 0));
+    // And a new one works.
+    const q = try pipe2(0);
+    _ = try ok(sys(.write, fdu(q[1]), @intFromPtr("z"), 1, 0));
+    try testing.expectEqual(@as(usize, 1), try ok(sys(.read, fdu(q[0]), @intFromPtr(&buf), 8, 0)));
+}
+
+test "system-call mode: pipes, eventfds and epoll sets do not outlive a crash" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, descriptorsAndCrash, .{ .iterations = 10, .mode = .syscalls });
+}
+
+// --- threads (revision 97, `systhread.zig`) -----------------------------------------
+
+/// A thread's work, by system calls only: sleep, count, and say so on a pipe.
+fn threadWorker(counter: *std.atomic.Value(u32), fd: usize, tag: u8, ms: i64) void {
+    sleepsMs(ms);
+    _ = counter.fetchAdd(1, .seq_cst);
+    _ = sys(.write, fd, @intFromPtr(&tag), 1, 0);
+}
+
+fn threadsJoin(env: *Env) !void {
+    _ = env;
+    var counter: std.atomic.Value(u32) = .init(0);
+    const p = try pipe2(0);
+    defer _ = sys(.close, fdu(p[0]), 0, 0, 0);
+    defer _ = sys(.close, fdu(p[1]), 0, 0, 0);
+    const before = try monotonicNs();
+    const a = try std.Thread.spawn(.{}, threadWorker, .{ &counter, fdu(p[1]), 'a', 5 });
+    const b = try std.Thread.spawn(.{}, threadWorker, .{ &counter, fdu(p[1]), 'b', 2 });
+    // The parent waits on the pipe while the threads sleep, in virtual
+    // time: the one with the shorter sleep writes first.
+    var order: [2]u8 = undefined;
+    for (&order) |*o| try testing.expectEqual(@as(usize, 1), try ok(sys(.read, fdu(p[0]), @intFromPtr(o), 1, 0)));
+    try testing.expectEqualStrings("ba", &order);
+    a.join();
+    b.join();
+    try testing.expectEqual(@as(u32, 2), counter.load(.seq_cst));
+    const took = try monotonicNs() - before;
+    try testing.expect(took >= 5 * std.time.ns_per_ms and took < 50 * std.time.ns_per_ms);
+}
+
+test "system-call mode: threads are tasks: they sleep in virtual time, write to a pipe, and are joined" {
+    if (!supported or !tardis.syscallModeAvailable() or !tardis.syscallThreadsAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, threadsJoin, .{ .iterations = 50, .mode = .syscalls });
+}
+
+/// Each thread has a thread pointer of its own: a thread-local is not
+/// shared, and a thread's number is its own.
+threadlocal var per_thread: u32 = 7;
+
+fn threadLocalWorker(seen: *u32, tid: *i32) void {
+    per_thread += 1;
+    _ = sys(.sched_yield, 0, 0, 0, 0);
+    per_thread += 1;
+    seen.* = per_thread;
+    tid.* = @intCast(sys(.gettid, 0, 0, 0, 0));
+}
+
+fn threadLocals(env: *Env) !void {
+    _ = env;
+    per_thread = 100;
+    var seen: [3]u32 = @splat(0);
+    var tids: [3]i32 = @splat(0);
+    var threads: [3]std.Thread = undefined;
+    for (&threads, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, threadLocalWorker, .{ &seen[i], &tids[i] });
+    for (threads) |t| t.join();
+    for (seen) |v| try testing.expectEqual(@as(u32, 9), v);
+    try testing.expectEqual(@as(u32, 100), per_thread);
+    const mine: i32 = @intCast(sys(.gettid, 0, 0, 0, 0));
+    for (tids, 0..) |tid, i| {
+        try testing.expect(tid != mine);
+        for (tids[0..i]) |other| try testing.expect(tid != other);
+    }
+}
+
+test "system-call mode: a thread has its own thread-local storage and its own number" {
+    if (!supported or !tardis.syscallModeAvailable() or !tardis.syscallThreadsAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, threadLocals, .{ .iterations = 50, .mode = .syscalls });
+}
+
+const Shared = struct {
+    mutex: CLock = .{},
+    inside: u32 = 0,
+    total: u32 = 0,
+    overlapped: bool = false,
+};
+
+fn lockingWorker(shared: *Shared, fd: usize) void {
+    for (0..4) |_| {
+        shared.mutex.lock();
+        shared.inside += 1;
+        if (shared.inside != 1) shared.overlapped = true;
+        // A call that lets other threads run, with the lock held.
+        _ = sys(.write, fd, @intFromPtr("x"), 1, 0);
+        shared.total += 1;
+        shared.inside -= 1;
+        shared.mutex.unlock();
+    }
+}
+
+fn threadsLock(env: *Env) !void {
+    _ = env;
+    var shared: Shared = .{};
+    const fd = try open("log", o_creat | o_wronly | o_append);
+    defer _ = sys(.close, fd, 0, 0, 0);
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, lockingWorker, .{ &shared, fd });
+    for (threads) |t| t.join();
+    try testing.expect(!shared.overlapped);
+    try testing.expectEqual(@as(u32, 16), shared.total);
+    var st: [144]u8 = undefined;
+    _ = try ok(sys(.fstat, fd, @intFromPtr(&st), 0, 0));
+    try testing.expectEqual(@as(i64, 16), std.mem.readInt(i64, st[48..56], .little)); // st_size
+}
+
+test "system-call mode: a mutex between four threads holds across file calls" {
+    if (!supported or !tardis.syscallModeAvailable() or !tardis.syscallThreadsAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, threadsLock, .{ .iterations = 100, .mode = .syscalls });
+}
+
+fn detachedWorker(fd: usize) void {
+    sleepsMs(1);
+    const one: u64 = 1;
+    _ = sys(.write, fd, @intFromPtr(&one), 8, 0);
+}
+
+fn threadsDetached(env: *Env) !void {
+    _ = env;
+    const ev = try ok(sys(.eventfd2, 0, 0, 0, 0));
+    defer _ = sys(.close, ev, 0, 0, 0);
+    // A detached thread frees its own stack as it exits.
+    for (0..3) |_| (try std.Thread.spawn(.{}, detachedWorker, .{ev})).detach();
+    var seen: u64 = 0;
+    while (seen < 3) {
+        var value: u64 = 0;
+        _ = try ok(sys(.read, ev, @intFromPtr(&value), 8, 0));
+        seen += value;
+    }
+    // Let them finish exiting before the run ends.
+    sleepsMs(1);
+}
+
+test "system-call mode: detached threads run and exit" {
+    if (!supported or !tardis.syscallModeAvailable() or !tardis.syscallThreadsAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, threadsDetached, .{ .iterations = 50, .mode = .syscalls });
+}
+
+fn forks(env: *Env) !void {
+    _ = env;
+    _ = sys(.fork, 0, 0, 0, 0); // a new process: not emulated
+}
+
+test "system-call mode: fork is not a thread, and fails the run" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try testing.expectError(error.StraySyscall, tardis.check(gpa, forks, .{ .iterations = 1, .mode = .syscalls, .report = false, .shrink = false }));
+}
+
+fn longSleeper(ms: i64) void {
+    sleepsMs(ms);
+}
+
+fn threadLeftRunning(env: *Env) !void {
+    _ = env;
+    (try std.Thread.spawn(.{}, longSleeper, .{1000})).detach();
+}
+
+test "system-call mode: a thread still running when the body returns is a leaked task, and later runs are sound" {
+    if (!supported or !tardis.syscallModeAvailable() or !tardis.syscallThreadsAvailable()) return error.SkipZigTest;
+    try testing.expectError(error.ResourceLeak, tardis.check(gpa, threadLeftRunning, .{ .iterations = 5, .mode = .syscalls, .report = false }));
+    // The process and its trap are as they were: threads work again.
+    try tardis.check(gpa, threadsJoin, .{ .iterations = 20, .mode = .syscalls });
+}
+
+// --- found by review (revision 97) ----------------------------------------------------
+
+const Iov = extern struct { base: usize, len: usize };
+
+fn readsSlowly(fd: usize) void {
+    var buf: [4096]u8 = undefined;
+    var left: usize = 65536 + 5000;
+    while (left > 0) {
+        sleepsMs(1);
+        const n = ok(sys(.read, fd, @intFromPtr(&buf), buf.len, 0)) catch return;
+        if (n == 0) return;
+        left -= n;
+    }
+}
+
+fn reviewedDescriptors(env: *Env) !void {
+    const ep = try ok(sys(.epoll_create1, 0, 0, 0, 0));
+    defer _ = sys(.close, ep, 0, 0, 0);
+    var events: [4]EpollEvent = undefined;
+
+    // An edge for every write to the other end, read or not: a waker that
+    // is never drained still wakes (it hung).
+    {
+        const p = try pipe2(o_nonblock);
+        defer _ = sys(.close, fdu(p[0]), 0, 0, 0);
+        defer _ = sys(.close, fdu(p[1]), 0, 0, 0);
+        _ = try ok(epollAdd(ep, 1, fdu(p[0]), epollin | epollet, 1));
+        for (0..3) |_| {
+            _ = try ok(sys(.write, fdu(p[1]), @intFromPtr("w"), 1, 0));
+            try testing.expectEqual(@as(usize, 1), try epollWait(ep, &events, 0));
+            try testing.expectEqual(@as(usize, 0), try epollWait(ep, &events, 0));
+        }
+    }
+
+    // A blocking writev writes everything, waiting for a reader to make
+    // room (it returned short), and a small one is not split.
+    {
+        const p = try pipe2(0);
+        defer _ = sys(.close, fdu(p[0]), 0, 0, 0);
+        var big: [65536]u8 = @splat('a');
+        var more: [5000]u8 = @splat('b');
+        const iov = [2]Iov{ .{ .base = @intFromPtr(&big), .len = big.len }, .{ .base = @intFromPtr(&more), .len = more.len } };
+        var reader = try env.io.concurrent(readsSlowly, .{fdu(p[0])});
+        try testing.expectEqual(@as(usize, big.len + more.len), try ok(sys(.writev, fdu(p[1]), @intFromPtr(&iov), 2, 0)));
+        _ = sys(.close, fdu(p[1]), 0, 0, 0);
+        reader.await(env.io);
+    }
+    {
+        const p = try pipe2(o_nonblock);
+        defer _ = sys(.close, fdu(p[0]), 0, 0, 0);
+        defer _ = sys(.close, fdu(p[1]), 0, 0, 0);
+        var fill: [4096]u8 = @splat('f');
+        while (sys(.write, fdu(p[1]), @intFromPtr(&fill), fill.len, 0) != eagain) {}
+        var one: [1]u8 = undefined;
+        _ = try ok(sys(.read, fdu(p[0]), @intFromPtr(&one), 1, 0));
+        // One byte of room: two vectors of one byte each do not fit.
+        const iov = [2]Iov{ .{ .base = @intFromPtr("x"), .len = 1 }, .{ .base = @intFromPtr("y"), .len = 1 } };
+        try testing.expectEqual(@as(isize, eagain), sys(.writev, fdu(p[1]), @intFromPtr(&iov), 2, 0));
+    }
+
+    // poll over a pipe, an eventfd and a socket together.
+    {
+        const p = try pipe2(0);
+        defer _ = sys(.close, fdu(p[0]), 0, 0, 0);
+        defer _ = sys(.close, fdu(p[1]), 0, 0, 0);
+        const ev = try ok(sys(.eventfd2, 0, 0, 0, 0));
+        defer _ = sys(.close, ev, 0, 0, 0);
+        const sock = try ok(sys(.socket, 2, 2, 0, 0));
+        defer _ = sys(.close, sock, 0, 0, 0);
+        var fds = [3]PollFd{
+            .{ .fd = p[0], .events = pollin, .revents = 0 },
+            .{ .fd = @intCast(ev), .events = pollin, .revents = 0 },
+            .{ .fd = @intCast(sock), .events = pollin, .revents = 0 },
+        };
+        try testing.expectEqual(@as(isize, 0), sys(.poll, @intFromPtr(&fds), 3, 5, 0));
+        const one: u64 = 1;
+        _ = try ok(sys(.write, ev, @intFromPtr(&one), 8, 0));
+        try testing.expectEqual(@as(isize, 1), sys(.poll, @intFromPtr(&fds), 3, 5, 0));
+        try testing.expectEqual(@as(i16, pollin), fds[1].revents & pollin);
+        try testing.expectEqual(@as(i16, 0), fds[0].revents);
+    }
+
+    // No ready entry starves another when one event is taken at a time.
+    {
+        const a = try ok(sys(.eventfd2, 1, 0, 0, 0));
+        defer _ = sys(.close, a, 0, 0, 0);
+        const b = try ok(sys(.eventfd2, 1, 0, 0, 0));
+        defer _ = sys(.close, b, 0, 0, 0);
+        _ = try ok(epollAdd(ep, 1, a, epollin, 100));
+        _ = try ok(epollAdd(ep, 1, b, epollin, 200));
+        var seen: u64 = 0;
+        for (0..2) |_| {
+            try testing.expectEqual(@as(usize, 1), try epollWait(ep, events[0..1], 0));
+            seen += events[0].data;
+        }
+        try testing.expectEqual(@as(u64, 300), seen);
+    }
+
+    // A signal mask is read back as it was set, and never reaches the kernel.
+    var old: u64 = 0;
+    const all: u64 = ~@as(u64, 0);
+    _ = try ok(sys(.rt_sigprocmask, 2, @intFromPtr(&all), 0, 8));
+    _ = try ok(sys(.rt_sigprocmask, 2, 0, @intFromPtr(&old), 8));
+    try testing.expectEqual(all, old);
+    const none: u64 = 0;
+    _ = try ok(sys(.rt_sigprocmask, 2, @intFromPtr(&none), 0, 8));
+}
+
+test "system-call mode: descriptor and signal-mask edges (found by review)" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, reviewedDescriptors, .{ .iterations = 30, .mode = .syscalls });
+}
+
+fn threadCrash(env: *Env) !void {
+    (try std.Thread.spawn(.{}, longSleeper, .{1000})).detach();
+    sleepsMs(5);
+    // The process dies with its thread asleep in a system call.
+    try env.crashAndReboot(.process_crash);
+    // Threads work again after it.
+    var counter: std.atomic.Value(u32) = .init(0);
+    const p = try pipe2(0);
+    defer _ = sys(.close, fdu(p[0]), 0, 0, 0);
+    defer _ = sys(.close, fdu(p[1]), 0, 0, 0);
+    const t = try std.Thread.spawn(.{}, threadWorker, .{ &counter, fdu(p[1]), 'z', 1 });
+    t.join();
+    try testing.expectEqual(@as(u32, 1), counter.load(.seq_cst));
+}
+
+test "system-call mode: a crash takes the process's threads with it, and new ones start" {
+    if (!supported or !tardis.syscallModeAvailable() or !tardis.syscallThreadsAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, threadCrash, .{ .iterations = 30, .mode = .syscalls });
 }

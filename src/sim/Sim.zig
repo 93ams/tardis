@@ -30,6 +30,8 @@ const persist = @import("../search/persist.zig");
 const seam = @import("sec_seam.zig");
 const syscalls = @import("syscalls.zig");
 const sysnet = @import("sysnet.zig");
+const sysfd = @import("sysfd.zig");
+const systhread = @import("systhread.zig");
 const ionet = Io.net;
 
 pub const TaskId = sched.TaskId;
@@ -1910,6 +1912,8 @@ pub fn crashAndReboot(s: *Sim, mode: CrashMode) void {
     s.dropTasks(null);
     s.net.reset();
     sysnet.dropNode(null);
+    sysfd.dropNode(null);
+    systhread.dropNode(null);
     for (s.nodes) |*n| n.heap.reset();
     s.plan.clearTargeted();
     s.boot_count += 1;
@@ -1975,6 +1979,8 @@ pub fn crashNode(s: *Sim, node: NodeId, mode: CrashMode) void {
     s.crashVfs(&s.nodes[node].vfs, node, mode);
     s.dropTasks(node);
     sysnet.dropNode(node);
+    sysfd.dropNode(node);
+    systhread.dropNode(node);
     s.nodes[node].heap.reset();
     const freed = s.net.crashNode(node, s.now_ns, &s.decider, s.config.net);
     s.record(.net_fault, node, freed, 0, "node crash");
@@ -3373,6 +3379,7 @@ fn wakeBlocked(s: *Sim, tag: std.meta.Tag(Block)) void {
 
 /// Network state changed: every task waiting on the network re-checks.
 fn netWakeAll(s: *Sim) void {
+    sysfd.networkChanged();
     s.wakeBlocked(.net);
 }
 
@@ -3604,6 +3611,45 @@ pub fn unlisten(s: *Sim, handle: ionet.Socket.Handle) void {
     s.net.unlisten(slot, s.now_ns, &s.decider, s.config.net);
     s.touchGlobal();
     s.netWakeAll();
+}
+
+// --- threads of system-call mode (`systhread.zig`) ----------------------------
+
+/// A task for a thread the code under test started with `clone`. It is on
+/// the parent's node and ends by `exitThread`.
+pub fn spawnThread(s: *Sim, start: *const fn (context: *const anyopaque) void, context: []const u8) ?TaskId {
+    return s.spawn(.{ .daemon = start }, context, null, 0);
+}
+
+/// The current task, a thread, has exited: it never runs again. `clear`
+/// is the word the kernel zeroes and wakes for whoever joins the thread
+/// (`CLONE_CHILD_CLEARTID`). The wake and the end are one step: a joiner
+/// that ran between them would find the thread's task still there.
+pub fn exitThread(s: *Sim, clear: ?*u32) noreturn {
+    if (clear) |word| {
+        @atomicStore(u32, word, 0, .seq_cst);
+        var woken: u32 = 0;
+        for (s.tasks, 0..) |*t, i| {
+            if (t.state == .blocked and t.block == .futex and t.block.futex == @intFromPtr(word)) {
+                s.wake(@intCast(i));
+                woken += 1;
+            }
+        }
+        s.record(.futex_wake, woken, woken, 0, "");
+    }
+    s.finishCurrent();
+}
+
+/// `sched_yield`: another runnable task runs, if there is one.
+pub fn yieldNow(s: *Sim) void {
+    s.atomicFlush();
+    if (s.watches_armed > 0) s.watchStep();
+    if (s.runq.count > 1) s.reschedule();
+}
+
+/// A scheduling point, as any simulated operation is.
+pub fn yieldPoint(s: *Sim) void {
+    s.maybeYield();
 }
 
 /// Wakes the tasks waiting on the network (system-call mode: a `shutdown`

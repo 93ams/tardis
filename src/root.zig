@@ -57,6 +57,15 @@ pub fn syscallModeAvailable() bool {
     return syscalls.available();
 }
 
+/// Whether system-call mode can run threads here: code under test that
+/// calls `pthread_create` or `std.Thread.spawn`. It needs, beside
+/// `syscallModeAvailable`, a processor and a kernel that let user code set
+/// the thread pointer (FSGSBASE: 2012 and Linux 5.9). Where it is false,
+/// starting a thread is a stray call.
+pub fn syscallThreadsAvailable() bool {
+    return syscalls.threadsAvailable();
+}
+
 /// The seed of the first run of the latest `check` whose crash dropped a
 /// task inside a system call in system-call mode, if any. A C library's
 /// state outlives runs: later runs may inherit a lock or state that run

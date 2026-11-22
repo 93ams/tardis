@@ -236,3 +236,72 @@ test "sqlite: two tasks, two databases, SQLite's own mutexes between them" {
     if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
     try tardis.check(testing.allocator, twoTasks, options);
 }
+
+// --- real threads (revision 97) ----------------------------------------------------
+//
+// `pthread_create` is a `clone`, which system-call mode turns into a
+// simulated task with its own stack and thread pointer
+// (`src/sim/systhread.zig`). A thread may make system calls, as SQLite
+// does; it may not use `env.io`.
+
+const Pthread = ?*anyopaque;
+extern fn pthread_create(thread: *Pthread, attr: ?*const anyopaque, start: *const fn (?*anyopaque) callconv(.c) ?*anyopaque, arg: ?*anyopaque) c_int;
+extern fn pthread_join(thread: Pthread, result: ?*?*anyopaque) c_int;
+
+fn databaseThread(arg: ?*anyopaque) callconv(.c) ?*anyopaque {
+    const path: [*:0]const u8 = @ptrCast(arg.?);
+    ownDatabase(path) catch return @ptrFromInt(1);
+    return null;
+}
+
+fn twoThreads(env: *Env) !void {
+    _ = env;
+    sqlite3_randomness(0, null);
+    var threads: [2]Pthread = undefined;
+    const paths = [2][*:0]const u8{ "a.db", "b.db" };
+    for (&threads, paths) |*t, path| try testing.expectEqual(@as(c_int, 0), pthread_create(t, null, databaseThread, @constCast(path)));
+    for (threads) |t| {
+        var result: ?*anyopaque = null;
+        try testing.expectEqual(@as(c_int, 0), pthread_join(t, &result));
+        try testing.expect(result == null);
+    }
+}
+
+test "sqlite: two pthreads, a database each" {
+    if (!supported or !tardis.syscallModeAvailable() or !tardis.syscallThreadsAvailable()) return error.SkipZigTest;
+    try tardis.check(testing.allocator, twoThreads, options);
+}
+
+/// Ten rows through a connection another thread is using too. SQLite's
+/// connection mutex is recursive, and its owner is the thread: with real
+/// threads it keeps the second one out, which two tasks on one thread
+/// could not have.
+fn insertingThread(arg: ?*anyopaque) callconv(.c) ?*anyopaque {
+    const db: *Db = @ptrCast(arg.?);
+    for (0..10) |_| exec(db, "INSERT INTO log(v) VALUES('x')") catch return @ptrFromInt(1);
+    return null;
+}
+
+fn sharedConnection(env: *Env) !void {
+    _ = env;
+    sqlite3_randomness(0, null);
+    const db = try open();
+    defer _ = sqlite3_close(db);
+    try exec(db, "CREATE TABLE log(k INTEGER PRIMARY KEY, v TEXT)");
+    var threads: [2]Pthread = undefined;
+    for (&threads) |*t| try testing.expectEqual(@as(c_int, 0), pthread_create(t, null, insertingThread, db));
+    for (threads) |t| {
+        var result: ?*anyopaque = null;
+        try testing.expectEqual(@as(c_int, 0), pthread_join(t, &result));
+        try testing.expect(result == null);
+    }
+    const n = try query(db, "SELECT count(*) FROM log");
+    try testing.expectEqualStrings("20", n.text());
+    const integrity = try query(db, "PRAGMA integrity_check");
+    try testing.expectEqualStrings("ok", integrity.text());
+}
+
+test "sqlite: two pthreads share one connection" {
+    if (!supported or !tardis.syscallModeAvailable() or !tardis.syscallThreadsAvailable()) return error.SkipZigTest;
+    try tardis.check(testing.allocator, sharedConnection, options);
+}

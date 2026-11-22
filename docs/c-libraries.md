@@ -9,7 +9,7 @@ another library.
 
 The README's ["Choosing a mode"](../README.md#choosing-a-mode) has the
 table of what the mode simulates. Read its list of limits first: if the
-library needs `mmap` of a file, `epoll`, pipes or real threads, stop there.
+library needs `mmap` of a file, `select` or `fork`, stop there.
 
 ## 1. Build the library into the test
 
@@ -101,13 +101,32 @@ The cure is the library's own reset, first thing in the body
 `NonDeterministic` for a C library, look for state of this kind: a
 generator, a cache, a counter, a table filled on first use.
 
-## 5. Several tasks
+## 5. Several tasks, and threads
 
 A C library's locks work between tasks: a wait for a `pthread` mutex is a
-`futex` call, which blocks the task and not the thread. Two tasks can each
-drive their own database.
+`futex` call, which blocks the task and not the thread.
 
-Every task runs on one thread, though, and that sets three limits:
+There are two ways to run the library from more than one place at once.
+
+**Threads the code starts itself** (`pthread_create`, or `std.Thread.spawn`
+in the test) are the faithful way. Each becomes a simulated task with its
+own stack and its own thread pointer, so `errno`, thread-local storage and
+the owner of a recursive mutex are per thread, as on a real machine. Two
+`pthread`s may share one SQLite connection. Skip the test where
+`tardis.syscallThreadsAvailable()` is false. What to know:
+
+- A thread may make system calls. It may not use `env.io` or `env.dir`.
+- Threads switch only at system calls. One that waits for another by
+  spinning on memory, with no system call in the loop, hangs the run, and
+  nothing reports it.
+- A thread's calls are answered on the thread's own stack. If the library
+  makes threads with small stacks (musl's default is 128 KiB), give them
+  more.
+- A thread still running when the body returns is a leaked task: join
+  them.
+
+**Tasks made with `env.io.concurrent`** all run under the test's one
+thread identity, and that sets two limits:
 
 - A **recursive mutex** belongs to the thread, so it does not keep a second
   task out. Do not share one SQLite connection between tasks, or anything
@@ -115,6 +134,9 @@ Every task runs on one thread, though, and that sets three limits:
 - **Thread-local storage** is shared by every task, `errno` included. A
   task must read `errno` before it makes another call that can let other
   tasks run.
+
+Either way:
+
 - A task **dropped inside a library call**, by a crash or because the run
   ended, may leave the library's lock held or its state half changed, for
   the rest of the process. The run prints that it happened, with its seed,
@@ -140,12 +162,13 @@ What to do depends on the call:
 
 ## What has been run
 
-One library: SQLite 3.46.0, `zig build test-sqlite -Dsqlite`, four tests.
+One library: SQLite 3.46.0, `zig build test-sqlite -Dsqlite`, six tests.
 With `synchronous=OFF` an acknowledged commit is lost to a power loss, and
 the failure shrinks from 75 decisions to 1. With `EXTRA` it is kept. With
 `FULL`, SQLite's default, it is lost too, which is SQLite's documented
 behaviour and was then reproduced on a real ext4 (`docs/power-cut.md`).
-Two tasks with a database each pass.
+Two tasks with a database each pass, as do two `pthread`s with a database
+each and two sharing one connection.
 
 No library that uses the network has been run this way; the socket
 emulation is tested with system calls written for the test.

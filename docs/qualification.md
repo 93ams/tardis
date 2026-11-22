@@ -66,15 +66,21 @@ ran, no run broke a property the test stated. It does not mean more.
   `Options.mode = .syscalls` (revision 75) answers the file, clock, sleep
   and random-byte calls from the simulation; on other platforms nothing
   does either.
-- In system-call mode: every task shares one thread, so a recursive
-  mutex (owned by the thread) does not exclude a second task. Do not share
-  an object behind a recursive lock (a SQLite connection) between tasks.
+- In system-call mode: tasks made through `std.Io` share one thread
+  identity, so a recursive mutex (owned by the thread) does not exclude a
+  second task. Do not share an object behind a recursive lock (a SQLite
+  connection) between tasks. Threads the code starts itself are tasks with
+  their own thread pointer (revision 97) and do not have this limit, but
+  they switch only at system calls: a thread spinning on memory hangs the
+  run unreported, and data races between threads are not explored. A
+  thread may not use `std.Io`.
   A crash or the end of a run that drops a task holding a C library's
   mutex leaves it held, into the next run (C statics are the process's).
 - In system-call mode: clock reads through the vDSO are answered from
   the simulation (revision 78); a thread inside the vDSO when a run
-  begins makes that run fail with `StraySyscall`. `select`, `epoll`, pipes, `mmap` of a file,
-  `dup` and `poll` are not emulated (each fails the run). Owners,
+  begins makes that run fail with `StraySyscall`. `select`, `mmap` of a file,
+  `dup` and `fork` are not emulated (each fails the run). Edge-triggered
+  `epoll` reports more edges than Linux (revision 97). Owners,
   permission bits and record locks are not modelled. State a library keeps
   for the life of the process is carried from one run to the next.
 - Shared memory between tasks, except through `tardis.atomic.Value`.

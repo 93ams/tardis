@@ -36,7 +36,8 @@
 //! details follow Linux as a differential test found them
 //! (`src/tests/sysnet_diff_test.zig`).
 //!
-//! Not emulated (stray): `select`, `pselect6` and `epoll`; `sendmsg`, `recvmsg`, `MSG_PEEK`,
+//! `epoll` is in `sysfd.zig`. Not emulated (stray): `select` and
+//! `pselect6`; `sendmsg`, `recvmsg`, `MSG_PEEK`,
 //! `MSG_OOB`, `MSG_WAITALL`; a datagram `writev` of more than one vector;
 //! Unix-domain and other families. A stream `bind` reserves its port, as
 //! the kernel's does, and `listen` or `connect` after it use that port.
@@ -47,6 +48,7 @@ const ionet = Io.net;
 const linux = std.os.linux;
 const Sim = @import("Sim.zig");
 const net_mod = @import("../model/net.zig");
+const sysfd = @import("sysfd.zig");
 
 const E = linux.E;
 
@@ -289,6 +291,11 @@ pub fn emulate(s: *Sim, number: u64, a: *const [6]u64) ?u64 {
         54 => 0, // setsockopt: accepted, changes nothing
         55 => getsockopt(s, slot, a[1], a[2], a[3], a[4]),
         72 => fcntl(slot, @truncate(a[1]), a[2]),
+        // ioctl: FIONBIO, as `fcntl`'s O_NONBLOCK (Rust's `set_nonblocking`).
+        16 => if (@as(u32, @truncate(a[1])) != 0x5421) null else if (a[2] == 0) fail(.FAULT) else blk: {
+            slot.nonblock = @as(*align(1) const i32, @ptrFromInt(a[2])).* != 0;
+            break :blk 0;
+        },
         else => null,
     };
 }
@@ -849,6 +856,9 @@ fn close(s: *Sim, fd: i32) u64 {
         else => {},
     }
     slot.* = .{};
+    // It leaves every epoll set, and a waiter there looks again.
+    sysfd.forget(fd);
+    s.wakeNetwork();
     return 0;
 }
 

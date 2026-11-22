@@ -195,7 +195,7 @@ with `Options.mode`.
 |---|---|---|
 | The code does its I/O through | `std.Io` (`env.io`, `env.dir`) | its own system calls: `std.os.linux`, `std.posix`, a C library |
 | Platforms | every one TARDIS runs on | Linux on x86_64, kernel 5.11 or later |
-| What is simulated | everything `std.Io` offers: files, the network, the clock, tasks | files, clock reads, sleeping and random bytes (the list is at the top of `src/sim/sysemu.zig`) |
+| What is simulated | everything `std.Io` offers: files, the network, the clock, tasks | files, IPv4 sockets, pipes, `eventfd`, `poll` and `epoll`, clock reads, sleeping, random bytes, and threads (the lists are at the top of `src/sim/sysemu.zig`, `sysnet.zig`, `sysfd.zig` and `systhread.zig`) |
 | A call outside that | cannot be made through `env.io` | fails the run with `error.StraySyscall`, naming the call |
 
 Use `.std_io` when the code takes an `Io`: it is the complete simulation,
@@ -209,11 +209,19 @@ and `env.crashAndReboot` treats both alike.
 try tardis.check(gpa, body, .{ .mode = .syscalls });
 ```
 
-A C library's locks work across tasks: its `futex` waits block the task,
-not the thread, so two tasks may each drive their own SQLite database. One
-limit to know: every task runs on one thread, so a recursive mutex (whose
-owner is the thread) does not keep a second task out. Do not share one
-SQLite connection, or anything else behind a recursive lock, between tasks.
+A thread the code under test starts (`pthread_create`, `std.Thread.spawn`)
+becomes a simulated task with its own stack and thread pointer, scheduled
+by the seed: two `pthread`s may share one SQLite connection. It needs a
+processor and kernel with FSGSBASE (2012, Linux 5.9);
+`tardis.syscallThreadsAvailable()` says. A thread may make system calls
+and may not use `env.io`. Threads switch only at system calls, so one that
+spins on memory waiting for another hangs the run.
+
+A C library's locks work across tasks too: its `futex` waits block the
+task, not the thread. But tasks made with `env.io.concurrent` share the
+test's one thread identity, so a recursive mutex (whose owner is the
+thread) does not keep a second such task out. Share an object behind a
+recursive lock between threads, not between tasks.
 
 `examples/syscall_rename.zig` is a planted bug in a program that only
 makes system calls; `test/sqlite.zig` runs SQLite, built as it ships, and
@@ -222,8 +230,13 @@ allows that (`zig build test-sqlite -Dsqlite`).
 
 What to know before relying on it:
 
-- IPv4 sockets are emulated, blocking and non-blocking, with `poll`;
-  `select`, `epoll`, pipes, `mmap` of a file and `dup` are stray calls.
+- IPv4 sockets are emulated, blocking and non-blocking, with pipes,
+  `eventfd`, `poll` and `epoll`. `select`, `mmap` of a file, `dup` and
+  `fork` are stray calls. Simulated descriptor numbers are large, so a
+  library that indexes a table by descriptor (libuv, libevent) will not
+  work.
+- Edge-triggered `epoll` reports every edge Linux does and some it does
+  not: a program that fails to drain a descriptor is not caught.
 - Clock reads that libc answers through the vDSO are answered from the
   simulation too, by making the vDSO's code fault during a run.
 - A task dropped (by a crash, or the end of a run) inside a C library
