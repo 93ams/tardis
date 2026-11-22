@@ -49,6 +49,13 @@ pub const Persona = enum {
     pub fn normalizationInsensitive(p: Persona) bool {
         return p == .macos_apfs;
     }
+    /// `rename` of something that is not a directory onto a directory:
+    /// the BSD kernels (XNU, FreeBSD) compare the two kinds first and
+    /// answer `IsDir`; Linux first finds that the destination holds the
+    /// source and answers `DirNotEmpty`.
+    pub fn renameComparesKindsFirst(p: Persona) bool {
+        return p == .macos_apfs or p == .freebsd_zfs;
+    }
     pub fn backslashSeparator(p: Persona) bool {
         return p == .windows_ntfs;
     }
@@ -1105,10 +1112,11 @@ pub const Vfs = struct {
             // names stay. Found by the differential test.
             if (victim == ino and !v.persona.win32Names()) return;
             const vkind = v.inodes[victim].kind;
-            // Onto a directory the source lives under: POSIX kernels find
-            // that before they compare kinds, and call it not empty. Found
-            // by the differential test (`diff_fs_test.zig`).
-            if (!v.persona.win32Names() and vkind == .dir and v.isAncestor(victim, src.parent)) return error.DirNotEmpty;
+            // Onto a directory the source lives under: Linux finds that
+            // before it compares kinds, and calls it not empty; the BSD
+            // kernels compare kinds first. Both found by the differential
+            // test (`diff_fs_test.zig`), on Linux and on APFS.
+            if (!v.persona.win32Names() and !(v.persona.renameComparesKindsFirst() and kind != .dir) and vkind == .dir and v.isAncestor(victim, src.parent)) return error.DirNotEmpty;
             // Anything that is not a directory, a symbolic link included.
             if (kind != .dir and vkind == .dir) return error.IsDir;
             // A directory replaces only a directory: not a file, and on
@@ -2050,6 +2058,24 @@ test "paths, dirs, errors" {
     try v.rename(root_inode, "a/b/c/f", root_inode, "top");
     try v.deleteDir(root_inode, "a/b/c");
     try testing.expectError(error.FileNotFound, v.lookup(root_inode, "a/b/c"));
+}
+
+test "rename onto the directory the source is in: Linux says not empty, the BSD kernels compare kinds first" {
+    for ([_]Persona{ .linux_ext4, .linux_xfs, .posix_strict, .macos_apfs, .freebsd_zfs, .windows_ntfs }) |persona| {
+        var v = try testVfs(persona);
+        defer v.deinit();
+        _ = try v.makePath(root_inode, "d/sub");
+        _ = try v.createFile(root_inode, "d/f", .{});
+        _ = try v.createFile(root_inode, "d/sub/deep", .{});
+        try v.symLink(root_inode, "nowhere", "d/l");
+        // Windows compares kinds first as well, as it did before.
+        const want: Error = if (persona.renameComparesKindsFirst() or persona.win32Names()) error.IsDir else error.DirNotEmpty;
+        try testing.expectError(want, v.rename(root_inode, "d/f", root_inode, "d"));
+        try testing.expectError(want, v.rename(root_inode, "d/l", root_inode, "d"));
+        try testing.expectError(want, v.rename(root_inode, "d/sub/deep", root_inode, "d"));
+        // A directory onto the directory it is in: not empty, everywhere.
+        try testing.expectError(error.DirNotEmpty, v.rename(root_inode, "d/sub", root_inode, "d"));
+    }
 }
 
 test "setLength shrink then grow reads zeros" {

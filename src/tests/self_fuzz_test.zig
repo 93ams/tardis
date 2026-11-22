@@ -55,6 +55,10 @@ fn sideTask(io: Io, dir: Io.Dir, which: u8, fill: u8) Io.Cancelable!void {
     dir.deleteFile(io, name) catch {};
 }
 
+/// For the test of the oracle itself: the durable step leaves out the
+/// sync of the directory.
+var planted_no_dir_sync = false;
+
 fn body(env: *Env) !void {
     const io = env.io;
     const dir = env.dir;
@@ -124,7 +128,7 @@ fn body(env: *Env) !void {
                     f.writePositionalAll(io, &keep, 0) catch continue;
                     f.sync(io) catch continue;
                 }
-                syncDir(io, dir) catch continue;
+                if (!planted_no_dir_sync) syncDir(io, dir) catch continue;
                 crashes += 1;
                 try env.crashAndReboot(.power_loss);
                 // The campaign fails if no run ever gets this far.
@@ -156,4 +160,103 @@ test "self-fuzz: the same programs on four workers" {
         .workers = 4,
         .faults = .{ .io_error_ppm = 20_000 },
     });
+}
+
+test "fuzz oracles (files): without the directory's sync the durable step fails on strict POSIX" {
+    // The planted bug: the same programs, with the one line that makes
+    // the file's name durable left out.
+    planted_no_dir_sync = true;
+    defer planted_no_dir_sync = false;
+    try testing.expectError(error.AssertionFailed, tardis.check(testing.allocator, body, .{
+        .iterations = 300,
+        .personas = &.{.posix_strict},
+        .faults = .{ .io_error_ppm = 20_000, .oom_ppm = 5_000 },
+        .report = false,
+        .shrink = false,
+    }));
+}
+
+/// The sum, over the runs of a campaign, of a hash of what each run
+/// observed: the same for the same runs in any order.
+var observed_sum: std.atomic.Value(u64) = .init(0);
+
+fn setup(env: *Env) !void {
+    try env.dir.writeFile(env.io, .{ .sub_path = "a", .data = "from setup" });
+    try env.dir.createDir(env.io, "d", .default_dir);
+    try env.dir.writeFile(env.io, .{ .sub_path = "d/x", .data = "nested" });
+    try syncDir(env.io, env.dir);
+}
+
+/// The random program, then everything the run can see afterwards: each
+/// name's content or error, and the clock.
+fn observing(env: *Env) !void {
+    try body(env);
+    var h = std.hash.Wyhash.init(0);
+    for (names) |name| {
+        var buf: [128]u8 = undefined;
+        if (env.dir.readFile(env.io, name, &buf)) |bytes| {
+            h.update(bytes);
+        } else |err| {
+            if (err == error.Canceled) return error.Canceled;
+            h.update(@errorName(err));
+        }
+        h.update(&.{0xFF});
+    }
+    h.update(std.mem.asBytes(&env.nowNs()));
+    h.update(std.mem.asBytes(&env.crashCount()));
+    _ = observed_sum.fetchAdd(h.final(), .monotonic);
+}
+
+fn observe(o: tardis.Options) !u64 {
+    observed_sum.store(0, .monotonic);
+    try tardis.check(testing.allocator, observing, o);
+    return observed_sum.load(.monotonic);
+}
+
+test "simulator agreement: the same runs cold and warm, on one worker and on four" {
+    // Each configuration runs the same seeds; a run that saw anything
+    // else in any of them changes the sum. Not when the environment
+    // changes which runs a check makes, or keeps runs between checks.
+    for ([_][]const u8{ "TARDIS_EXPLORE", "TARDIS_PRESET", "TARDIS_SEED", "TARDIS_REPLAY", "TARDIS_CORPUS_DIR" }) |name| {
+        if (testing.environ.getAlloc(testing.allocator, name)) |value| {
+            testing.allocator.free(value);
+            return error.SkipZigTest;
+        } else |_| {}
+    }
+    const base: tardis.Options = .{
+        .iterations = 200,
+        .personas = &.{ .linux_ext4, .windows_ntfs, .posix_strict },
+        .setup = setup,
+        .warm_restore = false,
+        .determinism_check_every = 0,
+        .explore = .random,
+        .faults = .{ .io_error_ppm = 20_000 },
+    };
+    const want = try observe(base);
+    try testing.expect(want != 0);
+    var four = base;
+    four.workers = 4;
+    try testing.expectEqual(want, try observe(four));
+    // The sum does tell runs apart: other seeds give another.
+    var other = base;
+    other.campaign_seed = 12345;
+    try testing.expect(want != try observe(other));
+
+    // Warm starts need the same persona twice in a row, so one persona.
+    var cold = base;
+    cold.personas = &.{.posix_strict};
+    cold.iterations = 400;
+    var report: tardis.WarmReport = .{};
+    var warm = cold;
+    warm.warm_restore = true;
+    warm.warm_report = &report;
+    const cold_sum = try observe(cold);
+    try testing.expectEqual(cold_sum, try observe(warm));
+    // The security layer on every check turns warm starts off.
+    if (!tardis.security_by_default) try testing.expect(report.restores > 300 and report.mismatches == 0);
+    // On four workers the report says nothing (it is the calling
+    // thread's): the same sum, whether or not the workers started warm.
+    var warm_four = warm;
+    warm_four.workers = 4;
+    try testing.expectEqual(cold_sum, try observe(warm_four));
 }

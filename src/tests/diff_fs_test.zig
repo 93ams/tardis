@@ -218,6 +218,20 @@ fn body(env: *Env) !void {
         // INVALID_PARAMETER, which Zig's std treats as a bug in the
         // caller and panics on. Not generated.
         if (op.kind == .rename and std.mem.startsWith(u8, names[op.other], names[op.name]) and names[op.other].len > names[op.name].len) continue;
+        // Something that exists, moved to under something that is not a
+        // directory: the CI's Windows runner (Server 2025; whether it is
+        // the system or the volume is not known) answers the same
+        // INVALID_PARAMETER and std panics, where Windows 11 here gives
+        // an error the model agrees with. Not generated on Windows. The
+        // model says what is there: the two agree up to here.
+        if (builtin.os.tag == .windows and op.kind == .rename) {
+            if (std.mem.indexOfScalar(u8, names[op.other], '/')) |slash| {
+                const source_exists = if (env.dir.access(env.io, names[op.name], .{})) |_| true else |_| false;
+                if (env.dir.statFile(env.io, names[op.other][0..slash], .{})) |st| {
+                    if (source_exists and st.kind != .directory) continue;
+                } else |_| {}
+            }
+        }
         // Zig's std does not make hard links on Windows (it answers
         // OperationUnsupported); the model's NTFS does, as NTFS does.
         // On POSIX a symbolic link can make the destination's directory an

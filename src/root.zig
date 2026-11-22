@@ -239,7 +239,11 @@ pub const Options = struct {
     /// start later iterations from it instead of running setup again, when
     /// setup left only files, clock steps, host names and time passed
     /// (`Sim.Warm`). The iterations are the same either way; false runs
-    /// setup every time.
+    /// setup every time. A snapshot is of one persona, and a campaign
+    /// takes its personas in turn at each iteration: with more than one
+    /// persona only the second run of a determinism check starts warm.
+    /// No run starts warm under guided exploration, chaos or a security
+    /// layer.
     warm_restore: bool = true,
     warm_report: ?*WarmReport = null,
     /// Fail a run with `error.StraySyscall` when its code makes a real
@@ -3177,6 +3181,7 @@ test {
     _ = @import("tests/tsc_test.zig");
     _ = @import("tests/diff_fs_test.zig");
     _ = @import("tests/self_fuzz_test.zig");
+    _ = @import("tests/self_fuzz_net_test.zig");
     _ = @import("tests/corpus_test.zig");
     _ = @import("tests/diff_net_test.zig");
     _ = syscalls;
