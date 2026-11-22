@@ -88,7 +88,8 @@ for round in $(seq 1 "$rounds"); do
   rm -f "$mnt/b"; sync "$mnt"
 
   # 3. Unlink, then fsync of another file that has not changed. The
-  # model takes the fsync of any file to commit every pending change.
+  # model took the fsync of any file to commit every pending change
+  # (until revision 96).
   echo data > "$mnt/c"; echo other > "$mnt/unrelated"; sync
   rm "$mnt/c"; sync "$mnt/unrelated"
   power_cut
@@ -103,6 +104,63 @@ for round in $(seq 1 "$rounds"); do
   [ -e "$mnt/d" ] && r=back || r=gone
   echo "round $round: unlink, then a write to another file and its fsync: the file is $r"
   rm -f "$mnt/d" "$mnt/written"; sync "$mnt"
+
+  # 4a. As 4, with the write before the unlink: the other file has data
+  # waiting when the unlink is made.
+  echo data > "$mnt/e"; echo other > "$mnt/waiting"; sync
+  echo more >> "$mnt/waiting"; rm "$mnt/e"; sync "$mnt/waiting"
+  power_cut
+  [ -e "$mnt/e" ] && r=back || r=gone
+  echo "round $round: a write to another file, unlink, then that file's fsync: the file is $r"
+  rm -f "$mnt/e" "$mnt/waiting"; sync "$mnt"
+
+  # 4b. Unlink, then fsync of another directory in which nothing changed.
+  echo data > "$mnt/f"; mkdir "$mnt/quiet"; sync
+  rm "$mnt/f"; sync "$mnt/quiet"
+  power_cut
+  [ -e "$mnt/f" ] && r=back || r=gone
+  echo "round $round: unlink, then fsync of an unchanged directory: the file is $r"
+  rm -f "$mnt/f"; rmdir "$mnt/quiet"; sync "$mnt"
+
+  # 4c. Unlink, then fsync of a file created just before and never synced.
+  echo data > "$mnt/g"; sync
+  : > "$mnt/fresh"; rm "$mnt/g"; sync "$mnt/fresh"
+  power_cut
+  [ -e "$mnt/g" ] && r=back || r=gone
+  [ -e "$mnt/fresh" ] && n=there || n=gone
+  echo "round $round: a create, unlink, then fsync of the created file: the file is $r, the created file is $n"
+  rm -f "$mnt/g" "$mnt/fresh"; sync "$mnt"
+
+  # 4d. A rename, then fsync of the renamed file, whose data is synced.
+  echo data > "$mnt/h"; sync
+  mv "$mnt/h" "$mnt/h2"; sync "$mnt/h2"
+  power_cut
+  if [ -e "$mnt/h2" ] && [ ! -e "$mnt/h" ]; then r="kept"; elif [ -e "$mnt/h" ] && [ ! -e "$mnt/h2" ]; then r="undone"; else r="mixed"; fi
+  echo "round $round: a rename, then fsync of the renamed file: the rename is $r"
+  rm -f "$mnt/h" "$mnt/h2"; sync "$mnt"
+
+  # 4e. A file overwritten in place, then a commit of everything (another
+  # file's write and fsync), then the unlink, then the overwritten file's
+  # fsync: its data is still waiting, its inode's change is committed.
+  echo data > "$mnt/i"; echo 0123456789 > "$mnt/over"; echo other > "$mnt/carrier"; sync
+  printf XXXX | dd of="$mnt/over" conv=notrunc status=none
+  echo more >> "$mnt/carrier"; sync "$mnt/carrier"
+  rm "$mnt/i"; sync "$mnt/over"
+  power_cut
+  [ -e "$mnt/i" ] && r=back || r=gone
+  echo "round $round: an overwrite in place, a commit, unlink, then the overwritten file's fsync: the file is $r, the overwritten file holds $(head -c 4 "$mnt/over")"
+  rm -f "$mnt/i" "$mnt/over" "$mnt/carrier"; sync "$mnt"
+
+  # 4f. The same with an append in place of the overwrite: the file's new
+  # length is not on disk until its own fsync.
+  echo data > "$mnt/j"; echo 0123456789 > "$mnt/grown"; echo other > "$mnt/carrier"; sync
+  echo more >> "$mnt/grown"
+  echo more >> "$mnt/carrier"; sync "$mnt/carrier"
+  rm "$mnt/j"; sync "$mnt/grown"
+  power_cut
+  [ -e "$mnt/j" ] && r=back || r=gone
+  echo "round $round: an append, a commit, unlink, then the appended file's fsync: the file is $r"
+  rm -f "$mnt/j" "$mnt/grown" "$mnt/carrier"; sync "$mnt"
 
   # 5. SQLite: commit, acknowledgement, power cut, reopen.
   for mode in OFF FULL EXTRA; do

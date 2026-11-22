@@ -61,8 +61,9 @@ test "the acknowledged commit survives a power loss" {
   files. Write through the library and check the bytes through `env.dir`,
   or the other way round.
 - **`posix_strict`.** Include it. It is the persona that assumes least of
-  an `fsync`, and the other personas have promised more than a real ext4
-  gives in one case (`docs/power-cut.md`).
+  an `fsync`, and another persona has already promised more than the real
+  filesystem gives in one case, corrected since (`docs/power-cut.md`,
+  which also lists what `fdatasync` and timed commits still hide).
 
 ## 3. Crash it
 

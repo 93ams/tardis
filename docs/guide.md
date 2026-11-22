@@ -376,8 +376,8 @@ alone.
 
 | Persona | What sets it apart in the model |
 |---|---|
-| `linux_ext4` | a rename over an existing file flushes the new file's data first |
-| `linux_xfs` | it does not: a rename can be durable before the data it names |
+| `linux_ext4` | a rename over an existing file flushes the new file's data first; an `fsync` of a file that has not changed commits no other metadata |
+| `linux_xfs` | no flush on rename: a rename can be durable before the data it names; an `fsync` of a file or directory that has not changed commits no other metadata |
 | `windows_ntfs` | names ignore case, `\` separates, Win32 name rules, an open file cannot be deleted |
 | `macos_apfs` | names ignore case and Unicode normalization; `fsync` is taken to be durable |
 | `freebsd_zfs` | copy-on-write: no torn sectors, and a rename is ordered after the data written before it |
@@ -387,9 +387,10 @@ On every persona but `posix_strict`, the metadata operations lost in a
 power cut are the most recent ones. These rules are the functions of
 `Persona` in `src/model/vfs.zig`.
 
-The personas are models written from documentation. They have not been
-checked against the real filesystems under power loss
-([qualification.md](qualification.md) says what has been checked). Run
+The personas are models written from documentation. One rule of
+`linux_ext4` has been checked against the real filesystem under power
+loss, and corrected by it ([power-cut.md](power-cut.md)); the rest has
+not ([qualification.md](qualification.md) says what has been checked). Run
 `posix_strict` when you want the harshest reading, and several personas
 when the code must be portable:
 

@@ -62,9 +62,26 @@ pub const Persona = enum {
     pub fn sharingViolations(p: Persona) bool {
         return p == .windows_ntfs;
     }
-    /// `fsync` of any file commits the whole metadata journal.
+    /// `fsync` of a file can commit the whole metadata journal: always, or
+    /// under the condition of `syncNeedsOwnChange`.
     pub fn fileSyncCommitsJournal(p: Persona) bool {
         return p != .posix_strict;
+    }
+    /// `fsync` of a file commits the journal only when the file has
+    /// changed since the last commit of the whole journal: a write, a
+    /// change of length, a change to one of its names. An `fsync` of any
+    /// other file commits nothing but that file's data, even data written
+    /// before that commit and still unsynced. Seen on ext4 (`docs/power-cut.md`);
+    /// XFS by its source as remembered, not run.
+    pub fn syncNeedsOwnChange(p: Persona) bool {
+        return p == .linux_ext4 or p == .linux_xfs;
+    }
+    /// The same condition for the `fsync` of a directory, where the change
+    /// is to one of its entries. Not ext4, where a directory's `fsync`
+    /// commits the journal whatever the directory is (seen). XFS by its
+    /// source as remembered, not run.
+    pub fn dirSyncNeedsOwnChange(p: Persona) bool {
+        return p == .linux_xfs;
     }
     /// ext4 `auto_da_alloc`: rename over an existing file flushes the source's data.
     pub fn renameFlushesData(p: Persona) bool {
@@ -130,6 +147,8 @@ pub const Inode = struct {
     journal_refs: u32,
     open_count: u32,
     mtime_ns: u64,
+    /// `Vfs.commit_seq` when the inode last changed (`Vfs.touch`).
+    touch_seq: u64 = 0,
 };
 
 const Dentry = struct {
@@ -197,6 +216,8 @@ pub const Vfs = struct {
     persona: Persona,
     now_ns: u64,
     epoch: u16,
+    /// Counts commits of the whole journal (see `Inode.touch_seq`).
+    commit_seq: u64,
     /// Pages written to media by fsync, rename flushes and crashes (cost ledger).
     flushed_pages: u64 = 0,
 
@@ -244,6 +265,7 @@ pub const Vfs = struct {
         v.persona = persona;
         v.now_ns = 0;
         v.epoch = 0;
+        v.commit_seq = 1;
         v.chunks = try gpa.alloc(?[*]align(page_bytes) u8, (limits.pages_max + chunk_pages - 1) / chunk_pages);
         errdefer gpa.free(v.chunks);
         @memset(v.chunks, null);
@@ -296,6 +318,7 @@ pub const Vfs = struct {
         v.persona = persona;
         v.now_ns = 0;
         v.epoch = 1; // handle values must be identical across runs of a seed
+        v.commit_seq = 1;
         v.flushed_pages = 0;
         @memset(v.page_refs[0..v.page_hwm], 0);
         @memset(v.pageData(0), 0); // page 0: the shared zero page
@@ -414,6 +437,7 @@ pub const Vfs = struct {
         persona: Persona,
         now_ns: u64,
         epoch: u16,
+        commit_seq: u64,
         flushed_pages: u64,
         free_pages_len: u32,
         page_hwm: u32,
@@ -501,6 +525,7 @@ pub const Vfs = struct {
             .persona = v.persona,
             .now_ns = v.now_ns,
             .epoch = v.epoch,
+            .commit_seq = v.commit_seq,
             .flushed_pages = v.flushed_pages,
             .free_pages_len = v.free_pages_len,
             .page_hwm = v.page_hwm,
@@ -553,7 +578,7 @@ pub const Vfs = struct {
     /// True if the filesystem's tables are those of `sn` (before pinning):
     /// what a re-run of the same deterministic setup must give.
     pub fn matches(v: *const Vfs, sn: *const Snapshot) bool {
-        return v.persona == sn.persona and v.now_ns == sn.now_ns and v.epoch == sn.epoch and
+        return v.persona == sn.persona and v.now_ns == sn.now_ns and v.epoch == sn.epoch and v.commit_seq == sn.commit_seq and
             v.flushed_pages == sn.flushed_pages and v.free_pages_len == sn.free_pages_len and
             v.cur_hwm == sn.cur_hwm and v.dur_hwm == sn.dur_hwm and v.inode_hwm == sn.inode_hwm and
             v.journal_len == sn.journal_len and
@@ -571,6 +596,7 @@ pub const Vfs = struct {
         v.persona = sn.persona;
         v.now_ns = sn.now_ns;
         v.epoch = sn.epoch;
+        v.commit_seq = sn.commit_seq;
         v.flushed_pages = sn.flushed_pages;
         // A reset filesystem has taken no page, and one compared with the
         // snapshot has taken the same ones: nothing above the snapshot's
@@ -865,6 +891,14 @@ pub const Vfs = struct {
         v.journal[v.journal_len] = op;
         v.journal_len += 1;
         v.inodes[op.inode].journal_refs += 1;
+        v.touch(op.inode);
+        v.touch(op.parent);
+        v.touch(op.parent2);
+    }
+
+    /// `ino` has changed since the last commit of the whole journal.
+    fn touch(v: *Vfs, ino: InodeId) void {
+        v.inodes[ino].touch_seq = v.commit_seq;
     }
 
     fn makeOp(kind: OpKind, ino: InodeId, parent: InodeId, name: []const u8, parent2: InodeId, name2: []const u8, replaced: bool) JournalOp {
@@ -938,6 +972,8 @@ pub const Vfs = struct {
     /// Applies the first `n` journal ops to the durable namespace.
     fn commitJournal(v: *Vfs, n: u32) void {
         assert(n <= v.journal_len);
+        // A commit of everything: no inode has a change waiting after it.
+        if (n == v.journal_len) v.commit_seq += 1;
         var k: u32 = 0;
         while (k < n) : (k += 1) {
             v.applyOp(&v.journal[k]);
@@ -1160,6 +1196,7 @@ pub const Vfs = struct {
             if (v.persona.sharingViolations() and v.inodes[victim].open_count > 0) return error.FileBusy;
             v.cur_dentries[dst_idx].used = false;
             v.inodes[victim].cur_links -= 1;
+            v.touch(victim);
             replaced = true;
             // The victim may be freed only after the journal op is appended,
             // because the op does not reference it (it is still dur-linked).
@@ -1217,6 +1254,7 @@ pub const Vfs = struct {
         const i = &v.inodes[ino];
         i.cur_len_bytes = @max(i.cur_len_bytes, offset + done);
         i.mtime_ns = v.now_ns;
+        v.touch(ino);
         return done;
     }
 
@@ -1240,6 +1278,7 @@ pub const Vfs = struct {
         }
         i.cur_len_bytes = len_bytes;
         i.mtime_ns = v.now_ns;
+        v.touch(ino);
     }
 
     /// Makes `ino`'s data durable (no metadata).
@@ -1261,9 +1300,14 @@ pub const Vfs = struct {
     /// `fsync`. Commits data, and metadata according to the persona.
     pub fn sync(v: *Vfs, ino: InodeId) void {
         const i = &v.inodes[ino];
+        // Its own change is waiting: made since the last commit of
+        // everything. Data written before that commit does not count,
+        // though this `fsync` is what writes it.
+        const changed = i.touch_seq == v.commit_seq;
+        const own = changed or if (i.kind == .dir) !v.persona.dirSyncNeedsOwnChange() else !v.persona.syncNeedsOwnChange();
         if (i.kind == .file) v.syncData(ino);
         if (v.persona.fileSyncCommitsJournal()) {
-            v.commitJournal(v.journal_len);
+            if (own) v.commitJournal(v.journal_len);
             return;
         }
         if (i.kind != .dir) return;
@@ -1437,6 +1481,7 @@ pub const Vfs = struct {
         // 3. Rebuild the volatile namespace from the durable one and collect orphans.
         report.inodes_orphaned = v.rebuildFromDurable();
         v.epoch +%= 1;
+        v.commit_seq += 1;
         return report;
     }
 
@@ -1957,6 +2002,133 @@ test "posix_strict: file fsync does not persist the directory entry" {
         v.sync(root_inode);
         _ = v.crash(.power_loss, &d, true, true);
         _ = try v.lookup(root_inode, "f");
+    }
+}
+
+test "fsync of a file commits a waiting unlink only if the file changed since the last commit (ext4, XFS)" {
+    // The rows of `docs/power-cut.md`, as measured on ext4.
+    const Row = enum {
+        unchanged_file,
+        written_after,
+        written_before,
+        unchanged_dir,
+        created_before,
+        overwritten_before_a_commit,
+        appended_before_a_commit,
+        replaced_by_a_rename,
+        none,
+    };
+    for ([_]Persona{ .linux_ext4, .linux_xfs, .windows_ntfs, .macos_apfs, .freebsd_zfs }) |persona| {
+        for (std.enums.values(Row)) |row| {
+            // What the measured ext4 does; XFS differs for a directory.
+            const commits = switch (row) {
+                .none => false,
+                .unchanged_file, .overwritten_before_a_commit, .appended_before_a_commit => !persona.syncNeedsOwnChange(),
+                .unchanged_dir => !persona.dirSyncNeedsOwnChange(),
+                .written_after, .written_before, .created_before, .replaced_by_a_rename => true,
+            };
+            var back = false;
+            var seed: u64 = 0;
+            while (seed < 32) : (seed += 1) {
+                var v = try testVfs(persona);
+                defer v.deinit();
+                var d = decide.Decider.init(seed);
+                const a = try v.createFile(root_inode, "a", .{});
+                _ = try v.write(a, 0, "data");
+                const other = try v.createFile(root_inode, "other", .{});
+                _ = try v.write(other, 0, "other");
+                const carrier = try v.createFile(root_inode, "carrier", .{});
+                const quiet = try v.makeDir(root_inode, "quiet");
+                v.sync(a);
+                v.sync(other);
+                v.sync(root_inode);
+                try testing.expectEqual(@as(u32, 0), v.journalPending());
+                switch (row) {
+                    .unchanged_file => {
+                        try v.deleteFile(root_inode, "a");
+                        v.sync(other);
+                    },
+                    .written_after => {
+                        try v.deleteFile(root_inode, "a");
+                        _ = try v.write(other, 5, "more");
+                        v.sync(other);
+                    },
+                    .written_before => {
+                        _ = try v.write(other, 5, "more");
+                        try v.deleteFile(root_inode, "a");
+                        v.sync(other);
+                    },
+                    .unchanged_dir => {
+                        try v.deleteFile(root_inode, "a");
+                        v.sync(quiet);
+                    },
+                    .created_before => {
+                        const fresh = try v.createFile(root_inode, "fresh", .{});
+                        try v.deleteFile(root_inode, "a");
+                        v.sync(fresh);
+                    },
+                    .overwritten_before_a_commit, .appended_before_a_commit => {
+                        _ = try v.write(other, if (row == .appended_before_a_commit) 5 else 0, "XXXX");
+                        _ = try v.write(carrier, 0, "more");
+                        v.sync(carrier);
+                        try v.deleteFile(root_inode, "a");
+                        v.sync(other);
+                        // The data went out with the `fsync` all the same.
+                        try testing.expect(!v.isDirty(other));
+                    },
+                    .replaced_by_a_rename => {
+                        // Another file renamed over it changes its link
+                        // count; a handle keeps it to be synced.
+                        if (persona.sharingViolations()) {
+                            try v.deleteFile(root_inode, "a");
+                            v.sync(root_inode);
+                        } else {
+                            const h = try v.openHandle(other, true, false);
+                            defer v.closeHandle(h);
+                            try v.rename(root_inode, "carrier", root_inode, "other");
+                            try v.deleteFile(root_inode, "a");
+                            v.sync(other);
+                        }
+                    },
+                    .none => try v.deleteFile(root_inode, "a"),
+                }
+                try testing.expectEqual(commits, v.journalPending() == 0);
+                _ = v.crash(.power_loss, &d, true, true);
+                if (v.lookup(root_inode, "a")) |_| {
+                    back = true;
+                } else |_| {}
+                if (row == .created_before) _ = try v.lookup(root_inode, "fresh");
+                try v.checkPageConservation();
+            }
+            // A waiting unlink is undone on some seed, a committed one on none.
+            try testing.expectEqual(!commits, back);
+        }
+    }
+}
+
+test "fsync of a renamed file whose data is synced commits the rename; without it the rename can be undone" {
+    for ([_]Persona{ .linux_ext4, .linux_xfs }) |persona| {
+        for ([_]bool{ true, false }) |synced| {
+            var undone = false;
+            var seed: u64 = 0;
+            while (seed < 32) : (seed += 1) {
+                var v = try testVfs(persona);
+                defer v.deinit();
+                var d = decide.Decider.init(seed);
+                const h = try v.createFile(root_inode, "h", .{});
+                _ = try v.write(h, 0, "data");
+                v.sync(h);
+                v.sync(root_inode);
+                try v.rename(root_inode, "h", root_inode, "h2");
+                if (synced) v.sync(h);
+                _ = v.crash(.power_loss, &d, true, true);
+                const name: []const u8 = if (v.lookup(root_inode, "h2")) |_| "h2" else |_| "h";
+                if (name.len == 1) undone = true;
+                var buf: [8]u8 = undefined;
+                try testing.expectEqualStrings("data", readAll(&v, try v.lookup(root_inode, name), &buf));
+            }
+            try testing.expectEqual(!synced, undone);
+        }
     }
 }
 
