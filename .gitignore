@@ -4,3 +4,6 @@ zig-cache/
 zig-out/
 zig-pkg/
 diff_fs.trace
+
+# cargo, when the Rust crate is built in place
+test/rust/target/

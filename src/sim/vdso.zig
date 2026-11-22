@@ -59,6 +59,8 @@ var looked_up: std.atomic.Value(u8) = .init(0);
 /// Runs that want the protection on. The first protects, the last lifts.
 var users: std.atomic.Value(u32) = .init(0);
 var protect_lock: std.atomic.Value(bool) = .init(false);
+/// The process has a vDSO, whether or not its functions were found.
+var image_present = false;
 /// The protection was lifted early during a run (see the file comment).
 var lifted: std.atomic.Value(bool) = .init(false);
 /// The image is protected right now.
@@ -76,8 +78,11 @@ fn lookUp() void {
         }
     }
     defer looked_up.store(2, .release);
-    const image = linux.getauxval(std.elf.AT.SYSINFO_EHDR);
+    // From libc where there is one: without Zig's startup code,
+    // `std.os.linux.getauxval` has no vector to read, and finds nothing.
+    const image: usize = if (builtin.link_libc) std.c.getauxval(std.elf.AT.SYSINFO_EHDR) else linux.getauxval(std.elf.AT.SYSINFO_EHDR);
     if (image == 0) return;
+    image_present = true;
     const elf = std.elf;
     const eh: *const elf.Ehdr = @ptrFromInt(image);
     // The image's extent, and the address its symbols are relative to
@@ -145,9 +150,17 @@ fn mprotect(prot: u64) bool {
     return @as(i64, @bitCast(syscalls.raw6(10, text_start, text_len, prot, 0, 0, 0))) == 0;
 }
 
+/// The process has a vDSO: if a run could not protect it, clock reads
+/// through it are the host's.
+pub fn present() bool {
+    if (!supported) return false;
+    lookUp();
+    return image_present;
+}
+
 /// A system-call-mode run starts. False if there is no vDSO to protect
-/// (its calls then were never the host's to begin with) or the fault
-/// handler cannot be installed.
+/// (its calls then were never the host's to begin with), or it could not
+/// be protected (`present` tells the two apart).
 pub fn begin() bool {
     if (!supported) return false;
     lookUp();

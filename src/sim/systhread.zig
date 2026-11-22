@@ -189,8 +189,8 @@ pub fn emulate(s: *Sim, number: u64, a: *const [6]u64) ?u64 {
             break :blk 0;
         } else null,
         11 => munmap(s, a[0], a[1]),
-        200 => kill(s, @bitCast(@as(u32, @truncate(a[0]))), a[1]), // tkill
-        234 => kill(s, @bitCast(@as(u32, @truncate(a[1]))), a[2]), // tgkill
+        200 => kill(s, number, @bitCast(@as(u32, @truncate(a[0]))), a[1]), // tkill
+        234 => kill(s, number, @bitCast(@as(u32, @truncate(a[1]))), a[2]), // tgkill
         else => null,
     };
 }
@@ -264,14 +264,25 @@ fn exit(s: *Sim) ?u64 {
 }
 
 /// A signal to a simulated thread. To itself (`abort`, `raise`): raised
-/// on the real thread it runs on, where the handler or the default action
-/// takes it. To another: not emulated. To a number that is not a simulated
+/// on the real thread it runs on, where the default action takes it. A
+/// handler the program installed for it runs inside this call, with the
+/// simulator's thread pointer and its system calls not trapped: a caught
+/// signal a thread sends itself is not emulated faithfully, and nothing
+/// reports it. To another: not emulated. To a number that is not a simulated
 /// thread's: not ours.
-fn kill(s: *Sim, tid: i32, signal: u64) ?u64 {
+fn kill(s: *Sim, number: u64, tid: i32, signal: u64) ?u64 {
+    // Not a simulated thread's number (the thread the run began on has
+    // its real one): the kernel's to answer.
+    if (tid < tid_base) return null;
     const target = for (&threads) |*t| {
         if (t.used and t.tid == tid) break t;
-    } else return if (threadOf(s.current) == null) null else fail(.SRCH);
-    if (target.task != s.current) return fail(.NOSYS);
+    } else return fail(.SRCH);
+    if (target.task != s.current) {
+        // Not emulated, and not to be dropped in silence (`pthread_kill`,
+        // `pthread_cancel`): the run fails.
+        syscalls.noteStray(number);
+        return fail(.NOSYS);
+    }
     const pid = syscalls.raw6(39, 0, 0, 0, 0, 0, 0); // getpid
     const real = syscalls.raw6(186, 0, 0, 0, 0, 0, 0); // gettid
     return syscalls.raw6(234, pid, real, signal, 0, 0, 0);

@@ -226,13 +226,15 @@ recursive lock between threads, not between tasks.
 `examples/syscall_rename.zig` is a planted bug in a program that only
 makes system calls; `test/sqlite.zig` runs SQLite, built as it ships, and
 loses an acknowledged commit to a power loss when its `synchronous` setting
-allows that (`zig build test-sqlite -Dsqlite`).
+allows that (`zig build test-sqlite -Dsqlite`). `test/rust.zig` runs a Rust
+crate the same way: `std::thread`, `std::fs`, sockets, and tokio's two
+runtimes (`zig build test-rust -Drust=<library>`).
 
 What to know before relying on it:
 
 - IPv4 sockets are emulated, blocking and non-blocking, with pipes,
-  `eventfd`, `poll` and `epoll`. `select`, `mmap` of a file, `dup` and
-  `fork` are stray calls. Simulated descriptor numbers are large, so a
+  `eventfd`, `poll` and `epoll`. `select`, `mmap` of a file, `fork`, and
+  `dup` of a socket or a file are stray calls. Simulated descriptor numbers are large, so a
   library that indexes a table by descriptor (libuv, libevent) will not
   work.
 - Edge-triggered `epoll` reports every edge Linux does and some it does

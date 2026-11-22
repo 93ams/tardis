@@ -1088,6 +1088,9 @@ fn runOnce(s: *Sim, comptime body: fn (*Env) anyerror!void, seed: u64, persona: 
     const emulator: ?syscalls.Emulator = if (syscalls.supported and s.config.emulate_syscalls) &sysemu.emulate else null;
     // In system-call mode the vDSO's clocks are answered too (`vdso.zig`).
     const vdso_trapped = emulator != null and tsc.install() and vdso.begin();
+    // There is a vDSO and it is not protected: C code's clock reads would
+    // be the host's, and nothing else would say so.
+    const vdso_open = emulator != null and !vdso_trapped and vdso.present();
     if (emulator != null) sysemu.resetRun();
     const trapping = s.config.trap_syscalls and syscalls.begin(emulator);
     if (s.config.emulate_syscalls and !trapping) {
@@ -1107,6 +1110,10 @@ fn runOnce(s: *Sim, comptime body: fn (*Env) anyerror!void, seed: u64, persona: 
     var result = r.outcome;
     if (vdso_lifted) {
         if (s.config.report) std.debug.print("tardis: the vDSO could not stay trapped (a thread was inside it when the run began, the code read its image, or it called a vDSO function tardis does not answer): the run's later clock reads may have been the host's\n", .{});
+        result = error.StraySyscall;
+    }
+    if (vdso_open) {
+        if (s.config.report) std.debug.print("tardis: the vDSO could not be trapped (its image was found and its functions were not, or it could not be protected): clock reads through it may have been the host's\n", .{});
         result = error.StraySyscall;
     }
     if (stray) |call| {

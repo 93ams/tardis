@@ -2004,6 +2004,156 @@ test "system-call mode: descriptor and signal-mask edges (found by review)" {
     try tardis.check(gpa, reviewedDescriptors, .{ .iterations = 30, .mode = .syscalls });
 }
 
+/// `dup` and `fcntl(F_DUPFD_CLOEXEC)` (mio duplicates its epoll set): a
+/// second descriptor for the same object, which lives until the last one
+/// is closed.
+fn duplicates(env: *Env) !void {
+    _ = env;
+    var byte: [8]u8 = undefined;
+    // A pipe's write end twice: the reader sees the end only when both
+    // are closed.
+    {
+        const p = try pipe2(o_nonblock);
+        defer _ = sys(.close, fdu(p[0]), 0, 0, 0);
+        const w2 = try ok(sys(.dup, fdu(p[1]), 0, 0, 0));
+        try testing.expect(w2 != fdu(p[1]));
+        _ = try ok(sys(.write, w2, @intFromPtr("a"), 1, 0));
+        _ = try ok(sys(.close, fdu(p[1]), 0, 0, 0));
+        try testing.expectEqual(@as(usize, 1), try ok(sys(.read, fdu(p[0]), @intFromPtr(&byte), 8, 0)));
+        try testing.expectEqual(errOf(.AGAIN), sys(.read, fdu(p[0]), @intFromPtr(&byte), 8, 0));
+        _ = try ok(sys(.close, w2, 0, 0, 0));
+        try testing.expectEqual(@as(isize, 0), sys(.read, fdu(p[0]), @intFromPtr(&byte), 8, 0));
+        // O_NONBLOCK is the description's: cleared through one, it is
+        // cleared for its duplicate, and not for the other end.
+        const q = try pipe2(o_nonblock);
+        defer _ = sys(.close, fdu(q[0]), 0, 0, 0);
+        defer _ = sys(.close, fdu(q[1]), 0, 0, 0);
+        const r2 = try ok(sys(.fcntl, fdu(q[0]), 1030, 0, 0)); // F_DUPFD_CLOEXEC
+        defer _ = sys(.close, r2, 0, 0, 0);
+        _ = try ok(sys(.fcntl, r2, 4, 0, 0)); // F_SETFL
+        try testing.expectEqual(@as(usize, 0), try ok(sys(.fcntl, fdu(q[0]), 3, 0, 0)) & o_nonblock);
+        try testing.expectEqual(@as(usize, o_nonblock), try ok(sys(.fcntl, fdu(q[1]), 3, 0, 0)) & o_nonblock);
+    }
+    // An eventfd: one counter.
+    {
+        const ev = try ok(sys(.eventfd2, 0, o_nonblock, 0, 0));
+        const ev2 = try ok(sys(.fcntl, ev, 0, 0, 0)); // F_DUPFD
+        const three: u64 = 3;
+        _ = try ok(sys(.write, ev, @intFromPtr(&three), 8, 0));
+        _ = try ok(sys(.close, ev, 0, 0, 0));
+        var value: u64 = 0;
+        _ = try ok(sys(.read, ev2, @intFromPtr(&value), 8, 0));
+        try testing.expectEqual(@as(u64, 3), value);
+        _ = try ok(sys(.close, ev2, 0, 0, 0));
+        // The counter is not the next eventfd's.
+        const fresh = try ok(sys(.eventfd2, 0, o_nonblock, 0, 0));
+        defer _ = sys(.close, fresh, 0, 0, 0);
+        try testing.expectEqual(errOf(.AGAIN), sys(.read, fresh, @intFromPtr(&value), 8, 0));
+    }
+    // An epoll set: registered through one descriptor, waited on through
+    // the other, and still there when the first is closed.
+    {
+        const ep = try ok(sys(.epoll_create1, 0, 0, 0, 0));
+        const ep2 = try ok(sys(.dup, ep, 0, 0, 0));
+        const ev = try ok(sys(.eventfd2, 1, 0, 0, 0));
+        defer _ = sys(.close, ev, 0, 0, 0);
+        _ = try ok(epollAdd(ep, 1, ev, epollin, 77));
+        // A set is not put inside itself, by either of its descriptors.
+        try testing.expectEqual(errOf(.INVAL), epollAdd(ep, 1, ep2, epollin, 0));
+        _ = try ok(sys(.close, ep, 0, 0, 0));
+        var events: [2]EpollEvent = undefined;
+        try testing.expectEqual(@as(usize, 1), try epollWait(ep2, &events, 0));
+        try testing.expectEqual(@as(u64, 77), events[0].data);
+        _ = try ok(sys(.close, ep2, 0, 0, 0));
+        try testing.expectEqual(errOf(.BADF), sys(.epoll_wait, ep2, @intFromPtr(&events), 2, 0));
+        // An edge through a duplicate is an edge for the descriptor in
+        // the set: a second write, with nothing read, is reported again.
+        const watched = try ok(sys(.eventfd2, 0, o_nonblock, 0, 0));
+        defer _ = sys(.close, watched, 0, 0, 0);
+        const other = try ok(sys(.dup, watched, 0, 0, 0));
+        defer _ = sys(.close, other, 0, 0, 0);
+        const edges = try ok(sys(.epoll_create1, 0, 0, 0, 0));
+        defer _ = sys(.close, edges, 0, 0, 0);
+        _ = try ok(epollAdd(edges, 1, watched, epollin | epollet, 5));
+        const one: u64 = 1;
+        _ = try ok(sys(.write, other, @intFromPtr(&one), 8, 0));
+        try testing.expectEqual(@as(usize, 1), try epollWait(edges, &events, 0));
+        try testing.expectEqual(@as(usize, 0), try epollWait(edges, &events, 0));
+        _ = try ok(sys(.write, other, @intFromPtr(&one), 8, 0));
+        try testing.expectEqual(@as(usize, 1), try epollWait(edges, &events, 0));
+        // The set is gone: a new one starts empty.
+        const next = try ok(sys(.epoll_create1, 0, 0, 0, 0));
+        defer _ = sys(.close, next, 0, 0, 0);
+        try testing.expectEqual(@as(usize, 0), try epollWait(next, &events, 0));
+    }
+}
+
+test "system-call mode: a duplicate is a second descriptor for the same pipe, counter or epoll set" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, duplicates, .{ .iterations = 20, .mode = .syscalls });
+}
+
+/// A thread's signal to itself goes to the real thread it runs on: its
+/// simulated number is not one the kernel knows. Signal 0 asks only
+/// whether the thread exists.
+fn selfSignalWorker(result: *[4]isize, other: i32, main: usize) void {
+    const pid: usize = @intCast(sys(.getpid, 0, 0, 0, 0));
+    const tid: usize = @intCast(sys(.gettid, 0, 0, 0, 0));
+    result[0] = sys(.tgkill, pid, tid, 0, 0);
+    result[1] = sys(.tkill, tid, 0, 0, 0);
+    result[2] = sys(.tgkill, pid, @intCast(other), 0, 0);
+    // The thread the run began on has its real number: the kernel's.
+    result[3] = sys(.tgkill, pid, main, 0, 0);
+}
+
+fn signalsAnother(target: *const std.atomic.Value(i32), result: *isize) void {
+    const pid: usize = @intCast(sys(.getpid, 0, 0, 0, 0));
+    result.* = sys(.tgkill, pid, @intCast(target.load(.seq_cst)), 0, 0);
+}
+
+fn reportsItsNumber(tid: *std.atomic.Value(i32)) void {
+    tid.store(@intCast(sys(.gettid, 0, 0, 0, 0)), .seq_cst);
+    sleepsMs(50);
+}
+
+/// A signal to another simulated thread is not emulated: the run fails,
+/// and the signal is not dropped in silence.
+fn threadSignalsAnother(env: *Env) !void {
+    _ = env;
+    var tid: std.atomic.Value(i32) = .init(0);
+    var result: isize = 0;
+    const target = try std.Thread.spawn(.{}, reportsItsNumber, .{&tid});
+    sleepsMs(5);
+    const sender = try std.Thread.spawn(.{}, signalsAnother, .{ &tid, &result });
+    sender.join();
+    target.join();
+    try testing.expectEqual(errOf(.NOSYS), result);
+}
+
+fn threadSelfSignal(env: *Env) !void {
+    _ = env;
+    var first: [4]isize = @splat(-1);
+
+    var tid: i32 = 0;
+    var seen: u32 = 0;
+    const sleeper_thread = try std.Thread.spawn(.{}, threadLocalWorker, .{ &seen, &tid });
+    sleeper_thread.join();
+    // To itself: there. To a thread that has ended: not there.
+    const main: usize = @intCast(sys(.gettid, 0, 0, 0, 0));
+    const a = try std.Thread.spawn(.{}, selfSignalWorker, .{ &first, tid, main });
+    a.join();
+    try testing.expectEqual(@as(isize, 0), first[0]);
+    try testing.expectEqual(@as(isize, 0), first[1]);
+    try testing.expectEqual(errOf(.SRCH), first[2]);
+    try testing.expectEqual(@as(isize, 0), first[3]);
+}
+
+test "system-call mode: a thread's signal to itself reaches the thread it runs on" {
+    if (!supported or !tardis.syscallModeAvailable() or !tardis.syscallThreadsAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, threadSelfSignal, .{ .iterations = 20, .mode = .syscalls });
+    try testing.expectError(error.StraySyscall, tardis.check(gpa, threadSignalsAnother, .{ .iterations = 1, .mode = .syscalls, .report = false }));
+}
+
 fn threadCrash(env: *Env) !void {
     (try std.Thread.spawn(.{}, longSleeper, .{1000})).detach();
     sleepsMs(5);

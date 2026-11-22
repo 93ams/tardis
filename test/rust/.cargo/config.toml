@@ -1,0 +1,4 @@
+# `tokio::runtime::Builder::rng_seed`, which `src/lib.rs` uses to make
+# tokio's scheduler follow the run's seed.
+[build]
+rustflags = ["--cfg", "tokio_unstable"]

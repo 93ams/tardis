@@ -338,6 +338,32 @@ pub fn build(b: *std.Build) void {
         sqlite_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = sqlite_mod, .filters = test_filters })).step);
     }
 
+    // `zig build test-rust -Drust=<libtardis_rust_probe.a>`: the Rust crate
+    // in `test/rust`, built by cargo for `x86_64-unknown-linux-musl` as a
+    // static library, run under system-call mode (`test/rust.zig`). Behind
+    // an option: nothing else needs cargo.
+    const rust_lib = b.option([]const u8, "rust", "With `test-rust`: the static library cargo built from `test/rust` (Linux x86_64, musl)");
+    const rust_step = b.step("test-rust", "Run a Rust program under system-call mode (needs -Drust=<library>; Linux x86_64)");
+    if (rust_lib == null) {
+        rust_step.dependOn(&b.addFail("test-rust needs -Drust=<path>: the library `cargo build --target x86_64-unknown-linux-musl` makes in test/rust").step);
+    } else if (target.result.os.tag != .linux or target.result.cpu.arch != .x86_64) {
+        rust_step.dependOn(&b.addFail("test-rust needs Linux on x86_64: system-call mode exists nowhere else").step);
+    } else if (!target.result.abi.isMusl()) {
+        rust_step.dependOn(&b.addFail("test-rust needs -Dtarget=x86_64-linux-musl: the Rust library is built for musl, and two C libraries in one program do not work").step);
+    } else {
+        const rust_mod = b.createModule(.{
+            .root_source_file = b.path("test/rust.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "tardis", .module = mod }},
+            .link_libc = true,
+        });
+        rust_mod.addObjectFile(.{ .cwd_relative = rust_lib.? });
+        // The Rust standard library's backtraces call the unwinder.
+        rust_mod.linkSystemLibrary("unwind", .{});
+        rust_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = rust_mod, .filters = test_filters })).step);
+    }
+
     // The `tardis` program and the termancy suite need termancy. Only when
     // TARDIS is the root project: a package importing the library never
     // fetches it.

@@ -161,9 +161,61 @@ What to do depends on the call:
 - Anything else is a gap in the emulation. The list of what is answered is
   at the top of `src/sim/sysemu.zig` and `src/sim/sysnet.zig`.
 
+## 7. A program in Rust
+
+A Rust crate is tested the same way: built as a static library and linked
+into the test (`test/rust`, `test/rust.zig`).
+
+```
+[lib]
+crate-type = ["staticlib"]
+```
+
+```
+cargo build --target x86_64-unknown-linux-musl
+zig build test-rust -Dtarget=x86_64-linux-musl -Drust=<path to the .a>
+```
+
+Export an entry function with `#[no_mangle] pub extern "C"`, declare it in
+the test, and call it from the body. The standard library's threads,
+locks, channels, clock, files and sockets, and tokio's runtimes, make
+system calls that the mode answers. Link `unwind` too: the standard
+library's backtraces call it.
+
+Two rules beyond the C ones, both section 4's problem with no reset to
+call.
+
+Rust's standard library keeps thread-local state that is seeded once: a
+`HashMap`'s keys. On the thread the body runs on, it outlives the run.
+Start a `std::thread` inside the entry function, run the program on it and
+join it: a new thread's state is seeded from that run's `getrandom`.
+
+tokio seeds each runtime's scheduler from a counter the process keeps.
+Give it a seed drawn from the run instead, with `Builder::rng_seed`. That
+method needs `--cfg tokio_unstable` in `RUSTFLAGS` or
+`.cargo/config.toml`.
+
+```rust
+#[no_mangle]
+pub extern "C" fn run() -> i32 {
+    std::thread::spawn(|| {
+        use std::hash::BuildHasher;
+        let n = std::collections::hash_map::RandomState::new().hash_one(0u8);
+        let seed = tokio::runtime::RngSeed::from_bytes(&n.to_le_bytes());
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().rng_seed(seed).build().unwrap();
+        rt.block_on(program())
+    })
+    .join()
+    .unwrap_or(101)
+}
+```
+
+Build with `panic = "abort"`: a panic that unwinds into the Zig test is
+not defined behaviour.
+
 ## What has been run
 
-One library: SQLite 3.46.0, `zig build test-sqlite -Dsqlite`, six tests.
+One C library: SQLite 3.46.0, `zig build test-sqlite -Dsqlite`, six tests.
 With `synchronous=OFF` an acknowledged commit is lost to a power loss, and
 the failure shrinks from 75 decisions to 1. With `EXTRA` it is kept. With
 `FULL`, SQLite's default, it is lost too, which is SQLite's documented
@@ -171,5 +223,9 @@ behaviour and was then reproduced on a real ext4 (`docs/power-cut.md`).
 Two tasks with a database each pass, as do two `pthread`s with a database
 each and two sharing one connection.
 
-No library that uses the network has been run this way; the socket
-emulation is tested with system calls written for the test.
+One Rust crate, written for the test (`test/rust`, Rust 1.99, tokio 1.54):
+threads, a mutex, a channel, a timed wait, files across a power loss, a
+blocking TCP echo, and a TCP echo on tokio's single-threaded runtime and
+on its work-stealing one with two and four workers.
+
+No C library that uses the network has been run this way.

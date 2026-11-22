@@ -305,3 +305,24 @@ test "sqlite: two pthreads share one connection" {
     if (!supported or !tardis.syscallModeAvailable() or !tardis.syscallThreadsAvailable()) return error.SkipZigTest;
     try tardis.check(testing.allocator, sharedConnection, options);
 }
+
+/// libc reads its clocks through the vDSO, with no system call. The image
+/// is found through the auxiliary vector, which in a program linked with
+/// libc is libc's to give: found nowhere, it was never protected, and a C
+/// library's clock was the machine's (until revision 99).
+fn libcClock(env: *Env) !void {
+    var ts: std.c.timespec = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.clock_gettime(.MONOTONIC, &ts));
+    try testing.expectEqual(env.nowNs(), @as(u64, @intCast(ts.sec * std.time.ns_per_s + ts.nsec)));
+    const req: std.c.timespec = .{ .sec = 0, .nsec = 250 * std.time.ns_per_ms };
+    _ = std.c.nanosleep(&req, null);
+    var later: std.c.timespec = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.clock_gettime(.MONOTONIC, &later));
+    try testing.expectEqual(env.nowNs(), @as(u64, @intCast(later.sec * std.time.ns_per_s + later.nsec)));
+    try testing.expect(later.sec * std.time.ns_per_s + later.nsec >= ts.sec * std.time.ns_per_s + ts.nsec + 250 * std.time.ns_per_ms);
+}
+
+test "libc: a clock read through the vDSO is in virtual time" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try tardis.check(testing.allocator, libcClock, .{ .iterations = 20, .mode = .syscalls });
+}

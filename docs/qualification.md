@@ -79,7 +79,9 @@ ran, no run broke a property the test stated. It does not mean more.
 - In system-call mode: clock reads through the vDSO are answered from
   the simulation (revision 78); a thread inside the vDSO when a run
   begins makes that run fail with `StraySyscall`. `select`, `mmap` of a file,
-  `dup` and `fork` are not emulated (each fails the run). Edge-triggered
+  `fork`, and `dup` of a socket or a file are not emulated (each fails
+  the run). Before revision 99 a test linked with libc did not find the
+  vDSO, and its C code read the host's clock. Edge-triggered
   `epoll` reports more edges than Linux (revision 97). Owners,
   permission bits and record locks are not modelled. State a library keeps
   for the life of the process is carried from one run to the next.

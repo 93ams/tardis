@@ -277,7 +277,7 @@ pub fn emulate(number: u64, a: *const [6]u64) ?u64 {
     }
     // Threads, and what a thread asks of the kernel (`systhread.zig`).
     switch (number) {
-        56, 435, 334, 273, 24, 14, 60, 186, 218, 131, 11 => return systhread.emulate(s, number, a),
+        56, 435, 334, 273, 24, 14, 60, 186, 218, 131, 11, 200, 234 => return systhread.emulate(s, number, a),
         else => {},
     }
     // Pipes, eventfds and epoll sets (`sysfd.zig`).
@@ -288,7 +288,7 @@ pub fn emulate(number: u64, a: *const [6]u64) ?u64 {
     // Only a call whose first argument is a descriptor: in another, it is
     // a pointer or a number that may happen to fall in the range.
     const on_descriptor = switch (number) {
-        0, 1, 3, 5, 8, 16, 17, 18, 19, 20, 72, 74, 75, 77, 91, 93, 217, 295, 296 => true,
+        0, 1, 3, 5, 8, 16, 17, 18, 19, 20, 32, 72, 74, 75, 77, 91, 93, 217, 295, 296 => true,
         else => false,
     };
     if (on_descriptor and sysnet.isSocketFd(fd)) {

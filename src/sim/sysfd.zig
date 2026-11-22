@@ -26,6 +26,15 @@
 //! - On these descriptors: `read`, `write`, `readv`, `writev`, `close`,
 //!   `fstat` (the kind only), `fcntl` for the flags, `ioctl` `FIONBIO`
 //!   and, for a pipe, `FIONREAD`.
+//! - `dup` and `fcntl` `F_DUPFD`, `F_DUPFD_CLOEXEC` of one of these (mio
+//!   and so tokio duplicate their epoll descriptor): a second descriptor
+//!   for the same pipe end, counter or epoll set, which lives until the
+//!   last is closed. The new number is the lowest free one here, whatever
+//!   minimum `F_DUPFD` asks for. Two divergences: a descriptor leaves
+//!   the epoll sets it is in when it is closed, where Linux keeps it
+//!   until its last duplicate is closed; and a task waiting in a call on
+//!   a descriptor that another task closes gets `EBADF`, where Linux
+//!   goes on waiting on the object.
 //!
 //! **Edge-triggered is an approximation.** Linux reports an edge when
 //! something arrives. Here an event is reported once, and reported again
@@ -42,7 +51,8 @@
 //!
 //! Not emulated (stray): an epoll descriptor inside an epoll set or a
 //! `poll`; a regular file in an epoll set fails with `EPERM`, as on Linux;
-//! `O_DIRECT` pipes; `splice`, `tee`, `F_SETPIPE_SZ`; `dup` of anything.
+//! `O_DIRECT` pipes; `splice`, `tee`, `F_SETPIPE_SZ`; `dup2` and `dup3`
+//! (the program chooses the number), and `dup` of a socket or a file.
 //! `select` cannot be emulated at all: simulated descriptors are far
 //! above `FD_SETSIZE`. For the same reason a library that keeps a table
 //! indexed by descriptor number (libuv and libevent do) will try to
@@ -76,10 +86,11 @@ const Slot = struct {
     nonblock: bool = false,
     /// `EFD_SEMAPHORE`: a read takes 1.
     semaphore: bool = false,
-    /// Index into `pipes` or `epolls`.
+    /// Index into `pipes`, `counters` or `epolls`.
     object: u8 = 0,
-    /// An eventfd's counter.
-    counter: u64 = 0,
+    /// The open file description: shared by a descriptor and its
+    /// duplicates, which share `O_NONBLOCK` too.
+    description: u32 = 0,
     /// Changes whenever the slot is taken: an operation that waited
     /// checks it to see whether its descriptor was closed meanwhile.
     gen: u32 = 0,
@@ -91,6 +102,12 @@ const Pipe = struct {
     len: u32 = 0,
     readers: u8 = 0,
     writers: u8 = 0,
+};
+
+/// An eventfd's counter, and how many descriptors it has.
+const Counter = struct {
+    holders: u8 = 0,
+    value: u64 = 0,
 };
 
 const Entry = struct {
@@ -105,6 +122,8 @@ const Entry = struct {
 
 const Epoll = struct {
     used: bool = false,
+    /// Descriptors for it: the set lives until the last is closed.
+    holders: u8 = 0,
     len: u8 = 0,
     /// Where the next scan begins: no ready entry starves another.
     rotor: u8 = 0,
@@ -117,6 +136,7 @@ const Epoll = struct {
 /// The descriptors of the run on this thread.
 threadlocal var slots: [slots_max]Slot = @splat(.{});
 threadlocal var pipes: [pipes_max]Pipe = @splat(.{});
+threadlocal var counters: [slots_max]Counter = @splat(.{});
 threadlocal var epolls: [epolls_max]Epoll = @splat(.{});
 /// The pipes' bytes, mapped on the first `pipe` of the thread and kept.
 threadlocal var pipe_buffers: ?[]u8 = null;
@@ -136,6 +156,7 @@ pub fn networkChanged() void {
 pub fn reset() void {
     slots = @splat(.{});
     for (&pipes) |*p| p.* = .{};
+    counters = @splat(.{});
     for (&epolls) |*e| e.* = .{};
     epoll_count = 0;
     net_changes = 0;
@@ -172,7 +193,7 @@ fn take(s: *Sim, kind: Kind) ?usize {
     for (&slots, 0..) |*slot, i| {
         if (slot.kind != .free) continue;
         next_gen +%= 1;
-        slot.* = .{ .kind = kind, .node = s.currentNode(), .gen = next_gen };
+        slot.* = .{ .kind = kind, .node = s.currentNode(), .gen = next_gen, .description = next_gen };
         return i;
     }
     return null;
@@ -193,10 +214,18 @@ fn release(index: usize) void {
             p.writers -= 1;
             if (p.readers == 0 and p.writers == 0) p.* = .{};
         },
-        .eventfd => {},
+        .eventfd => {
+            const c = &counters[slot.object];
+            c.holders -= 1;
+            if (c.holders == 0) c.* = .{};
+        },
         .epoll => {
-            epolls[slot.object].used = false;
-            epoll_count -= 1;
+            const e = &epolls[slot.object];
+            e.holders -= 1;
+            if (e.holders == 0) {
+                e.used = false;
+                epoll_count -= 1;
+            }
         },
     }
     slot.* = .{};
@@ -224,6 +253,15 @@ fn touchedPipe(index: usize) void {
     if (epoll_count == 0) return;
     for (&slots, 0..) |*slot, i| {
         if ((slot.kind == .pipe_read or slot.kind == .pipe_write) and slot.object == index) touched(fdOf(i));
+    }
+}
+
+/// An eventfd's counter changed: an edge for whoever watches any of its
+/// descriptors, not only the one the call was made on.
+fn touchedCounter(index: usize) void {
+    if (epoll_count == 0) return;
+    for (&slots, 0..) |*slot, i| {
+        if (slot.kind == .eventfd and slot.object == index) touched(fdOf(i));
     }
 }
 
@@ -275,7 +313,7 @@ pub fn emulate(s: *Sim, number: u64, a: *const [6]u64) ?u64 {
     s.yieldPoint();
     const slot = slotOf(fd) orelse return fail(.BADF);
     return switch (number) {
-        233 => epollCtl(s, slot, fd, @truncate(a[1]), @bitCast(@as(u32, @truncate(a[2]))), a[3]),
+        233 => epollCtl(s, slot, @truncate(a[1]), @bitCast(@as(u32, @truncate(a[2]))), a[3]),
         232, 281 => epollWait(s, slot, a[1], a[2], msDeadline(s, a[3])),
         441 => blk: {
             var deadline: ?u64 = null;
@@ -298,7 +336,8 @@ pub fn emulate(s: *Sim, number: u64, a: *const [6]u64) ?u64 {
         5 => fstat(slot, a[1]),
         8, 17, 18 => fail(.SPIPE), // lseek, pread64, pwrite64
         16 => ioctl(slot, @truncate(a[1]), a[2]),
-        72 => fcntl(slot, @truncate(a[1]), a[2]),
+        32 => duplicate(s, slot),
+        72 => fcntl(s, slot, @truncate(a[1]), a[2]),
         74, 75, 77 => fail(.INVAL), // fsync, fdatasync, ftruncate
         else => null,
     };
@@ -403,8 +442,12 @@ const counter_max = std.math.maxInt(u64) - 1;
 
 fn eventfd(s: *Sim, initial: u64, flags: u32) ?u64 {
     if (flags & ~@as(u32, efd_semaphore | o_nonblock | o_cloexec) != 0) return fail(.INVAL);
+    const index = for (&counters, 0..) |*c, n| {
+        if (c.holders == 0) break n;
+    } else return fail(.MFILE);
     const i = take(s, .eventfd) orelse return fail(.MFILE);
-    slots[i].counter = @as(u32, @truncate(initial));
+    slots[i].object = @intCast(index);
+    counters[index] = .{ .holders = 1, .value = @as(u32, @truncate(initial)) };
     slots[i].semaphore = flags & efd_semaphore != 0;
     slots[i].nonblock = flags & o_nonblock != 0;
     return @intCast(fdOf(i));
@@ -413,14 +456,16 @@ fn eventfd(s: *Sim, initial: u64, flags: u32) ?u64 {
 fn eventRead(s: *Sim, slot: *Slot, buf: []u8) u64 {
     if (buf.len < 8) return fail(.INVAL);
     const gen = slot.gen;
-    while (slot.counter == 0) {
+    const counter = &counters[slot.object].value;
+    while (counter.* == 0) {
         if (slot.nonblock) return fail(.AGAIN);
         if (!wait(s)) return fail(.INTR);
         if (slot.gen != gen) return fail(.BADF);
     }
-    const value: u64 = if (slot.semaphore) 1 else slot.counter;
-    slot.counter -= value;
+    const value: u64 = if (slot.semaphore) 1 else counter.*;
+    counter.* -= value;
     std.mem.writeInt(u64, buf[0..8], value, .little);
+    touchedCounter(slot.object);
     s.wakeNetwork();
     return 8;
 }
@@ -430,12 +475,14 @@ fn eventWrite(s: *Sim, slot: *Slot, buf: []const u8) u64 {
     const value = std.mem.readInt(u64, buf[0..8], .little);
     if (value == std.math.maxInt(u64)) return fail(.INVAL);
     const gen = slot.gen;
-    while (value > counter_max - slot.counter) {
+    const counter = &counters[slot.object].value;
+    while (value > counter_max - counter.*) {
         if (slot.nonblock) return fail(.AGAIN);
         if (!wait(s)) return fail(.INTR);
         if (slot.gen != gen) return fail(.BADF);
     }
-    slot.counter += value;
+    counter.* += value;
+    touchedCounter(slot.object);
     s.wakeNetwork();
     return 8;
 }
@@ -491,11 +538,14 @@ fn vectors(s: *Sim, slot: *Slot, iov_ptr: u64, count: u64, comptime direction: e
     for (iov) |v| {
         const buf = userBytes(v.base, v.len) orelse return if (total > 0) total else fail(.FAULT);
         if (buf.len == 0) continue;
-        const was = slot.nonblock;
-        if (direction == .read and total > 0) slot.nonblock = true;
+        // After the first vector a read does not wait. Only then is the
+        // flag put back: a call that waited may come back to a flag that
+        // another task changed through a duplicate.
+        const forced = direction == .read and total > 0 and !slot.nonblock;
+        if (forced) slot.nonblock = true;
         const rc = if (direction == .read) read(s, slot, buf) else write(s, slot, buf);
         if (slot.gen != gen) return if (total > 0) total else rc;
-        slot.nonblock = was;
+        if (forced) slot.nonblock = false;
         if (@as(i64, @bitCast(rc)) < 0) return if (total > 0) total else rc;
         total += rc;
         if (rc < buf.len) break;
@@ -518,8 +568,35 @@ fn fstat(slot: *const Slot, out_ptr: u64) u64 {
     return 0;
 }
 
-fn fcntl(slot: *Slot, cmd: u32, arg: u64) ?u64 {
+/// `dup`: another descriptor for what `slot` is one for.
+fn duplicate(s: *Sim, slot: *Slot) u64 {
+    const from = slot.*;
+    const i = take(s, from.kind) orelse return fail(.MFILE);
+    slots[i].nonblock = from.nonblock;
+    slots[i].semaphore = from.semaphore;
+    slots[i].object = from.object;
+    slots[i].description = from.description;
+    switch (from.kind) {
+        .free => unreachable,
+        .pipe_read => pipes[from.object].readers += 1,
+        .pipe_write => pipes[from.object].writers += 1,
+        .eventfd => counters[from.object].holders += 1,
+        .epoll => epolls[from.object].holders += 1,
+    }
+    return @intCast(fdOf(i));
+}
+
+/// `O_NONBLOCK` is the open file description's: every duplicate has it.
+fn setNonblock(slot: *Slot, on: bool) void {
+    const description = slot.description;
+    for (&slots) |*other| {
+        if (other.kind != .free and other.description == description) other.nonblock = on;
+    }
+}
+
+fn fcntl(s: *Sim, slot: *Slot, cmd: u32, arg: u64) ?u64 {
     return switch (cmd) {
+        0, 1030 => duplicate(s, slot), // F_DUPFD, F_DUPFD_CLOEXEC
         1 => 0, // F_GETFD
         2 => 0, // F_SETFD
         3 => blk: { // F_GETFL
@@ -531,7 +608,7 @@ fn fcntl(slot: *Slot, cmd: u32, arg: u64) ?u64 {
             break :blk access | (if (slot.nonblock) @as(u64, o_nonblock) else 0);
         },
         4 => blk: { // F_SETFL: only O_NONBLOCK changes anything
-            slot.nonblock = arg & o_nonblock != 0;
+            setNonblock(slot, arg & o_nonblock != 0);
             break :blk 0;
         },
         1032 => if (slot.kind == .pipe_read or slot.kind == .pipe_write) pipe_bytes else fail(.BADF), // F_GETPIPE_SZ
@@ -543,7 +620,7 @@ fn ioctl(slot: *Slot, request: u32, arg: u64) ?u64 {
     switch (request) {
         0x5421 => { // FIONBIO
             if (arg == 0) return fail(.FAULT);
-            slot.nonblock = @as(*align(1) const i32, @ptrFromInt(arg)).* != 0;
+            setNonblock(slot, @as(*align(1) const i32, @ptrFromInt(arg)).* != 0);
             return 0;
         },
         0x541B => { // FIONREAD
@@ -584,8 +661,9 @@ pub fn pollMask(fd: i32) u16 {
             if (p.readers == 0) m |= poll_err | poll_out | wrnorm else if (pipe_bytes - p.len >= pipe_atomic_bytes) m |= poll_out | wrnorm;
         },
         .eventfd => {
-            if (slot.counter > 0) m |= poll_in | rdnorm;
-            if (slot.counter < counter_max) m |= poll_out | wrnorm;
+            const value = counters[slot.object].value;
+            if (value > 0) m |= poll_in | rdnorm;
+            if (value < counter_max) m |= poll_out | wrnorm;
         },
         // An epoll set inside a `poll` is not emulated: the caller makes
         // the call a stray before asking.
@@ -617,12 +695,12 @@ fn epollCreate(s: *Sim, flags: u32) ?u64 {
     } else return fail(.MFILE);
     const i = take(s, .epoll) orelse return fail(.MFILE);
     slots[i].object = @intCast(index);
-    epolls[index] = .{ .used = true };
+    epolls[index] = .{ .used = true, .holders = 1 };
     epoll_count += 1;
     return @intCast(fdOf(i));
 }
 
-fn epollCtl(s: *Sim, slot: *Slot, epfd: i32, op: u32, fd: i32, event_ptr: u64) ?u64 {
+fn epollCtl(s: *Sim, slot: *Slot, op: u32, fd: i32, event_ptr: u64) ?u64 {
     if (slot.kind != .epoll) return fail(.INVAL);
     const e = &epolls[slot.object];
     // What may be in a set: a socket, a pipe, an eventfd.
@@ -633,7 +711,7 @@ fn epollCtl(s: *Sim, slot: *Slot, epfd: i32, op: u32, fd: i32, event_ptr: u64) ?
         .pollable => {},
     }
     // Itself: Linux says EINVAL. Another set: nesting is not emulated.
-    if (isEpoll(fd)) return if (fd == epfd) fail(.INVAL) else null;
+    if (slotOf(fd)) |other| if (other.kind == .epoll) return if (other.object == slot.object) fail(.INVAL) else null;
     const at: ?usize = for (e.entries[0..e.len], 0..) |entry, i| {
         if (entry.fd == fd) break i;
     } else null;

@@ -205,6 +205,15 @@ fn onSigsys(_: i32, _: ?*anyopaque, context: ?*anyopaque) callconv(.c) void {
     selector = block;
 }
 
+/// A call the emulator answers with an error and counts as a stray: the
+/// run fails with `StraySyscall`. For one that returning null would hand
+/// to the kernel (`emulatorFirst`).
+pub fn noteStray(number: u64) void {
+    if (!supported) return;
+    if (stray_count == 0) stray_first = number;
+    stray_count +|= 1;
+}
+
 /// The registers of the system call being emulated, as the signal frame
 /// holds them (x86_64 `gregs`). Valid until the emulator lets another
 /// task run.
