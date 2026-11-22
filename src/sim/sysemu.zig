@@ -320,7 +320,8 @@ pub fn emulate(number: u64, a: *const [6]u64) ?u64 {
                 19 => vectors(s, fd, a[1], a[2], null, .read),
                 20 => vectors(s, fd, a[1], a[2], null, .write),
                 72 => fcntl(s, fd, @truncate(a[1]), a[2]),
-                74, 75 => fsync(s, fd),
+                74 => fsync(s, fd, false),
+                75 => fsync(s, fd, true),
                 77 => ftruncate(s, fd, a[1]),
                 91, 93 => if (fd == root_fd or handleOf(s, fd) != null) 0 else fail(.BADF), // fchmod, fchown
                 217 => getdents(s, fd, a[1], a[2]),
@@ -603,7 +604,8 @@ fn lseek(s: *Sim, fd: i32, offset: i64, whence: u32) u64 {
     return @intCast(pos);
 }
 
-fn fsync(s: *Sim, fd: i32) u64 {
+/// `fsync`, or `fdatasync` with `data_only`.
+fn fsync(s: *Sim, fd: i32, data_only: bool) u64 {
     if (fd == root_fd) {
         // The root has no handle of its own: one is opened for the sync.
         const io = s.io();
@@ -613,7 +615,11 @@ fn fsync(s: *Sim, fd: i32) u64 {
         return 0;
     }
     if (handleOf(s, fd) == null) return fail(.BADF);
-    fileOf(fd).sync(s.io()) catch |err| return fail(errnoOf(err));
+    if (data_only) {
+        s.fileDataSync(fileOf(fd)) catch |err| return fail(errnoOf(err));
+    } else {
+        fileOf(fd).sync(s.io()) catch |err| return fail(errnoOf(err));
+    }
     return 0;
 }
 

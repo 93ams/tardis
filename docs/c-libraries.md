@@ -63,7 +63,7 @@ test "the acknowledged commit survives a power loss" {
 - **`posix_strict`.** Include it. It is the persona that assumes least of
   an `fsync`, and another persona has already promised more than the real
   filesystem gives in one case, corrected since (`docs/power-cut.md`,
-  which also lists what `fdatasync` and timed commits still hide).
+  which also lists what the rule still does not cover).
 
 ## 3. Crash it
 

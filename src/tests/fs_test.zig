@@ -209,3 +209,49 @@ test "Dir.cwd() resolves to the simulated root" {
         }
     }.run, .{ .iterations = 2 });
 }
+
+var unlinked_back: u32 = 0;
+
+/// A file is made, an unlink of another follows at once or after a sleep,
+/// and the made file is synced. Then the power goes.
+fn createUnlinkSync(env: *tardis.Env, comptime pause_s: u32) !void {
+    const io = env.io;
+    {
+        var a = try env.dir.createFile(io, "a", .{});
+        defer a.close(io);
+        try a.writePositionalAll(io, "data", 0);
+        try a.sync(io);
+        var d = try env.dir.openFile(io, ".", .{});
+        defer d.close(io);
+        try d.sync(io);
+    }
+    var fresh = try env.dir.createFile(io, "fresh", .{});
+    if (pause_s != 0) try io.sleep(.fromSeconds(pause_s), .awake);
+    try env.dir.deleteFile(io, "a");
+    try fresh.sync(io);
+    fresh.close(io);
+    try env.crashAndReboot(.power_loss);
+    // The synced file is there either way.
+    try env.dir.access(io, "fresh", .{});
+    if (env.dir.access(io, "a", .{})) |_| {
+        unlinked_back += 1;
+    } else |_| {}
+}
+
+test "ext4: a file's fsync commits an unlink made at once after the file's creation, and not one made seven seconds later" {
+    const options: tardis.Options = .{ .iterations = 100, .personas = &.{.linux_ext4} };
+    unlinked_back = 0;
+    try tardis.check(testing.allocator, struct {
+        fn run(env: *tardis.Env) !void {
+            return createUnlinkSync(env, 0);
+        }
+    }.run, options);
+    try testing.expectEqual(@as(u32, 0), unlinked_back);
+    unlinked_back = 0;
+    try tardis.check(testing.allocator, struct {
+        fn run(env: *tardis.Env) !void {
+            return createUnlinkSync(env, 7);
+        }
+    }.run, options);
+    try testing.expect(unlinked_back > 0);
+}

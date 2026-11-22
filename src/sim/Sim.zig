@@ -2133,6 +2133,7 @@ const toctou_aside = ".tardis-toctou-aside";
 fn secVfs(s: *Sim, op: seam.VfsOp, parent: vfs_mod.InodeId, path: []const u8) void {
     const a = s.sec orelse return;
     const swap = a.provider.vfs_op(a.ctx, s.currentNode(), op, parent, path) orelse return;
+    s.syncClock();
     switch (swap.kind) {
         .symlink => {
             s.vfs.deleteFile(parent, path) catch return;
@@ -3306,14 +3307,24 @@ fn fileSeekTo(userdata: ?*anyopaque, file: File, absolute_offset: u64) File.Seek
 }
 
 fn fileSync(userdata: ?*anyopaque, file: File) File.SyncError!void {
-    const s = fromUserdata(userdata);
+    return fromUserdata(userdata).syncFile(file, false);
+}
+
+/// `fdatasync`, which `std.Io` does not have: system-call mode calls it.
+/// As a file's `sync` in every way but what it commits (`Vfs.dataSync`).
+pub fn fileDataSync(s: *Sim, file: File) File.SyncError!void {
+    return s.syncFile(file, true);
+}
+
+fn syncFile(s: *Sim, file: File, data_only: bool) File.SyncError!void {
     const E = File.SyncError;
     try s.enter(E);
     s.ioLatency();
     const h = s.fileHandle(file) catch |err| return vfsError(E, err);
     const ino = h.inode;
     if (s.injected(E, .sync)) |e| return e;
-    s.vfs.sync(ino);
+    s.syncClock();
+    if (data_only) s.vfs.dataSync(ino) else s.vfs.sync(ino);
     s.stats.disk_syncs += 1;
     s.record(.sync, ino, s.vfs.journalPending(), 0, "");
 }

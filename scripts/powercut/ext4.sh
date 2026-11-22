@@ -162,6 +162,81 @@ for round in $(seq 1 "$rounds"); do
   echo "round $round: an append, a commit, unlink, then the appended file's fsync: the file is $r"
   rm -f "$mnt/j" "$mnt/grown" "$mnt/carrier"; sync "$mnt"
 
+  # 4g. A create, a pause longer than ext4's commit interval (five
+  # seconds), unlink, then the created file's fsync: as 4c, but the
+  # periodic commit has taken the creation before the unlink is made.
+  echo data > "$mnt/k"; sync
+  : > "$mnt/early"; sleep 7; rm "$mnt/k"; sync "$mnt/early"
+  power_cut
+  [ -e "$mnt/k" ] && r=back || r=gone
+  [ -e "$mnt/early" ] && n=there || n=gone
+  echo "round $round: a create, a pause of 7 s, unlink, then fsync of the created file: the file is $r, the created file is $n"
+  rm -f "$mnt/k" "$mnt/early"; sync "$mnt"
+
+  # 4h. Unlink, a pause longer than the commit interval, no fsync at all.
+  echo data > "$mnt/l"; sync
+  rm "$mnt/l"; sleep 7
+  power_cut
+  [ -e "$mnt/l" ] && r=back || r=gone
+  echo "round $round: unlink, a pause of 7 s, no fsync: the file is $r"
+  rm -f "$mnt/l"; sync "$mnt"
+
+  # 4i. As 4, with fdatasync (sync -d) in place of fsync: the append
+  # changes the file's length.
+  echo data > "$mnt/m"; echo other > "$mnt/written"; sync
+  rm "$mnt/m"; echo more >> "$mnt/written"; sync -d "$mnt/written"
+  power_cut
+  [ -e "$mnt/m" ] && r=back || r=gone
+  echo "round $round: unlink, then an append to another file and its fdatasync: the file is $r"
+  rm -f "$mnt/m" "$mnt/written"; sync "$mnt"
+
+  # 4j. Unlink, then an overwrite in place of another file (no new length,
+  # no new block) and its fdatasync. The short pause lets the clock move,
+  # so that the overwrite changes the file's time of modification.
+  echo data > "$mnt/n"; echo 0123456789 > "$mnt/over"; sync
+  sleep 0.2
+  rm "$mnt/n"; printf XXXX | dd of="$mnt/over" conv=notrunc status=none; sync -d "$mnt/over"
+  power_cut
+  [ -e "$mnt/n" ] && r=back || r=gone
+  echo "round $round: unlink, then an overwrite in place of another file and its fdatasync: the file is $r, the overwritten file holds $(head -c 4 "$mnt/over")"
+  rm -f "$mnt/n" "$mnt/over"; sync "$mnt"
+
+  # 4k. The same with fsync.
+  echo data > "$mnt/o"; echo 0123456789 > "$mnt/over"; sync
+  sleep 0.2
+  rm "$mnt/o"; printf XXXX | dd of="$mnt/over" conv=notrunc status=none; sync "$mnt/over"
+  power_cut
+  [ -e "$mnt/o" ] && r=back || r=gone
+  echo "round $round: unlink, then an overwrite in place of another file and its fsync: the file is $r, the overwritten file holds $(head -c 4 "$mnt/over")"
+  rm -f "$mnt/o" "$mnt/over"; sync "$mnt"
+
+  # 4n. As 4k without the pause, and with the other file written just
+  # before: the overwrite may fall in the same tick of the kernel's clock
+  # as the file's last change, and then changes nothing in its inode.
+  echo data > "$mnt/r"; echo 0123456789 > "$mnt/over"; sync "$mnt/over"; sync "$mnt"
+  rm "$mnt/r"; printf XXXX | dd of="$mnt/over" conv=notrunc status=none; sync "$mnt/over"
+  power_cut
+  [ -e "$mnt/r" ] && r=back || r=gone
+  echo "round $round: the same at once after the file's last change: the file is $r, the overwritten file holds $(head -c 4 "$mnt/over")"
+  rm -f "$mnt/r" "$mnt/over"; sync "$mnt"
+
+  # 4l. As 4d with fdatasync: a rename changes nothing fdatasync must keep.
+  echo data > "$mnt/p"; sync
+  mv "$mnt/p" "$mnt/p2"; sync -d "$mnt/p2"
+  power_cut
+  if [ -e "$mnt/p2" ] && [ ! -e "$mnt/p" ]; then r="kept"; elif [ -e "$mnt/p" ] && [ ! -e "$mnt/p2" ]; then r="undone"; else r="mixed"; fi
+  echo "round $round: a rename, then fdatasync of the renamed file: the rename is $r"
+  rm -f "$mnt/p" "$mnt/p2"; sync "$mnt"
+
+  # 4m. As 4c with fdatasync.
+  echo data > "$mnt/q"; sync
+  : > "$mnt/fresh"; rm "$mnt/q"; sync -d "$mnt/fresh"
+  power_cut
+  [ -e "$mnt/q" ] && r=back || r=gone
+  [ -e "$mnt/fresh" ] && n=there || n=gone
+  echo "round $round: a create, unlink, then fdatasync of the created file: the file is $r, the created file is $n"
+  rm -f "$mnt/q" "$mnt/fresh"; sync "$mnt"
+
   # 5. SQLite: commit, acknowledgement, power cut, reopen.
   for mode in OFF FULL EXTRA; do
     db="$mnt/$mode.db"

@@ -630,6 +630,58 @@ test "system-call mode: the root descriptor is a directory to be relative to, an
     try tardis.check(gpa, rootDescriptor, .{ .iterations = 100, .mode = .syscalls, .personas = &.{ .linux_ext4, .posix_strict } });
 }
 
+threadlocal var unlinked_came_back: u32 = 0;
+
+/// An unlink, then a write inside another file's length and that file's
+/// `fdatasync` or `fsync`, then a power cut. On ext4 the `fsync` carries
+/// the unlink out and the `fdatasync` does not (`docs/power-cut.md`, rows
+/// 4j and 4k). The data is durable either way.
+fn unlinkThenSync(env: *Env, comptime data_only: bool) !void {
+    const a = try open("a", o_creat | o_wronly | o_trunc);
+    try writeAll(a, "data");
+    try fsync(a);
+    close(a);
+    const other = try open("other", o_creat | o_wronly | o_trunc);
+    try writeAll(other, "0123456789");
+    try fsync(other);
+    const dir = try open(".", o_rdonly);
+    try fsync(dir);
+    close(dir);
+    try testing.expectEqual(@as(isize, 0), sys(.unlink, @intFromPtr("a"), 0, 0, 0));
+    // The simulation may write less than was asked.
+    var done: usize = 0;
+    while (done < 4) {
+        const rc = sys(.pwrite64, other, @intFromPtr("XXXX") + done, 4 - done, done);
+        if (rc <= 0) return error.WriteFailed;
+        done += @intCast(rc);
+    }
+    try testing.expectEqual(@as(isize, 0), sys(if (data_only) .fdatasync else .fsync, other, 0, 0, 0));
+    close(other);
+    try env.crashAndReboot(.power_loss);
+    if (sys(.access, @intFromPtr("a"), 0, 0, 0) == 0) unlinked_came_back += 1;
+    var buf: [10]u8 = undefined;
+    try testing.expectEqualStrings("XXXX456789", try env.dir.readFile(env.io, "other", &buf));
+}
+
+fn unlinkThenFdatasync(env: *Env) !void {
+    return unlinkThenSync(env, true);
+}
+
+fn unlinkThenFsync(env: *Env) !void {
+    return unlinkThenSync(env, false);
+}
+
+test "system-call mode: fdatasync after a write inside the file does not commit an unlink on ext4, fsync does" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    const options: tardis.Options = .{ .iterations = 100, .mode = .syscalls, .personas = &.{.linux_ext4} };
+    unlinked_came_back = 0;
+    try tardis.check(gpa, unlinkThenFdatasync, options);
+    try testing.expect(unlinked_came_back > 0);
+    unlinked_came_back = 0;
+    try tardis.check(gpa, unlinkThenFsync, options);
+    try testing.expectEqual(@as(u32, 0), unlinked_came_back);
+}
+
 test "system-call mode: a call that is not emulated, or on a real descriptor, fails the run" {
     if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
     const options: tardis.Options = .{ .iterations = 3, .mode = .syscalls, .report = false, .shrink = false };
