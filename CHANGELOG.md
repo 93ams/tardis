@@ -5,6 +5,16 @@ numbers (§) are `plan2.md`'s unless an entry names `plan.md`. Revision 1
 was the first draft of `plan2.md`; the core's earlier history is in
 `plan.md` §9 and §14.
 
+## Revision 102 (tests: forked children against one process, and failing runs between warm starts)
+
+`plan3.md` A6. Two comparisons of configurations that were missing.
+
+`simulator agreement: the same runs in one process, in forked children and in worker processes` (Linux): 900 runs of the simulator's own fuzz program (300 on each of three personas), with I/O errors, give the same sum of what every run observed when each run is a forked child of the process that ran setup, when three worker processes fork them, when one process runs setup before every run, and when it starts from a snapshot. The children add to a page shared with the parent, and the test checks that the parent itself observed nothing in the forked campaigns. Another campaign seed gives another sum.
+
+`warm restore: failing runs between warm starts, on three personas, are the failures of cold starts` (every target): with `keep_going`, a body that reads and changes what setup left and fails on about one input in seven hundred logs the same failing iterations with the same shrunk tokens warm and cold. Each failure is shrunk and replayed before the next run starts, which drops the snapshots; the next run takes them again, and the test requires warm starts after a failure and to the end. After five failures warm starts stay off (`Sim.Warm`), so the body fails seldom. The review found the first version of this test unable to see a wrong snapshot.
+
+No finding. Not covered still: forked runs with allocation failures or with the determinism re-run, the fork server outside Linux, warm starts with several nodes, and a failed allocation while a snapshot's pages are copied. Under `-Dsec` there are no warm starts, and both warm comparisons are cold against cold.
+
 ## Revision 101 (core: `dup` of a socket and of a file in system-call mode)
 
 Revision 99 left `dup` of a socket or a file stray, so Rust's `TcpStream::try_clone` and `File::try_clone`, the usual way to give a connection's reading half to one thread and its writing half to another, failed the run. `dup`, and `fcntl` with `F_DUPFD` or `F_DUPFD_CLOEXEC`, now give a socket (`sysnet.zig`), a file or a directory (`sysemu.zig`) a second descriptor: one socket or one open file under two numbers, with one position and one set of flags (`O_NONBLOCK`, `O_APPEND`), closed when its last number is. A number that is closed is no descriptor from then on, though its duplicate lives; a node's crash closes its duplicates with its files and sockets.

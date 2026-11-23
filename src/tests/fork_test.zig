@@ -165,3 +165,61 @@ fn sameWarmStateQuiet(env: *Env) !void {
     _ = try env.dir.readFile(env.io, "token", &buf);
     _ = try env.dir.statFile(env.io, "f49", .{});
 }
+
+/// Reads what setup left, changes it, and fails on about one input in
+/// seven hundred. A snapshot that came back wrong fails every run.
+fn readsWarmUpAndFails(env: *Env) !void {
+    const io = env.io;
+    var buf: [16]u8 = undefined;
+    try testing.expectEqualStrings("warm", try env.dir.readFile(io, "f49", &buf));
+    try testing.expectEqualStrings("warm", try env.dir.readFile(io, "f7", &buf));
+    _ = try env.dir.readFile(io, "token", &buf);
+    try env.dir.writeFile(io, .{ .sub_path = "f7", .data = "changed" });
+    try env.dir.deleteFile(io, "f49");
+    const x = try env.fuzz(u16);
+    try env.always("x is not a multiple of 701", x % 701 != 0 or x == 0);
+}
+
+test "warm restore: failing runs between warm starts, on three personas, are the failures of cold starts" {
+    // A failed run is shrunk and replayed before the next one starts.
+    // That drops the snapshots, and the next run takes them again; after
+    // five such failures warm starts stay off, so this body fails less.
+    for ([_][]const u8{ "TARDIS_EXPLORE", "TARDIS_PRESET", "TARDIS_SEED", "TARDIS_REPLAY", "TARDIS_CORPUS_DIR", "TARDIS_CAMPAIGN_SALT" }) |name| {
+        if (testing.environ.getAlloc(gpa, name)) |value| {
+            gpa.free(value);
+            return error.SkipZigTest;
+        } else |_| {}
+    }
+    const base: tardis.Options = .{
+        .iterations = 600,
+        .setup = warmUp,
+        .report = false,
+        .personas = &.{ .linux_ext4, .windows_ntfs, .posix_strict },
+    };
+    var report: tardis.WarmReport = .{};
+    var logs: [2]tardis.FailureLog = .{ .{}, .{} };
+    for (&logs, 0..) |*log, k| {
+        var o = base;
+        o.keep_going = log;
+        o.warm_restore = k == 0;
+        if (k == 0) o.warm_report = &report;
+        try testing.expectError(error.AssertionFailed, tardis.check(gpa, readsWarmUpAndFails, o));
+    }
+    const warm = logs[0].slice();
+    try testing.expect(warm.len >= 2 and warm.len <= 4);
+    try testing.expectEqual(logs[1].len, logs[0].len);
+    try testing.expectEqual(logs[1].dropped, logs[0].dropped);
+    for (logs[1].slice(), warm) |*x, *y| {
+        try testing.expectEqual(x.iteration, y.iteration);
+        try testing.expectEqual(x.shrunk, y.shrunk);
+        try testing.expectEqualStrings(x.token(), y.token());
+    }
+    try testing.expectEqual(@as(u64, 0), report.mismatches);
+    // With a security layer on every check there are no warm starts.
+    if (!tardis.security_by_default) {
+        // Still on at the end, and more warm starts than there were runs
+        // before the second failure: some came after a failure.
+        try testing.expect(report.active);
+        try testing.expect(report.restores > (@as(u64, warm[1].iteration) + 1) * base.personas.len);
+    }
+}

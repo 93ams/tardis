@@ -12,6 +12,7 @@
 //!   content.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const tardis = @import("../root.zig");
 const Io = std.Io;
 const Env = tardis.Env;
@@ -180,6 +181,10 @@ test "fuzz oracles (files): without the directory's sync the durable step fails 
 /// observed: the same for the same runs in any order.
 var observed_sum: std.atomic.Value(u64) = .init(0);
 
+/// The same sum in memory shared with forked children, when a test has
+/// mapped some: what a child adds to `observed_sum` dies with the child.
+var shared_sum: ?*std.atomic.Value(u64) = null;
+
 fn setup(env: *Env) !void {
     // Another content on each persona: a warm start that brought back
     // another persona's pages would be seen.
@@ -206,25 +211,35 @@ fn observing(env: *Env) !void {
     }
     h.update(std.mem.asBytes(&env.nowNs()));
     h.update(std.mem.asBytes(&env.crashCount()));
+    // Both: a forked child's own `observed_sum` is lost with it, which
+    // is how a test knows that the runs were made in children.
     _ = observed_sum.fetchAdd(h.final(), .monotonic);
+    if (shared_sum) |sum| _ = sum.fetchAdd(h.final(), .monotonic);
+}
+
+/// The environment changes which runs a check makes, or keeps runs
+/// between checks: configurations cannot be compared.
+fn runsChosenByEnvironment() bool {
+    for ([_][]const u8{ "TARDIS_EXPLORE", "TARDIS_PRESET", "TARDIS_SEED", "TARDIS_REPLAY", "TARDIS_CORPUS_DIR", "TARDIS_CAMPAIGN_SALT" }) |name| {
+        if (testing.environ.getAlloc(testing.allocator, name)) |value| {
+            testing.allocator.free(value);
+            return true;
+        } else |_| {}
+    }
+    return false;
 }
 
 fn observe(o: tardis.Options) !u64 {
     observed_sum.store(0, .monotonic);
+    if (shared_sum) |sum| sum.store(0, .monotonic);
     try tardis.check(testing.allocator, observing, o);
-    return observed_sum.load(.monotonic);
+    return (shared_sum orelse &observed_sum).load(.monotonic);
 }
 
 test "simulator agreement: the same runs cold and warm, on one worker and on four" {
     // Each configuration runs the same seeds; a run that saw anything
-    // else in any of them changes the sum. Not when the environment
-    // changes which runs a check makes, or keeps runs between checks.
-    for ([_][]const u8{ "TARDIS_EXPLORE", "TARDIS_PRESET", "TARDIS_SEED", "TARDIS_REPLAY", "TARDIS_CORPUS_DIR", "TARDIS_CAMPAIGN_SALT" }) |name| {
-        if (testing.environ.getAlloc(testing.allocator, name)) |value| {
-            testing.allocator.free(value);
-            return error.SkipZigTest;
-        } else |_| {}
-    }
+    // else in any of them changes the sum.
+    if (runsChosenByEnvironment()) return error.SkipZigTest;
     const base: tardis.Options = .{
         .iterations = 200,
         .personas = &.{ .linux_ext4, .windows_ntfs, .posix_strict },
@@ -273,4 +288,47 @@ test "simulator agreement: the same runs cold and warm, on one worker and on fou
     var warm_four = warm;
     warm_four.workers = 4;
     try testing.expectEqual(cold_sum, try observe(warm_four));
+}
+
+test "simulator agreement: the same runs in one process, in forked children and in worker processes" {
+    // A forked child starts from the parent's memory after setup, where an
+    // iteration in one process starts from a fresh run of setup or from a
+    // snapshot of it: three ways to the same state.
+    if (builtin.os.tag != .linux or !tardis.fork_supported) return error.SkipZigTest;
+    if (runsChosenByEnvironment()) return error.SkipZigTest;
+    const linux = std.os.linux;
+    const map = linux.mmap(null, 4096, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED, .ANONYMOUS = true }, -1, 0);
+    if (linux.errno(map) != .SUCCESS) return error.SkipZigTest;
+    defer _ = linux.munmap(@ptrFromInt(map), 4096);
+    shared_sum = @ptrFromInt(map);
+    defer shared_sum = null;
+
+    const base: tardis.Options = .{
+        .iterations = 300,
+        .personas = &.{ .linux_ext4, .windows_ntfs, .posix_strict },
+        .setup = setup,
+        .warm_restore = false,
+        .determinism_check_every = 0,
+        .explore = .random,
+        .faults = .{ .io_error_ppm = 20_000 },
+    };
+    const want = try observe(base);
+    try testing.expect(want != 0);
+    try testing.expectEqual(want, observed_sum.load(.monotonic));
+    var forked = base;
+    forked.fork = true;
+    try testing.expectEqual(want, try observe(forked));
+    // Every run was in a child: this process observed nothing itself.
+    try testing.expectEqual(@as(u64, 0), observed_sum.load(.monotonic));
+    var workers = forked;
+    workers.workers = 3;
+    try testing.expectEqual(want, try observe(workers));
+    try testing.expectEqual(@as(u64, 0), observed_sum.load(.monotonic));
+    var warm = base;
+    warm.warm_restore = true;
+    try testing.expectEqual(want, try observe(warm));
+    // The shared sum does tell runs apart.
+    var other = forked;
+    other.campaign_seed = 12345;
+    try testing.expect(want != try observe(other));
 }
