@@ -1,9 +1,10 @@
 # Measurements
 
-Four tables that the repository can print again at any time. Numbers in
-the first, the third and the fourth follow from the seeds and are the
-same on every machine; the second depends on the allocator's rounding and
-may move by a few kilobytes.
+Four sections of tables that the repository can print again at any
+time. Numbers in the first, the third and the fourth follow from the
+seeds and are the same on every machine; in the second, memory depends on
+the allocator's rounding and may move by a few kilobytes, and time
+depends on the machine.
 
 ## 1. Which oracle catches which bug, and how often
 
@@ -55,8 +56,70 @@ How to read it:
   history checkers (`tardis.lin`, `tardis.elle`).
 - No row yet: the stray-system-call trap (Linux; its tests are in
   `syscall_test.zig`).
-- Not in the table: the security layer's oracles, which have their own
-  campaigns (`zig build evidence`).
+- The security layer's oracles have a table of their own, below.
+
+### The security layer's oracles
+
+`zig build secrates -Doptimize=ReleaseSafe` (`plan3.md` A5). Each row is
+a planted bug from the layer's own tests (`src/sec/tests/pillar1_test.zig`,
+`pillar2_test.zig`), run with the layer options its test uses, in 20
+campaigns at three sizes; the last column runs the test's fixed version
+of the same program in the same 20 campaigns of 200 iterations and counts
+those that failed. The 20 campaign seeds are the same in every column, so
+the columns are nested, not independent samples. The command fails if a
+campaign of 200 iterations misses a bug or a fixed version fails.
+
+| Program | Planted bug | Caught by | 10 iterations | 50 iterations | 200 iterations | Fixed version, 200 iterations |
+|---|---|---|---|---|---|---|
+| uninitialized tail | uninitialized heap bytes written to a file | CWE-908 | 20/20 | 20/20 | 20/20 | 0/20 |
+| use after free | freed bytes written to a file | CWE-416 | 20/20 | 20/20 | 20/20 | no fixed version |
+| write past the end | a copy longer than its buffer | CWE-787 | 20/20 | 20/20 | 20/20 | 0/20 |
+| over-read | a reply longer than its buffer | CWE-125 | 20/20 | 20/20 | 20/20 | 0/20 |
+| secret logged | part of a marked key in a log file | CWE-200 | 20/20 | 20/20 | 20/20 | 0/20 |
+| secret not zeroed | a marked key freed without zeroing | CWE-226 (ReleaseFast only) | 20/20 | 20/20 | 20/20 | 0/20 |
+| Heartbleed | one tenant's record echoed to another tenant | CWE-668 | 20/20 | 20/20 | 20/20 | 0/20 |
+| lock order | two `sec.Mutex` classes taken in both orders | CWE-833 | 20/20 | 20/20 | 20/20 | 0/20 |
+| file lock order | two file locks taken in both orders | CWE-833 | 20/20 | 20/20 | 20/20 | 0/20 |
+| double fetch | a shared length checked, then read again | the program's `always` | 18/20 | 20/20 | 20/20 | 0/20 |
+| check-then-use | stat a name, then open the name | CWE-200 | 17/20 | 20/20 | 20/20 | 0/20 |
+| path from the network | a received name in a path | CWE-22 | 20/20 | 20/20 | 20/20 | 0/20 |
+| command from the network | a received name in a process's arguments | CWE-78 | 20/20 | 20/20 | 20/20 | 0/20 |
+| capability after start | a connect after `enterSandbox` | CWE-272 | 20/20 | 20/20 | 20/20 | 0/20 |
+| equivocation | followers that trust one frame of a two-faced leader | the program's `always` | 20/20 | 20/20 | 20/20 | 0/20 |
+| replay | a frame recorded before a reboot accepted after it | the program's `always` | 20/20 | 20/20 | 20/20 | 0/20 |
+| length desync | a frame shortened in flight smuggles another | the program's `always` | 20/20 | 20/20 | 20/20 | 0/20 |
+
+| Program | Exploration | 5,000 iterations | 50,000 iterations |
+|---|---|---|---|
+| hash flooding (CWE-407) | guided | 0/20 | 11/20 |
+| hash flooding (CWE-407) | random | 0/20 | 0/20 |
+| hash flooding, hash seeded from the run | guided | 0/20 | 5/20 |
+
+Measured on Windows at revision 109, ReleaseSafe; the same on ReleaseFast
+except the row marked, which finds nothing in a safe build because
+`free` there already overwrites the key (`sec.engine.safe_fill`).
+
+How to read it:
+
+- Most of these programs leak in every run, so the first campaign finds
+  them; what the table adds for them is the last column: no false alarm
+  on the fixed program in 20 campaigns. The rates that depend on the
+  search are the rows the layer steers: the double fetch (a forced switch
+  between two reads, `double_fetch_preempt_ppm` 500,000), the
+  check-then-use swap (`vfs_toctou_race_ppm` 200,000), and the three
+  hostile-peer rows (`byzantine_ppm` 500,000).
+- Hash flooding needs a set of colliding keys that random search does not
+  find in 50,000 runs; guided exploration finds it in 11 campaigns of 20.
+  The test's "fixed" program, whose hash is seeded from the run's seed, is
+  still flooded in 5 of 20: a mutated input keeps its parent's run seed
+  (`Corpus.mutate` in `src/search/explore.zig` copies the entry), so a
+  secret derived from the run seed is the same across a family of inputs
+  the search refines. Within the simulator, no program secret is hidden
+  from guided exploration. The two hashes also use different multipliers,
+  so 11 against 5 is not a controlled comparison.
+- No row yet: the timing and information-flow assertions, glitched
+  decisions, the Spectre-v1 shape, the C shims and the instrumented
+  objects (shadow memory, data races), which have their own tests.
 
 ## 2. Memory one simulator takes
 

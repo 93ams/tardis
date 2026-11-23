@@ -5,6 +5,16 @@ numbers (§) are `plan2.md`'s unless an entry names `plan.md`. Revision 1
 was the first draft of `plan2.md`; the core's earlier history is in
 `plan.md` §9 and §14.
 
+## Revision 109 (measurements: the security layer's oracles)
+
+`plan3.md` A5, its last part: a planted bug for each security oracle, with a detection rate. `zig build secrates` runs the planted bugs of the layer's own tests (`pillar1_test.zig`, `pillar2_test.zig`, `pillar45_test.zig`, whose bodies are now `pub` and imported, so the table measures the code the tests run) in 20 campaigns at 10, 50 and 200 iterations, and the fixed version of each in 20 campaigns of 200 (`docs/measurements.md` §1). `zig build test` builds it. Seventeen rows: every bug found by every campaign of 200, the steered ones (double fetch, check-then-use) missed by two or three of 20 at 10 iterations, no false alarm on a fixed program. `secret not zeroed` is found only in a build without runtime safety, where `free` does not overwrite the key first.
+
+**Found.** The fixed hash-flooding program (a hash seeded from the run) is flooded in 5 of 20 guided campaigns of 50,000 iterations. Its test passed because its one campaign of 10,000 does not. The cause is in the explorer: a mutated input keeps its parent's run seed, so a secret derived from the run seed is the same for every input the search refines from one parent; within the simulator no secret of the program is hidden from guided exploration. Not changed: a mutation that kept the decisions and changed the seed would no longer reproduce what it mutates. The test's name and comment now say what it shows.
+
+**Review.** A fresh reviewer confirmed every row runs with its test's options, found the use-after-free row's "fixed" program to be another test's program (now "no fixed version"), the columns to be nested samples rather than independent ones (now said), and an unbounded copy of the label, now bounded.
+
+Not in the table: the timing and information-flow assertions, glitched decisions, the Spectre-v1 shape, the C shims, shadow memory and the race detector.
+
 ## Revision 108 (tests: the network model against the loopback, datagrams and larger streams)
 
 `plan3.md` A4. `diff_net_test.zig` compared five stream scenarios with the real loopback interface; it compares ten. New: 256 KiB each way over one connection; three connections made before any is written to, written in the reverse order of connecting, each answered with its place in the accept order; three datagrams of 5, 1,200 and 1 bytes echoed back (boundaries and order kept); a datagram of 100 bytes received into 10 (the first 10 bytes and the truncation flag); a datagram of no bytes followed by one of one byte (both arrive, the first empty).

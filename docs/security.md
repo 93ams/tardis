@@ -430,6 +430,13 @@ sampling them. The result says whether the bound was covered without
 gaps. It is evidence within the model and the bound, never a proof
 beyond them.
 
+How often each detector finds its planted bug, and how often it
+complains about the fixed program, is measured by `zig build secrates`
+([`measurements.md`](measurements.md) §1). One limit it found: guided
+exploration keeps a parent input's run seed for the inputs it derives
+from it, so a program secret derived from the run seed is not hidden
+from the search.
+
 ## The evidence campaign
 
 `sec.certify(gpa, io, body, config, options)` runs a campaign and

@@ -293,6 +293,30 @@ pub fn build(b: *std.Build) void {
     const membench_step = b.step("membench", "Print the memory one simulator takes, by option");
     membench_step.dependOn(&b.addRunArtifact(membench).step);
 
+    // `zig build secrates`: the security layer's detection table
+    // (plan3.md A5), over the planted bugs of its own tests.
+    const secrates_mod = b.createModule(.{
+        .root_source_file = b.path("src/cmd/secrates/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = sec_imports,
+    });
+    for ([_][2][]const u8{
+        .{ "pillar1", "src/sec/tests/pillar1_test.zig" },
+        .{ "pillar2", "src/sec/tests/pillar2_test.zig" },
+        .{ "pillar45", "src/sec/tests/pillar45_test.zig" },
+    }) |m| secrates_mod.addImport(m[0], b.createModule(.{
+        .root_source_file = b.path(m[1]),
+        .target = target,
+        .optimize = optimize,
+        .imports = sec_imports,
+    }));
+    const secrates = b.addExecutable(.{ .name = "tardis-secrates", .root_module = secrates_mod });
+    const secrates_step = b.step("secrates", "Print how often the security layer's oracles find their planted bugs, and false alarms on the fixed versions");
+    secrates_step.dependOn(&b.addRunArtifact(secrates).step);
+    // Built by `zig build test`, so the table's program keeps compiling.
+    test_step.dependOn(&secrates.step);
+
     // `zig build bench`: simulator throughput, always optimized.
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),

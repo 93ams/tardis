@@ -713,6 +713,8 @@ Not verified, and the limits: threads switch only at system calls, so a thread s
 
 Still not verified after revision 99: glibc; C++; a Rust program that is an executable and not a library linked into the test; tokio's blocking pool, signals and child processes; `dup` of a socket (`TcpStream::try_clone`) or a file, `dup2` and `dup3`, which are stray. A caught signal that a thread sends itself ran its handler outside the simulation, unreported; since revision 105 it fails the run. The libc clock test is behind `-Dsqlite`: the default suite links no libc, so it has no test of this.
 
+**Revision 109: how often the security layer finds what it should.** A table for its oracles, like the core's: every planted bug of its tests found in every campaign of 200 iterations, no false alarm on a fixed program. One claim of a test did not hold: a hash seeded from the run's seed does not stop guided exploration, which keeps a parent's seed for the inputs it derives from it.
+
 **Revision 108: the network model against the loopback, again.** Ten scenarios where there were five: large streams, several connections at once, and datagrams. The model agreed with Linux on all of them and with Windows wherever Windows agrees with POSIX.
 
 **Revision 106: a thousand tasks.** Measured, a thousand tasks make a switch about twice as dear as two. A test runs a thousand tasks to their end, twice the same way.

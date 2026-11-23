@@ -69,11 +69,11 @@ fn heartbeatClient(env: *Env, bounds_checked: bool) !void {
     if (env.daemonError()) |err| return err;
 }
 
-fn heartbleed(env: *Env) !void {
+pub fn heartbleed(env: *Env) !void {
     return heartbeatClient(env, false);
 }
 
-fn heartbeatFixed(env: *Env) !void {
+pub fn heartbeatFixed(env: *Env) !void {
     return heartbeatClient(env, true);
 }
 
@@ -115,11 +115,11 @@ fn sendRecord(env: *Env, whole_buffer: bool) !void {
     try env.dir.writeFile(env.io, .{ .sub_path = "record.bin", .data = out });
 }
 
-fn uninitTail(env: *Env) !void {
+pub fn uninitTail(env: *Env) !void {
     return sendRecord(env, true);
 }
 
-fn initOnly(env: *Env) !void {
+pub fn initOnly(env: *Env) !void {
     return sendRecord(env, false);
 }
 
@@ -139,7 +139,7 @@ test "uninit: the unwritten tail of a heap buffer reaching a file is CWE-908" {
 // ---------------------------------------------------------------------------
 // Use after free reaching egress
 
-fn useAfterFree(env: *Env) !void {
+pub fn useAfterFree(env: *Env) !void {
     const msg = try env.allocator.alloc(u8, 32);
     @memcpy(msg, "session=7f3a9c21; path=/; secure");
     env.allocator.free(msg);
@@ -196,11 +196,11 @@ fn copyField(env: *Env, bounded: bool) !void {
     @memcpy(buf.ptr[0..n], input[0..n]);
 }
 
-fn overflowField(env: *Env) !void {
+pub fn overflowField(env: *Env) !void {
     return copyField(env, false);
 }
 
-fn boundedField(env: *Env) !void {
+pub fn boundedField(env: *Env) !void {
     return copyField(env, true);
 }
 
@@ -229,11 +229,11 @@ fn sendClaimed(env: *Env, bounded: bool) !void {
     try env.dir.writeFile(env.io, .{ .sub_path = "reply.bin", .data = buf.ptr[0..n] });
 }
 
-fn overRead(env: *Env) !void {
+pub fn overRead(env: *Env) !void {
     return sendClaimed(env, false);
 }
 
-fn boundedRead(env: *Env) !void {
+pub fn boundedRead(env: *Env) !void {
     return sendClaimed(env, true);
 }
 
@@ -259,15 +259,15 @@ fn keyLifecycle(env: *Env, zeroize: bool, leak: bool) !void {
     if (leak) try env.dir.writeFile(env.io, .{ .sub_path = "debug.log", .data = key[4..20] });
 }
 
-fn keyZeroized(env: *Env) !void {
+pub fn keyZeroized(env: *Env) !void {
     return keyLifecycle(env, true, false);
 }
 
-fn keyNotZeroized(env: *Env) !void {
+pub fn keyNotZeroized(env: *Env) !void {
     return keyLifecycle(env, false, false);
 }
 
-fn keyLogged(env: *Env) !void {
+pub fn keyLogged(env: *Env) !void {
     return keyLifecycle(env, true, true);
 }
 

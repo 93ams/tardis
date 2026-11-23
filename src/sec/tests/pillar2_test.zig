@@ -68,11 +68,11 @@ fn bankRun(env: *Env, inverted: bool) !void {
     try auditJob(io, &bank, inverted);
 }
 
-fn abba(env: *Env) !void {
+pub fn abba(env: *Env) !void {
     return bankRun(env, true);
 }
 
-fn ordered(env: *Env) !void {
+pub fn ordered(env: *Env) !void {
     return bankRun(env, false);
 }
 
@@ -118,11 +118,11 @@ fn spoolRun(env: *Env, inverted: bool) !void {
         try lockBoth(io, env.dir, "queue.lock", "index.lock");
 }
 
-fn fileAbba(env: *Env) !void {
+pub fn fileAbba(env: *Env) !void {
     return spoolRun(env, true);
 }
 
-fn fileOrdered(env: *Env) !void {
+pub fn fileOrdered(env: *Env) !void {
     return spoolRun(env, false);
 }
 
@@ -167,11 +167,11 @@ fn parseMessage(env: *Env, refetch: bool) !void {
     try env.always("the copy stays inside the message", m <= msg.data.len);
 }
 
-fn doubleFetch(env: *Env) !void {
+pub fn doubleFetch(env: *Env) !void {
     return parseMessage(env, true);
 }
 
-fn singleFetch(env: *Env) !void {
+pub fn singleFetch(env: *Env) !void {
     return parseMessage(env, false);
 }
 
@@ -217,11 +217,11 @@ fn publish(env: *Env, by_handle: bool) !void {
     try env.dir.writeFile(io, .{ .sub_path = "published.txt", .data = buf[0..n] });
 }
 
-fn toctou(env: *Env) !void {
+pub fn toctou(env: *Env) !void {
     return publish(env, false);
 }
 
-fn byHandle(env: *Env) !void {
+pub fn byHandle(env: *Env) !void {
     return publish(env, true);
 }
 
@@ -446,11 +446,11 @@ fn fetchRun(env: *Env, validated: bool) !void {
     if (env.daemonError()) |err| return err;
 }
 
-fn rawName(env: *Env) !void {
+pub fn rawName(env: *Env) !void {
     return fetchRun(env, false);
 }
 
-fn validatedName(env: *Env) !void {
+pub fn validatedName(env: *Env) !void {
     return fetchRun(env, true);
 }
 
@@ -700,15 +700,15 @@ fn leaderRun(env: *Env, echo: bool) !void {
     try env.always("followers never commit different values for one index", a == null or b == null or a.? == b.?);
 }
 
-fn trusting(env: *Env) !void {
+pub fn trusting(env: *Env) !void {
     return leaderRun(env, false);
 }
 
-fn echoing(env: *Env) !void {
+pub fn echoing(env: *Env) !void {
     return leaderRun(env, true);
 }
 
-const no_loss: tardis.FaultOptions = .{ .datagram_loss_ppm = 0, .datagram_duplicate_ppm = 0 };
+pub const no_loss: tardis.FaultOptions = .{ .datagram_loss_ppm = 0, .datagram_duplicate_ppm = 0 };
 
 test "equivocation: followers that trust one frame commit different values" {
     var shrunk: tardis.ShrinkReport = .{};
@@ -891,14 +891,14 @@ fn controlRun(env: *Env, durable: bool) !void {
     try env.always("each command takes effect once, in order", valve.inOrder());
 }
 
-fn forgetful(env: *Env) !void {
+pub fn forgetful(env: *Env) !void {
     return controlRun(env, false);
 }
 
 /// Replays made in the runs of `durableSeq` (one worker).
 var durable_replays: u32 = 0;
 
-fn durableSeq(env: *Env) !void {
+pub fn durableSeq(env: *Env) !void {
     defer durable_replays += sec.raceCounters().replays;
     return controlRun(env, true);
 }
@@ -981,14 +981,14 @@ fn smuggleRun(env: *Env, strict: bool) !void {
     try env.always("a client's text never runs as an admin frame", !executed);
 }
 
-fn batchParser(env: *Env) !void {
+pub fn batchParser(env: *Env) !void {
     return smuggleRun(env, false);
 }
 
 /// Rewrites made in the runs of `strictParser` (one worker).
 var strict_mutations: u32 = 0;
 
-fn strictParser(env: *Env) !void {
+pub fn strictParser(env: *Env) !void {
     defer strict_mutations += sec.raceCounters().mutations;
     return smuggleRun(env, true);
 }
@@ -1105,11 +1105,11 @@ fn frontendRun(env: *Env, reconnect_late: bool) !void {
     if (env.daemonError()) |err| return err;
 }
 
-fn lateReconnect(env: *Env) !void {
+pub fn lateReconnect(env: *Env) !void {
     return frontendRun(env, true);
 }
 
-fn keptConnection(env: *Env) !void {
+pub fn keptConnection(env: *Env) !void {
     return frontendRun(env, false);
 }
 
@@ -1191,7 +1191,7 @@ fn jobRun(env: *Env, job: Job) !void {
     if (env.daemonError()) |err| return err;
 }
 
-fn rawCommand(env: *Env) !void {
+pub fn rawCommand(env: *Env) !void {
     return jobRun(env, .{ .validated = false });
 }
 
@@ -1203,7 +1203,7 @@ fn noSpawn(env: *Env) !void {
     return jobRun(env, .{ .validated = true, .may_spawn = false });
 }
 
-fn queuedOnly(env: *Env) !void {
+pub fn queuedOnly(env: *Env) !void {
     return jobRun(env, .{ .validated = true });
 }
 

@@ -59,7 +59,7 @@ fn loadKeys(env: *Env, randomized: bool) !void {
     }
 }
 
-fn fixedHash(env: *Env) !void {
+pub fn fixedHash(env: *Env) !void {
     return loadKeys(env, false);
 }
 
@@ -67,7 +67,7 @@ fn fixedHash(env: *Env) !void {
 /// comparisons. All in one bucket cost 1 + 2 + ... + 16 = 136. The limit
 /// sits at 3 per byte (96 comparisons), which needs about 13 keys in one
 /// bucket: about 1 run in 10^10 at random.
-const hashdos_limits: sec.AmplificationLimits = .{ .work_per_input_byte_milli_max = 3_000 };
+pub const hashdos_limits: sec.AmplificationLimits = .{ .work_per_input_byte_milli_max = 3_000 };
 
 test "hashdos: guided exploration synthesizes a colliding key set (CWE-407)" {
     var report: sec.engine.Report = .{};
@@ -97,12 +97,19 @@ test "hashdos: random exploration does not find it" {
     }));
 }
 
-fn randomizedHash(env: *Env) !void {
+pub fn randomizedHash(env: *Env) !void {
     return loadKeys(env, true);
 }
 
-test "hashdos fixed: a per-process hash seed keeps the guided search from converging" {
-    // Collisions found under one seed do not carry over to the next run.
+test "hashdos fixed: a hash seeded from the run is not flooded in this campaign" {
+    // Weaker than it looks: a mutated input keeps its parent's run seed
+    // (`Corpus.mutate` copies the entry), so the hash seed is the same for
+    // a parent and its children, and the search can still converge on it.
+    // `zig build secrates` measured it: 5 of 20 campaigns of 50,000
+    // guided iterations flood the seeded table (11 of 20 flood the fixed
+    // hash, whose multiplier differs, so the two are not a controlled
+    // comparison). This campaign of 10,000, with the default campaign
+    // seed, does not.
     try tardis.check(gpa, randomizedHash, sec.withSecurity(.{
         .amplification = hashdos_limits,
         .base = .{ .iterations = 10_000, .explore = .guided },
