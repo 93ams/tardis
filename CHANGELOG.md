@@ -5,6 +5,18 @@ numbers (§) are `plan2.md`'s unless an entry names `plan.md`. Revision 1
 was the first draft of `plan2.md`; the core's earlier history is in
 `plan.md` §9 and §14.
 
+## Revision 101 (core: `dup` of a socket and of a file in system-call mode)
+
+Revision 99 left `dup` of a socket or a file stray, so Rust's `TcpStream::try_clone` and `File::try_clone`, the usual way to give a connection's reading half to one thread and its writing half to another, failed the run. `dup`, and `fcntl` with `F_DUPFD` or `F_DUPFD_CLOEXEC`, now give a socket (`sysnet.zig`), a file or a directory (`sysemu.zig`) a second descriptor: one socket or one open file under two numbers, with one position and one set of flags (`O_NONBLOCK`, `O_APPEND`), closed when its last number is. A number that is closed is no descriptor from then on, though its duplicate lives; a node's crash closes its duplicates with its files and sockets.
+
+Tests: in system-call mode by the calls themselves (a file, a directory, a connection, a listener, an epoll set over a duplicate, a crash), and in Rust, where a thread reads a connection through `try_clone` while another writes it, and a file's clone moves the position the file reads from (`test/rust`, now eight tests).
+
+**Review.** A fresh reviewer read the change and found no fault in how the numbers and the tables are kept, and three at the edges, all fixed and tested. `mmap` of a file's duplicate went to the kernel, which said `EBADF`, where `mmap` of the file fails the run: the trap knew a simulated file by one bit of its number, and now takes every number from `0x1000_0000` up, so `mmap` of a socket or a pipe fails the run too, which it did not before this revision either. `fcntl(F_DUPFD_CLOEXEC)` of the random device said `EINVAL` and of the root descriptor `EBADF`, where `dup` of either is stray: both are stray now. And what was kept of a file's duplicates outlived a crash, harmless only because a handle's value changes with each crash: it is dropped with the node.
+
+Tested on Linux (WSL2, kernel 6.18): the library suite, 273 passed, 2 skipped, with the 39 other binaries and the bug benchmark; SQLite 7 of 7; Rust 8 of 8 in Debug and ReleaseSafe. Windows: the four build modes and `-Dsec` pass.
+
+**Limits.** `dup2` and `dup3` are stray: they name the number to take, and a program that moves a descriptor onto 0, 1 or 2 wants a real one. So is `dup` of the root descriptor and of the random device. As for a pipe (revision 99): a number leaves the epoll sets it is in when it is closed, and a task in `poll` on it sees `POLLNVAL`, where Linux keeps both while a duplicate lives; `F_DUPFD`'s lowest number is ignored. A run has 64 duplicates of sockets and 64 of files, over all its nodes; the next fails with `EMFILE`.
+
 ## Revision 100 (model: four more cases on ext4, and a rename over a file with the journal full)
 
 Four cases the reviews of revisions 96 and 98 said were untried, run on the real ext4 as before (`scripts/powercut/ext4.sh` 4o to 4r, five rounds and then eight, the same each time).

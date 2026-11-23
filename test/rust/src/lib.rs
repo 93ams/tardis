@@ -119,6 +119,68 @@ pub extern "C" fn rust_files_kept() -> i32 {
     }
 }
 
+/// `try_clone` (a `dup`): one connection read by a thread and written by
+/// another, and one file under two handles that share a position.
+#[no_mangle]
+pub extern "C" fn rust_try_clone() -> i32 {
+    use std::io::{Seek, SeekFrom};
+    let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:7010") else { return 1 };
+    let server = std::thread::spawn(move || {
+        let (mut conn, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 64];
+        loop {
+            let n = conn.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            conn.write_all(&buf[..n]).unwrap();
+        }
+    });
+    let Ok(mut writer) = std::net::TcpStream::connect("127.0.0.1:7010") else { return 2 };
+    let Ok(mut reader) = writer.try_clone() else { return 3 };
+    let read = std::thread::spawn(move || -> usize {
+        let mut total = 0;
+        let mut buf = [0u8; 64];
+        while total < 200 {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => total += n,
+            }
+        }
+        total
+    });
+    for _ in 0..5 {
+        if writer.write_all(&[7u8; 40]).is_err() {
+            return 4;
+        }
+    }
+    if read.join().unwrap_or(0) != 200 {
+        return 5;
+    }
+    // The reader's handle went with its thread; this is the last one, and
+    // the server reads the end only now.
+    drop(writer);
+    if server.join().is_err() {
+        return 6;
+    }
+    let Ok(mut f) = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open("clone.txt") else {
+        return 7;
+    };
+    let Ok(mut g) = f.try_clone() else { return 8 };
+    if f.write_all(b"abcdef").is_err() {
+        return 9;
+    }
+    if g.seek(SeekFrom::Start(2)).is_err() {
+        return 10;
+    }
+    drop(g);
+    let mut two = [0u8; 2];
+    if f.read_exact(&mut two).is_err() || &two != b"cd" {
+        return 11;
+    }
+    0
+}
+
 /// A blocking TCP echo: a thread serves, three threads are clients.
 #[no_mangle]
 pub extern "C" fn rust_tcp() -> i32 {

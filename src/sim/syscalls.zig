@@ -143,10 +143,13 @@ fn onSigsys(_: i32, _: ?*anyopaque, context: ?*anyopaque) callconv(.c) void {
     const gregs: [*]u64 = @ptrFromInt(@intFromPtr(context.?) + gregs_offset);
     const number = gregs[@backingInt(Reg.rax)];
     const a = gregs[@backingInt(Reg.rdi)];
-    // A file mapping of a simulated descriptor (bit 30, `sysemu.zig`) is
-    // not the allocator's `mmap`: the kernel has no such file.
+    // A file mapping of a simulated descriptor is not the allocator's
+    // `mmap`: the kernel has no such file. Every simulated number, a
+    // file's, its duplicate's, a socket's or a pipe's, is from 0x1000_0000
+    // up, where the kernel has none.
+    const map_fd: u32 = @truncate(gregs[@backingInt(Reg.r8)]);
     const maps_simulated = number == 9 and gregs[@backingInt(Reg.r10)] & 0x20 == 0 and // MAP_ANONYMOUS
-        gregs[@backingInt(Reg.r8)] & 0xC000_0000 == 0x4000_0000;
+        map_fd >= 0x1000_0000 and map_fd < 0x8000_0000;
     const first = emulator != null and emulatorFirst(number);
     stray: {
         if (!(maps_simulated or first or !expected(number, a))) break :stray;

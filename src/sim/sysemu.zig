@@ -33,8 +33,13 @@
 //! process), `O_NOFOLLOW`, `O_PATH`, `O_DIRECT`, `O_SYNC`. `O_TRUNC`
 //! without `O_CREAT` is an open and then a truncation, two steps another
 //! task can come between. A sleep that is canceled returns `EINTR` and the
-//! cancellation is spent. `O_TMPFILE`, `mmap` of a simulated file, `dup`,
-//! pipes and `poll` are not emulated (sockets are, `sysnet.zig`): they are stray, as is any
+//! cancellation is spent. `dup`, and `fcntl` with `F_DUPFD` or
+//! `F_DUPFD_CLOEXEC`, give a file or a directory a second descriptor with
+//! the same position and flags (`dups`, below), as they do a socket
+//! (`sysnet.zig`) and a pipe, an eventfd or an epoll set (`sysfd.zig`).
+//! `O_TMPFILE`, `mmap` of a simulated file, `dup2`, `dup3` and `select`
+//! are not emulated: they are stray, as is `dup` of the root descriptor
+//! or of the random device, any
 //! path under `/proc`, `/sys` or `/dev` (but `/dev/urandom`) and any call
 //! relative to a directory descriptor the simulator did not issue. The
 //! root descriptor (`root_fd`) serves as a directory to be relative to,
@@ -149,6 +154,81 @@ fn handleOf(s: *Sim, fd: i32) ?*vfs_mod.Handle {
     return s.vfs.handle(valueOf(fd)) catch null;
 }
 
+// --- duplicates ---------------------------------------------------------------
+
+/// The first descriptor `dup` gives for a file: between the sockets'
+/// numbers and the files'.
+pub const dup_base: i32 = 0x3000_0000;
+const dups_max = 64;
+
+/// A handle of a node's file system.
+const Held = struct {
+    used: bool = false,
+    node: u16 = 0,
+    value: u32 = 0,
+
+    /// False once the handle is closed, or its node has crashed.
+    fn live(h: Held, s: *Sim) bool {
+        if (!h.used) return false;
+        _ = s.nodes[h.node].vfs.handle(h.value) catch return false;
+        return true;
+    }
+};
+
+/// `dups[i]` is the handle that descriptor `dup_base + i` is a second
+/// number for. The position and the flags are the handle's, so the two
+/// share them, as two descriptors of one open file description do.
+threadlocal var dups: [dups_max]Held = @splat(.{});
+/// The handles whose own descriptor was closed while a duplicate was
+/// open: that number is no longer a descriptor, and the handle lives.
+threadlocal var orphans: [dups_max]Held = @splat(.{});
+
+/// A descriptor number that is in the simulated range and never open.
+const dead_fd: i32 = @bitCast(fd_bit);
+
+fn isDupFd(fd: i32) bool {
+    return fd >= dup_base and fd < dup_base + dups_max;
+}
+
+fn holds(s: *Sim, table: *[dups_max]Held, node: u16, value: u32) ?*Held {
+    for (table) |*h| if (h.node == node and h.value == value and h.live(s)) return h;
+    return null;
+}
+
+/// The descriptor a call names, as the handle's own number: a duplicate
+/// becomes the number it duplicates, and a number that was closed while
+/// its duplicate lives becomes one that is not open.
+fn resolve(s: *Sim, fd: i32) i32 {
+    if (isDupFd(fd)) {
+        const d = dups[@intCast(fd - dup_base)];
+        return if (d.used and d.node == s.currentNode()) @bitCast(d.value | fd_bit) else dead_fd;
+    }
+    if (!simulated(fd) or fd == root_fd or fd == random_fd) return fd;
+    return if (holds(s, &orphans, s.currentNode(), valueOf(fd)) != null) dead_fd else fd;
+}
+
+/// A node crashed (null: every node): its duplicates are gone with its
+/// handles.
+pub fn dropNode(node: ?u16) void {
+    for ([_]*[dups_max]Held{ &dups, &orphans }) |table| {
+        for (table) |*h| {
+            if (node == null or h.node == node.?) h.* = .{};
+        }
+    }
+}
+
+/// `dup` of a file or a directory.
+fn duplicate(s: *Sim, fd: i32) ?u64 {
+    if (fd == root_fd or fd == random_fd) return null;
+    if (handleOf(s, fd) == null) return fail(.BADF);
+    for (&dups, 0..) |*d, i| {
+        if (d.live(s)) continue;
+        d.* = .{ .used = true, .node = s.currentNode(), .value = valueOf(fd) };
+        return @intCast(dup_base + @as(i32, @intCast(i)));
+    }
+    return fail(.MFILE);
+}
+
 fn cstr(ptr: u64) ?[]const u8 {
     if (ptr == 0) return null;
     return std.mem.span(@as([*:0]const u8, @ptrFromInt(ptr)));
@@ -241,7 +321,8 @@ pub const DescriptorKind = enum {
     pollable,
 };
 
-pub fn descriptorKind(s: *Sim, fd: i32) DescriptorKind {
+pub fn descriptorKind(s: *Sim, raw: i32) DescriptorKind {
+    const fd = resolve(s, raw);
     if (sysnet.isSocketFd(fd)) return if (sysnet.pollMask(s, fd) == sysnet.pollnval) .closed else .pollable;
     if (sysfd.isFd(fd)) return if (sysfd.pollMask(fd) == sysfd.poll_nval and !sysfd.isEpoll(fd)) .closed else .pollable;
     if (!simulated(fd)) return .real;
@@ -249,7 +330,8 @@ pub fn descriptorKind(s: *Sim, fd: i32) DescriptorKind {
 }
 
 /// The events a simulated descriptor has now, as `poll` names them.
-pub fn descriptorMask(s: *Sim, fd: i32) u16 {
+pub fn descriptorMask(s: *Sim, raw: i32) u16 {
+    const fd = resolve(s, raw);
     if (sysnet.isSocketFd(fd)) return sysnet.pollMask(s, fd);
     if (sysfd.isFd(fd)) return sysfd.pollMask(fd);
     if (fd == root_fd or fd == random_fd or (simulated(fd) and handleOf(s, fd) != null))
@@ -262,6 +344,8 @@ pub fn resetRun() void {
     sysnet.reset();
     sysfd.reset();
     systhread.reset();
+    dups = @splat(.{});
+    orphans = @splat(.{});
 }
 
 /// Entry point for `syscalls.zig`: the value for `rax`, or null for a
@@ -269,7 +353,9 @@ pub fn resetRun() void {
 pub fn emulate(number: u64, a: *const [6]u64) ?u64 {
     const s = Sim.activeOrNull() orelse return null;
     if (!s.config.emulate_syscalls) return null;
-    const fd = fdOf(a[0]);
+    const raw = fdOf(a[0]);
+    // A file's duplicate is the file's own number from here on.
+    const fd = resolve(s, raw);
     // Sockets, and any call on a socket descriptor (`sysnet.zig`).
     if ((number >= 41 and number <= 55) or number == 288) {
         if (number != 41) sysfd.touched(fd);
@@ -306,13 +392,16 @@ pub fn emulate(number: u64, a: *const [6]u64) ?u64 {
         85 => open(s, at_fdcwd, a[0], o_creat | o_wronly | o_trunc), // creat
         257 => open(s, fd, a[1], @truncate(a[2])),
         // Calls on a descriptor: only on one of ours.
-        0, 1, 3, 5, 8, 17, 18, 19, 20, 72, 74, 75, 77, 91, 93, 217, 295, 296 => {
+        0, 1, 3, 5, 8, 17, 18, 19, 20, 32, 72, 74, 75, 77, 91, 93, 217, 295, 296 => {
             if (!simulated(fd)) return null;
-            if (fd == random_fd) return randomDevice(s, number, a);
+            // A duplicate of the random device is not emulated.
+            const dups_it = number == 32 or (number == 72 and (@as(u32, @truncate(a[1])) == 0 or @as(u32, @truncate(a[1])) == 1030));
+            if (fd == random_fd) return if (dups_it) null else randomDevice(s, number, a);
             return switch (number) {
                 0 => read(s, fd, a[1], a[2], null),
                 1 => write(s, fd, a[1], a[2], null),
-                3 => close(s, fd),
+                3 => close(s, raw),
+                32 => duplicate(s, fd),
                 5 => fstat(s, fd, a[1]),
                 8 => lseek(s, fd, @bitCast(a[1]), @truncate(a[2])),
                 17 => read(s, fd, a[1], a[2], a[3]),
@@ -332,8 +421,8 @@ pub fn emulate(number: u64, a: *const [6]u64) ?u64 {
         },
         76 => truncate(s, a[0], a[1]),
         82 => rename(s, at_fdcwd, a[0], at_fdcwd, a[1], 0),
-        264 => rename(s, fd, a[1], fdOf(a[2]), a[3], 0),
-        316 => rename(s, fd, a[1], fdOf(a[2]), a[3], @truncate(a[4])),
+        264 => rename(s, fd, a[1], resolve(s, fdOf(a[2])), a[3], 0),
+        316 => rename(s, fd, a[1], resolve(s, fdOf(a[2])), a[3], @truncate(a[4])),
         87 => unlink(s, at_fdcwd, a[0], 0),
         84 => unlink(s, at_fdcwd, a[0], at_removedir),
         263 => unlink(s, fd, a[1], @truncate(a[2])),
@@ -490,9 +579,26 @@ fn vectorsRandom(s: *Sim, iov_ptr: u64, count: u64) u64 {
     return getrandom(s, first[0], first[1]);
 }
 
-fn close(s: *Sim, fd: i32) u64 {
-    if (fd == root_fd) return 0; // always open
+fn close(s: *Sim, raw: i32) u64 {
+    if (raw == root_fd) return 0; // always open
+    const fd = resolve(s, raw);
     if (handleOf(s, fd) == null) return fail(.BADF);
+    const node = s.currentNode();
+    const value = valueOf(fd);
+    if (isDupFd(raw)) {
+        dups[@intCast(raw - dup_base)] = .{};
+        // The handle is closed with its last number.
+        if (holds(s, &dups, node, value) != null) return 0;
+        (holds(s, &orphans, node, value) orelse return 0).* = .{};
+    } else if (holds(s, &dups, node, value) != null) {
+        // As many orphans as duplicates at most: there is room.
+        for (&orphans) |*o| {
+            if (o.live(s)) continue;
+            o.* = .{ .used = true, .node = node, .value = value };
+            return 0;
+        }
+        unreachable;
+    }
     fileOf(fd).close(s.io());
     return 0;
 }
@@ -646,9 +752,10 @@ fn truncate(s: *Sim, path_ptr: u64, len: u64) ?u64 {
 /// record locks, every one of which is granted: POSIX record locks belong
 /// to the process, so within one process they never conflict.
 fn fcntl(s: *Sim, fd: i32, cmd: u32, arg: u64) ?u64 {
+    // F_DUPFD, F_DUPFD_CLOEXEC; of the root descriptor, a stray, as `dup`.
+    if (cmd == 0 or cmd == 1030) return duplicate(s, fd);
     const h = handleOf(s, fd) orelse return fail(.BADF);
     switch (cmd) {
-        0, 1030 => return null, // F_DUPFD, F_DUPFD_CLOEXEC: no `dup` either
         1 => return 1, // F_GETFD: close-on-exec, which no simulated descriptor outlives
         2 => return 0, // F_SETFD
         3 => { // F_GETFL

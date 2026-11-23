@@ -84,6 +84,18 @@ test "rust: a blocking TCP echo, a thread for each connection" {
     try tardis.check(testing.allocator, tcp, options);
 }
 
+extern fn rust_try_clone() c_int;
+
+fn tryClone(env: *Env) !void {
+    _ = env;
+    try testing.expectEqual(@as(c_int, 0), rust_try_clone());
+}
+
+test "rust: try_clone of a TcpStream and of a File" {
+    if (skip()) return error.SkipZigTest;
+    try tardis.check(testing.allocator, tryClone, options);
+}
+
 threadlocal var orders: [2]u64 = @splat(0);
 threadlocal var order_count: usize = 0;
 

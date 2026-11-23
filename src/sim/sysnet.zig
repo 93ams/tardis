@@ -14,6 +14,14 @@
 //! frees its slots (`dropNode`), as a process's death closes its
 //! descriptors.
 //!
+//! `dup`, and `fcntl` with `F_DUPFD` or `F_DUPFD_CLOEXEC`, give a second
+//! number for a slot (`aliases`): one socket, with one set of flags, that
+//! is closed when its last number is. `dup2` and `dup3` are stray. As
+//! for a pipe (`sysfd.zig`), a number leaves the epoll sets it is in
+//! when it is closed, and a `poll` on it sees `POLLNVAL`, where Linux
+//! keeps both while a duplicate lives. A run has `aliases_max`
+//! duplicates over all its nodes.
+//!
 //! Emulated: `socket` (IPv4, stream or datagram, blocking), `bind`,
 //! `listen`, `accept`, `accept4`, `connect`, `read`, `write`, `readv`,
 //! `writev`, `recvfrom`, `sendto`, `shutdown`, `close`, `getsockname`,
@@ -118,6 +126,8 @@ const Slot = struct {
     /// Datagrams that arrived before a datagram socket's `connect`: Linux
     /// keeps them whatever their source, and filters only later ones.
     unfiltered: u32 = 0,
+    /// Its own number was closed, and a duplicate keeps the socket.
+    primary_closed: bool = false,
 };
 
 const unspecified: ionet.IpAddress = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } };
@@ -126,9 +136,15 @@ const unspecified: ionet.IpAddress = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .por
 threadlocal var slots: [slots_max]Slot = @splat(.{});
 threadlocal var next_gen: u32 = 0;
 
+/// The descriptors `dup` made, after the slots' own numbers: the slot
+/// each is a second number for.
+const aliases_max = 64;
+threadlocal var aliases: [aliases_max]?u16 = @splat(null);
+
 /// A run begins: no socket is open.
 pub fn reset() void {
     slots = @splat(.{});
+    aliases = @splat(null);
 }
 
 /// A node crashed (null: every node): its descriptors are gone. The
@@ -139,10 +155,38 @@ pub fn dropNode(node: ?u16) void {
         if (node) |n| if (slot.node != n) continue;
         slot.* = .{};
     }
+    for (&aliases) |*alias| {
+        if (alias.*) |index| if (slots[index].kind == .free) {
+            alias.* = null;
+        };
+    }
 }
 
 pub fn isSocketFd(fd: i32) bool {
-    return fd >= fd_base and fd < fd_base + slots_max;
+    return fd >= fd_base and fd < fd_base + slots_max + aliases_max;
+}
+
+/// The slot a descriptor is a number for, if it is open.
+fn indexOf(fd: i32) ?usize {
+    if (!isSocketFd(fd)) return null;
+    const n: usize = @intCast(fd - fd_base);
+    if (n >= slots_max) return if (aliases[n - slots_max]) |index| index else null;
+    return if (slots[n].kind == .free or slots[n].primary_closed) null else n;
+}
+
+fn aliased(index: usize) bool {
+    for (aliases) |alias| if (alias != null and alias.? == index) return true;
+    return false;
+}
+
+/// `dup`: another number for the slot.
+fn duplicate(index: usize) u64 {
+    for (&aliases, 0..) |*alias, i| {
+        if (alias.* != null) continue;
+        alias.* = @intCast(index);
+        return fdOf(slots_max + i);
+    }
+    return fail(.MFILE);
 }
 
 fn fail(e: E) u64 {
@@ -150,9 +194,7 @@ fn fail(e: E) u64 {
 }
 
 fn slotOf(fd: i32) ?*Slot {
-    if (!isSocketFd(fd)) return null;
-    const s = &slots[@intCast(fd - fd_base)];
-    return if (s.kind == .free) null else s;
+    return &slots[indexOf(fd) orelse return null];
 }
 
 /// Takes a free slot for the current node.
@@ -290,7 +332,11 @@ pub fn emulate(s: *Sim, number: u64, a: *const [6]u64) ?u64 {
             fail(.NOTCONN),
         54 => 0, // setsockopt: accepted, changes nothing
         55 => getsockopt(s, slot, a[1], a[2], a[3], a[4]),
-        72 => fcntl(slot, @truncate(a[1]), a[2]),
+        32 => duplicate(indexOf(fd).?),
+        72 => switch (@as(u32, @truncate(a[1]))) {
+            0, 1030 => duplicate(indexOf(fd).?), // F_DUPFD, F_DUPFD_CLOEXEC
+            else => |cmd| fcntl(slot, cmd, a[2]),
+        },
         // ioctl: FIONBIO, as `fcntl`'s O_NONBLOCK (Rust's `set_nonblocking`).
         16 => if (@as(u32, @truncate(a[1])) != 0x5421) null else if (a[2] == 0) fail(.FAULT) else blk: {
             slot.nonblock = @as(*align(1) const i32, @ptrFromInt(a[2])).* != 0;
@@ -846,7 +892,16 @@ fn shutdown(s: *Sim, slot: *Slot, how: u64) u64 {
 }
 
 fn close(s: *Sim, fd: i32) u64 {
-    const slot = &slots[@intCast(fd - fd_base)];
+    const index = indexOf(fd).?;
+    const slot = &slots[index];
+    const n: usize = @intCast(fd - fd_base);
+    if (n >= slots_max) aliases[n - slots_max] = null else slot.primary_closed = true;
+    if (!slot.primary_closed or aliased(index)) {
+        // Another number keeps the socket. This one leaves the epoll sets.
+        sysfd.forget(fd);
+        s.wakeNetwork();
+        return 0;
+    }
     switch (slot.kind) {
         .bound, .listening, .stream, .dgram => {
             const io = s.io();

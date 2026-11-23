@@ -233,8 +233,8 @@ runtimes (`zig build test-rust -Drust=<library>`).
 What to know before relying on it:
 
 - IPv4 sockets are emulated, blocking and non-blocking, with pipes,
-  `eventfd`, `poll` and `epoll`. `select`, `mmap` of a file, `fork`, and
-  `dup` of a socket or a file are stray calls. Simulated descriptor numbers are large, so a
+  `eventfd`, `poll` and `epoll`. `select`, `mmap` of a file, `fork`,
+  `dup2` and `dup3` are stray calls. Simulated descriptor numbers are large, so a
   library that indexes a table by descriptor (libuv, libevent) will not
   work.
 - Edge-triggered `epoll` reports every edge Linux does and some it does

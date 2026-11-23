@@ -29,6 +29,7 @@ const explore = @import("../search/explore.zig");
 const persist = @import("../search/persist.zig");
 const seam = @import("sec_seam.zig");
 const syscalls = @import("syscalls.zig");
+const sysemu = @import("sysemu.zig");
 const sysnet = @import("sysnet.zig");
 const sysfd = @import("sysfd.zig");
 const systhread = @import("systhread.zig");
@@ -1911,6 +1912,7 @@ pub fn crashAndReboot(s: *Sim, mode: CrashMode) void {
     for (s.nodes, 0..) |*n, i| s.crashVfs(&n.vfs, @intCast(i), mode);
     s.dropTasks(null);
     s.net.reset();
+    sysemu.dropNode(null);
     sysnet.dropNode(null);
     sysfd.dropNode(null);
     systhread.dropNode(null);
@@ -1978,6 +1980,7 @@ pub fn crashNode(s: *Sim, node: NodeId, mode: CrashMode) void {
     }
     s.crashVfs(&s.nodes[node].vfs, node, mode);
     s.dropTasks(node);
+    sysemu.dropNode(node);
     sysnet.dropNode(node);
     sysfd.dropNode(node);
     systhread.dropNode(node);

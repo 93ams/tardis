@@ -225,7 +225,8 @@ each and two sharing one connection.
 
 One Rust crate, written for the test (`test/rust`, Rust 1.99, tokio 1.54):
 threads, a mutex, a channel, a timed wait, files across a power loss, a
-blocking TCP echo, and a TCP echo on tokio's single-threaded runtime and
+blocking TCP echo, a connection and a file shared through `try_clone`,
+and a TCP echo on tokio's single-threaded runtime and
 on its work-stealing one with two and four workers.
 
 No C library that uses the network has been run this way.

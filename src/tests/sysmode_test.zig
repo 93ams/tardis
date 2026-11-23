@@ -543,6 +543,35 @@ fn mapsSimulatedFile(env: *Env) !void {
     try testing.expect(rc < 0);
 }
 
+/// A duplicate's number is not a file's (bit 30), and is no more the
+/// kernel's to map (found by review, revision 101: it went to the kernel,
+/// which said `EBADF`, and the run passed).
+fn mapsDuplicate(env: *Env) !void {
+    _ = env;
+    const fd = try open("m", o_creat | o_rdwr);
+    defer close(fd);
+    const d = try ok(sys(.dup, fd, 0, 0, 0));
+    defer close(d);
+    const rc: isize = @bitCast(linux.syscall6(.mmap, 0, 4096, 1, 2, d, 0));
+    try testing.expect(rc < 0);
+}
+
+/// The random device and the root descriptor are not duplicated, by `dup`
+/// or by `fcntl` (found by review, revision 101: `fcntl` said `EINVAL`
+/// and `EBADF`, which a program takes for an answer).
+fn duplicatesRandomDevice(env: *Env) !void {
+    _ = env;
+    const fd = try open("/dev/urandom", o_rdonly);
+    defer close(fd);
+    _ = sys(.fcntl, fd, 1030, 3, 0);
+}
+
+fn duplicatesRoot(env: *Env) !void {
+    _ = env;
+    const fd: usize = @intCast(tardis.syscall_root_fd);
+    _ = sys(.fcntl, fd, 0, 0, 0);
+}
+
 fn opensHostTree(env: *Env) !void {
     _ = env;
     const rc = openAt(cwd, "/proc/self/no-such-file", o_rdonly);
@@ -692,6 +721,9 @@ test "system-call mode: a call that is not emulated, or on a real descriptor, fa
     try testing.expectError(error.StraySyscall, tardis.check(gpa, readsRealDescriptor, options));
     try testing.expectError(error.StraySyscall, tardis.check(gpa, opensBesideRealDescriptor, options));
     try testing.expectError(error.StraySyscall, tardis.check(gpa, mapsSimulatedFile, options));
+    try testing.expectError(error.StraySyscall, tardis.check(gpa, mapsDuplicate, options));
+    try testing.expectError(error.StraySyscall, tardis.check(gpa, duplicatesRandomDevice, options));
+    try testing.expectError(error.StraySyscall, tardis.check(gpa, duplicatesRoot, options));
     try testing.expectError(error.StraySyscall, tardis.check(gpa, opensHostTree, options));
 }
 
@@ -2094,6 +2126,148 @@ fn duplicates(env: *Env) !void {
 test "system-call mode: a duplicate is a second descriptor for the same pipe, counter or epoll set" {
     if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
     try tardis.check(gpa, duplicates, .{ .iterations = 20, .mode = .syscalls });
+}
+
+/// `dup` of a file and of a socket (Rust's `File::try_clone` and
+/// `TcpStream::try_clone` are `fcntl(F_DUPFD_CLOEXEC)`): one open file,
+/// one position and one set of flags under two numbers, closed with the
+/// last of them.
+fn duplicatesOfFilesAndSockets(env: *Env) !void {
+    var buf: [8]u8 = undefined;
+    {
+        const f = try open("dup", o_creat | o_rdwr | o_trunc);
+        try writeAll(f, "abcdef");
+        const d = try ok(sys(.fcntl, f, 1030, 3, 0)); // F_DUPFD_CLOEXEC
+        try testing.expect(d != f);
+        // One position: set through one, read through the other.
+        try testing.expectEqual(@as(usize, 0), try ok(sys(.lseek, d, 0, 0, 0)));
+        try readAll(f, buf[0..3]);
+        try testing.expectEqualStrings("abc", buf[0..3]);
+        try testing.expectEqual(@as(usize, 3), try ok(sys(.lseek, d, 0, 1, 0)));
+        // One set of flags.
+        _ = try ok(sys(.fcntl, d, 4, o_append, 0)); // F_SETFL
+        try testing.expect(try ok(sys(.fcntl, f, 3, 0, 0)) & o_append != 0);
+        _ = try ok(sys(.fcntl, f, 4, 0, 0));
+        // The first number is closed: it is no descriptor, and the file is open.
+        _ = try ok(sys(.close, f, 0, 0, 0));
+        try testing.expectEqual(errOf(.BADF), sys(.read, f, @intFromPtr(&buf), 1, 0));
+        try testing.expectEqual(errOf(.BADF), sys(.close, f, 0, 0, 0));
+        try testing.expectEqual(errOf(.BADF), sys(.dup, f, 0, 0, 0));
+        try readAll(d, buf[0..3]);
+        try testing.expectEqualStrings("def", buf[0..3]);
+        try writeAll(d, "gh");
+        try fsync(d);
+        // A file opened now is not taken for the number that was closed.
+        const other = try open("other", o_creat | o_rdwr | o_trunc);
+        try writeAll(other, "x");
+        var st: [144]u8 = undefined;
+        _ = try ok(sys(.fstat, d, @intFromPtr(&st), 0, 0));
+        const d2 = try ok(sys(.dup, d, 0, 0, 0));
+        _ = try ok(sys(.close, d, 0, 0, 0));
+        try testing.expectEqual(errOf(.BADF), sys(.lseek, d, 0, 1, 0));
+        try testing.expectEqual(@as(usize, 8), try ok(sys(.lseek, d2, 0, 1, 0)));
+        _ = try ok(sys(.close, d2, 0, 0, 0));
+        try testing.expectEqual(errOf(.BADF), sys(.lseek, d2, 0, 1, 0));
+        try testing.expectEqual(@as(usize, 1), try ok(sys(.lseek, other, 0, 1, 0)));
+        close(other);
+        var content: [16]u8 = undefined;
+        try testing.expectEqualStrings("abcdefgh", try env.dir.readFile(env.io, "dup", &content));
+        // A directory too, to be relative to.
+        const dir = try open(".", o_rdonly | o_directory);
+        const dir2 = try ok(sys(.dup, dir, 0, 0, 0));
+        close(dir);
+        const again = openAt(dir2, "dup", o_rdonly);
+        try testing.expect(again > 0);
+        close(@intCast(again));
+        close(dir2);
+    }
+    {
+        const l = try ok(sys(.socket, 2, 1, 0, 0));
+        const at = sockaddr(.{ 127, 0, 0, 1 }, 7300);
+        _ = try ok(sys(.bind, l, @intFromPtr(&at), @sizeOf(SockaddrIn), 0));
+        _ = try ok(sys(.listen, l, 8, 0, 0));
+        const c = try ok(sys(.socket, 2, 1, 0, 0));
+        _ = try ok(sys(.connect, c, @intFromPtr(&at), @sizeOf(SockaddrIn), 0));
+        const conn = try ok(sys(.accept, l, 0, 0, 0));
+        // A reader and a writer of one connection, as `try_clone` makes.
+        const writer = try ok(sys(.fcntl, c, 1030, 3, 0));
+        try testing.expect(writer != c);
+        try writeAll(writer, "ping");
+        try readAll(conn, buf[0..4]);
+        try testing.expectEqualStrings("ping", buf[0..4]);
+        // O_NONBLOCK is the socket's, whichever number sets it.
+        _ = try ok(sys(.fcntl, writer, 4, o_nonblock, 0));
+        try testing.expectEqual(errOf(.AGAIN), sys(.read, c, @intFromPtr(&buf), 4, 0));
+        _ = try ok(sys(.fcntl, c, 4, 0, 0));
+        // Closing one number does not close the connection: the other
+        // still carries data both ways.
+        _ = try ok(sys(.close, c, 0, 0, 0));
+        try testing.expectEqual(errOf(.BADF), sys(.write, c, @intFromPtr("x"), 1, 0));
+        try writeAll(conn, "pong");
+        try readAll(writer, buf[0..4]);
+        try testing.expectEqualStrings("pong", buf[0..4]);
+        var name: SockaddrIn = undefined;
+        var name_len: u32 = @sizeOf(SockaddrIn);
+        _ = try ok(sys(.getpeername, writer, @intFromPtr(&name), @intFromPtr(&name_len), 0));
+        try testing.expectEqual(@as(u16, 7300), std.mem.bigToNative(u16, name.port_be));
+        // A socket made now does not take the closed number while the
+        // connection lives.
+        const fresh = try ok(sys(.socket, 2, 1, 0, 0));
+        try testing.expect(fresh != c);
+        _ = try ok(sys(.close, fresh, 0, 0, 0));
+        // An epoll set sees a duplicate as it sees the socket.
+        const ep = try ok(sys(.epoll_create1, 0, 0, 0, 0));
+        _ = try ok(epollAdd(ep, 1, writer, epollin, 5));
+        var events: [2]EpollEvent = undefined;
+        try testing.expectEqual(@as(usize, 0), try epollWait(ep, &events, 0));
+        try writeAll(conn, "!");
+        try testing.expectEqual(@as(usize, 1), try epollWait(ep, &events, -1));
+        try testing.expectEqual(@as(u64, 5), events[0].data);
+        _ = try ok(sys(.close, ep, 0, 0, 0));
+        try readAll(writer, buf[0..1]);
+        // The last number closes it: the peer reads the end.
+        _ = try ok(sys(.close, writer, 0, 0, 0));
+        try testing.expectEqual(errOf(.BADF), sys(.read, writer, @intFromPtr(&buf), 1, 0));
+        try testing.expectEqual(@as(isize, 0), sys(.read, conn, @intFromPtr(&buf), 4, 0));
+        _ = try ok(sys(.close, conn, 0, 0, 0));
+        // A listener's duplicate accepts.
+        const l2 = try ok(sys(.dup, l, 0, 0, 0));
+        _ = try ok(sys(.close, l, 0, 0, 0));
+        const c2 = try ok(sys(.socket, 2, 1, 0, 0));
+        _ = try ok(sys(.connect, c2, @intFromPtr(&at), @sizeOf(SockaddrIn), 0));
+        const conn2 = try ok(sys(.accept, l2, 0, 0, 0));
+        _ = try ok(sys(.close, conn2, 0, 0, 0));
+        _ = try ok(sys(.close, c2, 0, 0, 0));
+        _ = try ok(sys(.close, l2, 0, 0, 0));
+    }
+}
+
+test "system-call mode: a duplicate of a file or a socket shares its position and flags, and the last one closes it" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, duplicatesOfFilesAndSockets, .{ .iterations = 50, .mode = .syscalls });
+}
+
+/// A duplicate does not outlive a crash: the numbers are closed, and a
+/// file opened after it is not taken for one of them.
+fn duplicateAcrossCrash(env: *Env) !void {
+    const f = try open("kept", o_creat | o_rdwr | o_trunc);
+    try writeAll(f, "abc");
+    try fsync(f);
+    const d = try ok(sys(.dup, f, 0, 0, 0));
+    _ = try ok(sys(.close, f, 0, 0, 0));
+    try env.crashAndReboot(.power_loss);
+    var byte: [1]u8 = undefined;
+    try testing.expectEqual(errOf(.BADF), sys(.read, d, @intFromPtr(&byte), 1, 0));
+    const g = try open("kept", o_creat | o_rdwr);
+    defer close(g);
+    try testing.expect(sys(.read, g, @intFromPtr(&byte), 1, 0) >= 0);
+    const d2 = try ok(sys(.dup, g, 0, 0, 0));
+    _ = try ok(sys(.close, d2, 0, 0, 0));
+}
+
+test "system-call mode: a duplicate does not outlive a crash" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, duplicateAcrossCrash, .{ .iterations = 50, .mode = .syscalls });
 }
 
 /// A thread's signal to itself goes to the real thread it runs on: its
