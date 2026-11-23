@@ -128,6 +128,32 @@ What the numbers are made of:
   `limits.heap_bytes_max`) and a guided corpus come on top, as the test
   uses them.
 
+### What a task costs in time
+
+`zig build bench -Doptimize=ReleaseSafe` runs 51,200 sleeps of one
+nanosecond spread over 2, 64 and 512 tasks, and 51,000 over 1,000, and
+prints the campaign's time divided by the sleeps. On the same machine, at
+revision 106:
+
+| Tasks | Time of one sleep |
+|---|---|
+| 2 | 176 ns |
+| 64 | 223 ns |
+| 512 | 352 ns |
+| 1,000 | 396 ns |
+
+A sleep is a switch to another task, a timer set and a timer taken. With
+a thousand tasks it costs about twice what it costs with two (the figures move by a fifth from one run of the benchmark to the next). The
+timers are a heap and the choice of the next task counts bits, so
+neither looks through the tasks one by one; `plan.md` puts most of the
+growth down to a thousand stacks not fitting the processor's cache,
+which was not measured again here. The figure is not a switch alone:
+the campaign's start, twenty runs, and the start and end of every task
+are in it, and with a thousand tasks that is one start for 51 sleeps
+where with two it is one for 25,600. The tasks have stacks of 64 KiB
+(`limits.fiber_stack_bytes`); with the default 256 KiB a thousand tasks
+reserve 256 MiB of address space, as the table above says.
+
 ## 3. What each part of the exploration contributes
 
 `zig build bugbench-baselines -Doptimize=ReleaseSafe` (`plan3.md` F2).

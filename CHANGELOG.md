@@ -5,6 +5,10 @@ numbers (§) are `plan2.md`'s unless an entry names `plan.md`. Revision 1
 was the first draft of `plan2.md`; the core's earlier history is in
 `plan.md` §9 and §14.
 
+## Revision 106 (tests and measurements: a thousand tasks)
+
+The other half of `plan3.md` D8's exit criterion. `zig build bench` runs its scheduler row with 1,000 tasks too: a sleep, which is a switch to another task, takes 396 ns there against 176 ns with two tasks and 352 ns with 512, on this machine (`docs/measurements.md` §2). `a thousand tasks: every one runs to its end, and the same seed finishes them in the same order` (`scheduler_test.zig`) starts a thousand in one group, each sleeping three times for lengths of its own; every run is repeated and compared, the same campaign twice finishes them in the same order, and another campaign seed in another. No fault found. With revision 104 the criterion (1,000 tasks and 100 nodes at a documented cost) is met; both at once, and a test that does work on a hundred nodes, were not measured.
+
 ## Revision 105 (core: a caught signal a thread sends itself fails the run)
 
 The one fault of revision 99's review that was written down and not fixed. In system-call mode a simulated thread's signal to itself (`raise`, `abort`, `pthread_kill` of itself) is raised on the real thread it runs on. With the default action or with the signal ignored that is right. With a handler the program installed, the handler ran inside the call with the simulator's thread pointer and its system calls not trapped, so whatever it did happened outside the simulation, and the run passed. Now the signal's action is read first (`rt_sigaction`), and if it is a handler the signal is not raised, the call is counted as a stray and answers `ENOSYS`, and the run fails with `StraySyscall`, as a signal to another simulated thread does since revision 99.

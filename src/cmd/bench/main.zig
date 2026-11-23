@@ -92,17 +92,20 @@ fn tornRename(env: *Env) !void {
     try env.always("old or new", std.mem.eql(u8, got, "old-config") or std.mem.eql(u8, got, "new-config"));
 }
 
-/// The scheduler at `tasks` tasks: the same number of sleeps in all, so
-/// the time per sleep shows what a reschedule costs as tasks are added
-/// (the timer scan and the rank selection are linear in the task limit).
+/// The scheduler at `tasks` tasks: about the same number of sleeps in
+/// all, so the time per sleep shows what a reschedule costs as tasks are
+/// added (the choice among the tasks that can run counts bits over the
+/// task limit; the timers are a heap).
 fn Scaling(comptime tasks: u32) type {
     return struct {
-        const sleeps_total = 51_200;
+        const sleeps_each = 51_200 / tasks;
+        /// What runs: 51,200 where `tasks` divides it.
+        const sleeps_total = sleeps_each * tasks;
 
         fn body(env: *Env) !void {
             var group: Io.Group = .init;
             defer group.cancel(env.io);
-            for (0..tasks) |_| try group.concurrent(env.io, sleeper, .{ env.io, sleeps_total / tasks });
+            for (0..tasks) |_| try group.concurrent(env.io, sleeper, .{ env.io, sleeps_each });
             try group.await(env.io);
         }
 
@@ -149,7 +152,7 @@ pub fn main(init: std.process.Init) !void {
     try campaign(gpa, io, "net: loopback echo", netBody, 5_000, 1, 1, "run");
 
     std.debug.print("\nscheduler scaling:\n", .{});
-    inline for (.{ 2, 64, 512 }) |tasks| try Scaling(tasks).run(gpa, io);
+    inline for (.{ 2, 64, 512, 1000 }) |tasks| try Scaling(tasks).run(gpa, io);
 
     const cpus: u32 = @intCast(std.Thread.getCpuCount() catch 1);
     const workers = @min(cpus, 8);

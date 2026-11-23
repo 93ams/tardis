@@ -237,3 +237,57 @@ test "crash drops in-flight tasks and their group no longer blocks" {
         }
     }.run, quiet);
 }
+
+// --- a thousand tasks ---------------------------------------------------------
+
+var thousand_ran: u32 = 0;
+var thousand_order_sum: u64 = 0;
+
+fn oneOfAThousand(io: Io, index: u32, total: *u32) Io.Cancelable!void {
+    // Sleeps of different lengths, so the tasks finish in an order of
+    // their own, and each is rescheduled several times.
+    for (0..3) |round| try io.sleep(.fromNanoseconds(1 + (index * 7 + round) % 13), .awake);
+    total.* += 1;
+    thousand_order_sum +%= @as(u64, total.*) * (index + 1);
+}
+
+fn thousandTasks(env: *tardis.Env) !void {
+    var total: u32 = 0;
+    var group: Io.Group = .init;
+    defer group.cancel(env.io);
+    for (0..1000) |i| try group.concurrent(env.io, oneOfAThousand, .{ env.io, @as(u32, @intCast(i)), &total });
+    try group.await(env.io);
+    try testing.expectEqual(@as(u32, 1000), total);
+    thousand_ran += 1;
+}
+
+test "a thousand tasks: every one runs to its end, and the same seed finishes them in the same order" {
+    // Not when the environment chooses the runs or keeps some between
+    // checks: the campaigns below are compared with each other.
+    for ([_][]const u8{ "TARDIS_EXPLORE", "TARDIS_PRESET", "TARDIS_SEED", "TARDIS_REPLAY", "TARDIS_CORPUS_DIR", "TARDIS_CAMPAIGN_SALT", "TARDIS_ITERATIONS_SCALE" }) |name| {
+        if (testing.environ.getAlloc(testing.allocator, name)) |value| {
+            testing.allocator.free(value);
+            return error.SkipZigTest;
+        } else |_| {}
+    }
+    const options: tardis.Options = .{
+        .iterations = 3,
+        .determinism_check_every = 1,
+        .limits = .{ .tasks_max = 1008, .fiber_stack_bytes = 64 * 1024 },
+    };
+    thousand_ran = 0;
+    thousand_order_sum = 0;
+    try tardis.check(testing.allocator, thousandTasks, options);
+    // Each iteration and its determinism re-run.
+    try testing.expectEqual(@as(u32, 6), thousand_ran);
+    const first = thousand_order_sum;
+    thousand_order_sum = 0;
+    try tardis.check(testing.allocator, thousandTasks, options);
+    try testing.expectEqual(first, thousand_order_sum);
+    // The order is not the order of spawning every time.
+    var other = options;
+    other.campaign_seed = 99;
+    thousand_order_sum = 0;
+    try tardis.check(testing.allocator, thousandTasks, other);
+    try testing.expect(first != thousand_order_sum);
+}
