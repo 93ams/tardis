@@ -9,7 +9,8 @@
 //! Build the library with `cargo build --target x86_64-unknown-linux-musl`
 //! in `test/rust`, then `zig build test-rust -Dtarget=x86_64-linux-musl
 //! -Drust=<path to the .a>` on
-//! Linux x86_64.
+//! Linux x86_64. Or both for glibc: `x86_64-unknown-linux-gnu` and
+//! `-Dtarget=x86_64-linux-gnu`.
 
 const std = @import("std");
 const tardis = @import("tardis");

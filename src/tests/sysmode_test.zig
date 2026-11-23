@@ -568,6 +568,18 @@ fn otherIoctlOnFile(env: *Env) !void {
     _ = sys(.ioctl, fd, 0x541B, @intFromPtr(&n), 0); // FIONREAD
 }
 
+/// glibc's allocator opens this file once in the life of the process:
+/// it is answered as missing, and is no stray (revision 110).
+fn opensLibcProbe(env: *Env) !void {
+    _ = env;
+    try testing.expectEqual(errOf(.NOENT), openAt(cwd, "/proc/sys/vm/overcommit_memory", o_rdonly));
+}
+
+test "system-call mode: the file glibc's allocator probes is missing, and not a stray" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, opensLibcProbe, .{ .iterations = 5, .mode = .syscalls });
+}
+
 fn mapsSimulatedFile(env: *Env) !void {
     _ = env;
     const fd = try open("m", o_creat | o_rdwr);

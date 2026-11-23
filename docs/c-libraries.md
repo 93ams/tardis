@@ -32,8 +32,9 @@ Nothing in the library is changed and it gets no shim: SQLite runs with its
 own Unix VFS. The one flag only removes its use of `dlopen`.
 
 The configuration that has been run most is a static link against musl
-(`-Dtarget=x86_64-linux-musl`). One C++ program has also been run on
-glibc 2.41, linked dynamically (`test/cpp.zig`); SQLite has not.
+(`-Dtarget=x86_64-linux-musl`). SQLite, the C++ program and the Rust
+crate have also been run on glibc 2.41, linked dynamically
+(`-Dtarget=x86_64-linux-gnu`).
 
 ## 2. Write the body
 
@@ -114,9 +115,10 @@ tardis: the two runs agree for 2 events (virtual time, task, event):
 ```
 
 That one is glibc, which draws eight random bytes when a process starts
-its first thread. It has no reset to call. Where there is none, do the
-once-only work before the first run: call the program once outside
-`check`, as `test/cpp.zig` does (`prime`).
+its first thread. It has no reset to call, and the tool now takes care
+of it: a run in system-call mode starts one real thread first. Where a
+library of yours has once-only work and no reset, do that work before
+the first run: call the code once outside `check`.
 
 ## 5. Several tasks, and threads
 
@@ -163,7 +165,7 @@ Either way:
 ## 6. When the run fails with `StraySyscall`
 
 The library made a call the mode does not answer. The report names the
-call. The call was refused with `ENOSYS` and never reached the machine,
+call, and the file when the call names one. The call was refused with `ENOSYS` and never reached the machine,
 but the run proves nothing, so it fails whatever the body returned.
 
 What to do depends on the call:
@@ -237,13 +239,14 @@ the failure shrinks from 75 decisions to 1. With `EXTRA` it is kept. With
 `FULL`, SQLite's default, it is lost too, which is SQLite's documented
 behaviour and was then reproduced on a real ext4 (`docs/power-cut.md`).
 Two tasks with a database each pass, as do two `pthread`s with a database
-each and two sharing one connection.
+each and two sharing one connection. On musl and on glibc.
 
 One Rust crate, written for the test (`test/rust`, Rust 1.99, tokio 1.54):
 threads, a mutex, a channel, a timed wait, files across a power loss, a
 blocking TCP echo, a connection and a file shared through `try_clone`,
 and a TCP echo on tokio's single-threaded runtime and
-on its work-stealing one with two and four workers.
+on its work-stealing one with two and four workers. On musl and on
+glibc.
 
 One C++ program, written for the test (`test/cpp/probe.cpp`, libc++):
 threads, a mutex, a condition variable, the steady and the system clock,

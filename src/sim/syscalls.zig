@@ -46,6 +46,34 @@ threadlocal var selector: u8 = allow;
 threadlocal var armed = false;
 threadlocal var stray_count: u32 = 0;
 threadlocal var stray_first: u64 = 0;
+/// The path the first stray call named, if it names one: what a report
+/// needs to say which file a library went looking for.
+threadlocal var stray_path: [96]u8 = undefined;
+threadlocal var stray_path_len: usize = 0;
+
+/// The argument of a call that is a path, for the calls that take one.
+fn pathArgument(number: u64, a0: u64, a1: u64) u64 {
+    return switch (number) {
+        2, 4, 6, 21, 59, 76, 80, 82, 83, 84, 85, 87, 89 => a0, // open, stat, lstat, access, execve, truncate, chdir, rename, mkdir, rmdir, creat, unlink, readlink
+        257, 258, 262, 263, 267, 269, 332, 439 => a1, // openat, mkdirat, newfstatat, unlinkat, readlinkat, faccessat, statx, faccessat2
+        else => 0,
+    };
+}
+
+/// Keeps the first stray call's path. The pointer is the program's: the
+/// kernel would have read it, and answered a bad one with `EFAULT`, where
+/// this faults. System-call mode reads the same pointers for the calls
+/// it emulates.
+fn notePath(number: u64, a0: u64, a1: u64) void {
+    stray_path_len = 0;
+    const ptr = pathArgument(number, a0, a1);
+    if (ptr == 0) return;
+    const bytes: [*]const u8 = @ptrFromInt(ptr);
+    while (stray_path_len < stray_path.len and bytes[stray_path_len] != 0) : (stray_path_len += 1) {
+        const c = bytes[stray_path_len];
+        stray_path[stray_path_len] = if (c >= 0x20 and c < 0x7f) c else '?';
+    }
+}
 /// Stray calls that were refused, not made (`startsThreadOrProcess`).
 threadlocal var stray_refused: u32 = 0;
 /// True between `begin` and `end`.
@@ -173,7 +201,10 @@ fn onSigsys(_: i32, _: ?*anyopaque, context: ?*anyopaque) callconv(.c) void {
             // futex operation it does not know is a stray).
             if (first and number != 202 and !maps_simulated and expected(number, a)) break :stray;
         }
-        if (stray_count == 0) stray_first = number;
+        if (stray_count == 0) {
+            stray_first = number;
+            notePath(number, a, gregs[@backingInt(Reg.rsi)]);
+        }
         stray_count +|= 1;
         // With the emulator on, the code under test believes it has no
         // other world: a call it was not answered must not reach the real
@@ -423,6 +454,7 @@ pub fn begin(emulate: ?Emulator) bool {
     if (!arm()) return false;
     stray_count = 0;
     stray_first = 0;
+    stray_path_len = 0;
     stray_refused = 0;
     emulator = emulate;
     active = true;
@@ -432,7 +464,9 @@ pub fn begin(emulate: ?Emulator) bool {
 
 /// `count` stray calls, the first of them `number`; `refused` of them
 /// would have started a thread or a process and were not made.
-pub const Stray = struct { number: u64, count: u32, refused: u32 };
+/// `path`: what the first one named, if it names a file (cut at 96
+/// bytes; valid until the thread's next run).
+pub const Stray = struct { number: u64, count: u32, refused: u32, path: []const u8 = "" };
 
 /// The run ended: the first system call that left the simulation, if any.
 pub fn end() ?Stray {
@@ -441,7 +475,7 @@ pub fn end() ?Stray {
     active = false;
     emulator = null;
     if (stray_count == 0) return null;
-    return .{ .number = stray_first, .count = stray_count, .refused = stray_refused };
+    return .{ .number = stray_first, .count = stray_count, .refused = stray_refused, .path = stray_path[0..stray_path_len] };
 }
 
 /// A vDSO function the code under test called (`vdso.zig`): answered as

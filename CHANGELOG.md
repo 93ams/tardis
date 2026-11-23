@@ -5,6 +5,24 @@ numbers (§) are `plan2.md`'s unless an entry names `plan.md`. Revision 1
 was the first draft of `plan2.md`; the core's earlier history is in
 `plan.md` §9 and §14.
 
+## Revision 110 (core: SQLite and Rust on glibc, and the hang it found)
+
+Revision 107 ran one small C++ program on glibc and said that was no claim about glibc programs in general. SQLite and the Rust crate (tokio included) are now run on it too: glibc 2.41, linked dynamically, Debian 13 in WSL2. The Rust crate passed 8 of 8 as it was. SQLite failed 3 of 7, for two reasons that are the tool's, both fixed, and now passes 7 of 7.
+
+**Two tasks at one lock hung, on glibc.** While a process has never had a second thread, glibc's locks do no atomic work and its unlock wakes nobody. Simulated tasks are fibers on one real thread, so to glibc two of them were one thread: the second to reach a `pthread_mutex` waited, in the simulation, for a wake the first never sent, and the run ended as `error.Deadlock` in a program that has none (SQLite's two connections on two tasks; any C library with a lock, driven from two tasks, would have done the same). Every run in system-call mode now starts one real thread and joins it, once in the life of the process, before its calls are trapped; glibc then does the work. The same thread makes glibc do what it does once at a process's first thread (eight random bytes drawn, two signal handlers installed), which revision 107's C++ test had to do by hand before its first run: that code is gone from the test, and the first SQLite test, which failed as `NonDeterministic`, passes. A test in the default suite (two tasks, one `pthread_mutex`, a system call made with it held) fails with a deadlock on glibc without the thread and passes with it.
+
+**glibc's allocator reads a file once.** The first time a thread's heap shrinks, it opens `/proc/sys/vm/overcommit_memory`, and a path under `/proc` is a stray: SQLite's two-thread test failed on whichever run came first. That one path is now answered as missing, at once and with no event, so the run in which glibc happens to ask is the same run as any other of its seed; glibc takes the missing file as the default setting.
+
+**A stray call's report names the file.** It said `openat (number 257)` and nothing else; finding the path above took a debugger's work. For a call that names a path, the report now prints it.
+
+`zig build test-rust` takes a glibc target (the library must be built for the same C library as the target).
+
+**Review.** A fresh reviewer found four things, all fixed: `traceHash`, `traceJson` and `exhaustive` run without passing where the thread was first started (it is started by each run now); a thread that could not be started was never tried again; the new test left its lock held after a failed run, so that the replay of the failure would hang; and the Rust step's messages still said musl only. Written down and not changed: musl's internal locks (the time zone's, `random`'s; not `pthread_mutex`, not stdio) go back to doing nothing once the process is back to one thread, so two tasks that yield inside one are not kept apart.
+
+Tested on Linux: the library suite, 283 passed and 2 skipped, and all 41 Linux test binaries pass; SQLite 7 of 7 and Rust 8 of 8 on musl and on glibc, in Debug and ReleaseSafe; C++ 7 of 7 on both. Windows: the full verification script passes in all five configurations (Debug: 417 of 471 passed, 54 skipped, none failed).
+
+**Limits.** One glibc and one kernel still. Other files a C library reads once and late are not answered and will fail the run that meets them, with the path in the report now: the number of processors (`/sys/devices/system/cpu/online`), a process's cgroup (Rust's `available_parallelism`), `/etc/ld.so.cache` at the first `pthread_exit` or `pthread_cancel`. None was met by these three programs. A recursive lock of a C library cannot tell two tasks apart, on either C library: they have one thread number.
+
 ## Revision 109 (measurements: the security layer's oracles)
 
 `plan3.md` A5, its last part: a planted bug for each security oracle, with a detection rate. `zig build secrates` runs the planted bugs of the layer's own tests (`pillar1_test.zig`, `pillar2_test.zig`, `pillar45_test.zig`, whose bodies are now `pub` and imported, so the table measures the code the tests run) in 20 campaigns at 10, 50 and 200 iterations, and the fixed version of each in 20 campaigns of 200 (`docs/measurements.md` §1). `zig build test` builds it. Seventeen rows: every bug found by every campaign of 200, the steered ones (double fetch, check-then-use) missed by two or three of 20 at 10 iterations, no false alarm on a fixed program. `secret not zeroed` is found only in a build without runtime safety, where `free` does not overwrite the key first.
@@ -14,6 +32,7 @@ was the first draft of `plan2.md`; the core's earlier history is in
 **Review.** A fresh reviewer confirmed every row runs with its test's options, found the use-after-free row's "fixed" program to be another test's program (now "no fixed version"), the columns to be nested samples rather than independent ones (now said), and an unbounded copy of the label, now bounded.
 
 Not in the table: the timing and information-flow assertions, glitched decisions, the Spectre-v1 shape, the C shims, shadow memory and the race detector.
+||||||| base
 
 ## Revision 108 (tests: the network model against the loopback, datagrams and larger streams)
 

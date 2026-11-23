@@ -465,8 +465,20 @@ fn ioctl(s: *Sim, fd: i32, request: u32) ?u64 {
     };
 }
 
+/// A file a C library reads once in the life of the process, to tune
+/// itself: glibc's allocator asks whether the kernel overcommits memory
+/// the first time a thread's heap shrinks. It is not the program's
+/// business, and it is not there: the answer is given at once, with no
+/// event and no decision, so that the run in which the library happens to
+/// ask is the same run as every other of its seed. glibc takes the
+/// missing file as the default setting.
+fn libcProbe(path: []const u8) bool {
+    return std.mem.eql(u8, path, "/proc/sys/vm/overcommit_memory");
+}
+
 fn open(s: *Sim, dirfd: i32, path_ptr: u64, flags: u32) ?u64 {
     const path = cstr(path_ptr) orelse return fail(.FAULT);
+    if (libcProbe(path)) return fail(.NOENT);
     const dir = switch (dirOf(s, dirfd, path)) {
         .dir => |d| d,
         .closed => return fail(.BADF),

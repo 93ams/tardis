@@ -1084,6 +1084,7 @@ fn BodyThunk(comptime body: fn (*Env) anyerror!void) type {
 }
 
 fn runOnce(s: *Sim, comptime body: fn (*Env) anyerror!void, seed: u64, persona: Persona, iteration: u32, leak_check: bool) RunOutcome {
+    if (s.config.emulate_syscalls) startOneThread();
     s.beginRun(s.setup_seed orelse seed, persona);
     s.iteration = iteration;
     var env = Env.init(s, iteration);
@@ -1123,6 +1124,7 @@ fn runOnce(s: *Sim, comptime body: fn (*Env) anyerror!void, seed: u64, persona: 
     }
     if (stray) |call| {
         if (s.config.report) std.debug.print("tardis: the code under test tried {d} real system call(s), the first one {s} (number {d}): it left the simulation, so the run does not depend on its seed alone\n", .{ call.count, syscalls.name(call.number), call.number });
+        if (s.config.report and call.path.len > 0) std.debug.print("tardis: that call named \"{s}\"\n", .{call.path});
         if (s.config.report and call.refused != 0) std.debug.print("tardis: {d} of them would have started a thread or a process, which the simulation cannot hold: refused, not made (docs/threads.md)\n", .{call.refused});
         // A run that left the simulation proves nothing, whether it passed
         // or failed: its outcome does not follow from its seed.
@@ -1745,6 +1747,42 @@ pub fn check(gpa: Allocator, comptime body: fn (*Env) anyerror!void, options: Op
         });
     }
     return result;
+}
+
+/// Whether the process has started its one real thread (`startOneThread`).
+var one_thread_started: std.atomic.Value(bool) = .init(false);
+
+fn noThreadBody() void {}
+
+/// In system-call mode, with a C library linked: starts one real thread
+/// and joins it, once in the life of the process, before the first run.
+///
+/// glibc keeps a note of whether the process ever had a second thread,
+/// and while it has not, its locks do no atomic work and its unlock wakes
+/// nobody. Simulated tasks are fibers on one real thread, so two of them
+/// that meet at a `pthread_mutex` (SQLite's, between two connections)
+/// looked like one thread to glibc: the second waited, in the simulation,
+/// for a wake the first never sent, and the run ended in a deadlock that
+/// no real program has. One real thread, once, and glibc does the work.
+/// It also has glibc do what it does once at a process's first thread
+/// (eight random bytes drawn, probably its allocator's key for the new
+/// thread's cache, and two signal handlers installed), which otherwise
+/// made the first run of a seed differ from its replay.
+///
+/// Called by every run in system-call mode, before its calls are trapped,
+/// so that `traceHash`, `traceJson` and `exhaustive` have it too. A spawn
+/// that fails is tried again by the next run. musl needs none of this for
+/// a `pthread_mutex`; its own internal locks (the time zone's, `random`'s)
+/// go back to doing nothing when the process is back to one thread, so
+/// two tasks that yield inside one of those are not kept apart.
+fn startOneThread() void {
+    if (!builtin.link_libc or builtin.os.tag != .linux) return;
+    if (one_thread_started.swap(true, .acq_rel)) return;
+    const t = std.Thread.spawn(.{}, noThreadBody, .{}) catch {
+        one_thread_started.store(false, .release);
+        return;
+    };
+    t.join();
 }
 
 fn checkOn(gpa: Allocator, s: *Sim, comptime body: fn (*Env) anyerror!void, options: Options, caller: usize) anyerror!void {

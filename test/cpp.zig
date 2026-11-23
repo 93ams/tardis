@@ -61,18 +61,40 @@ test "libc: a clock read through the vDSO is in virtual time" {
     try tardis.check(testing.allocator, libcClock, .{ .iterations = 20, .mode = .syscalls });
 }
 
-var primed: bool = false;
+threadlocal var shared_lock: std.c.pthread_mutex_t = .{};
+threadlocal var shared_count: u32 = 0;
 
-/// What a C library does once in the life of the process must be done
-/// before the first run, or that run differs from every later one and
-/// `check` reports `error.NonDeterministic` (`docs/c-libraries.md` §4).
-/// glibc draws eight random bytes when the process starts its first
-/// thread; musl draws none. So the program runs once outside the
-/// simulation, on real threads.
-fn prime() void {
-    if (primed) return;
-    primed = true;
-    _ = cpp_threads();
+fn countsUnderLock() void {
+    for (0..5) |_| {
+        _ = std.c.pthread_mutex_lock(&shared_lock);
+        const before = shared_count;
+        // A system call with the lock held: the other task runs, and
+        // waits for the lock.
+        const req: std.c.timespec = .{ .sec = 0, .nsec = 1000 };
+        _ = std.c.nanosleep(&req, null);
+        shared_count = before + 1;
+        _ = std.c.pthread_mutex_unlock(&shared_lock);
+    }
+}
+
+/// Two tasks, which are fibers on one real thread, and one libc mutex.
+/// glibc's unlock wakes nobody while the process has only ever had one
+/// thread, so the task that waited was never woken and the run was a
+/// deadlock (found with SQLite on glibc, revision 110). A run in this
+/// mode now starts one real thread first, and this test fails without it.
+fn twoTasksOneLock(env: *Env) !void {
+    // A run that failed may have left it held.
+    shared_lock = .{};
+    shared_count = 0;
+    var other = try env.io.concurrent(countsUnderLock, .{});
+    countsUnderLock();
+    other.await(env.io);
+    try testing.expectEqual(@as(u32, 10), shared_count);
+}
+
+test "libc: two tasks that meet at a pthread mutex both get it" {
+    if (skip()) return error.SkipZigTest;
+    try tardis.check(testing.allocator, twoTasksOneLock, options);
 }
 
 fn threads(env: *Env) !void {
@@ -82,7 +104,6 @@ fn threads(env: *Env) !void {
 
 test "c++: four threads, a mutex and a condition variable" {
     if (skipThreads()) return error.SkipZigTest;
-    prime();
     try tardis.check(testing.allocator, threads, options);
 }
 
@@ -113,7 +134,6 @@ fn exceptions(env: *Env) !void {
 
 test "c++: exceptions unwind on a simulated thread's stack and on the body's" {
     if (skipThreads()) return error.SkipZigTest;
-    prime();
     try tardis.check(testing.allocator, exceptions, options);
 }
 
