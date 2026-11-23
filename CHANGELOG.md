@@ -5,6 +5,16 @@ numbers (§) are `plan2.md`'s unless an entry names `plan.md`. Revision 1
 was the first draft of `plan2.md`; the core's earlier history is in
 `plan.md` §9 and §14.
 
+## Revision 103 (tests and core: warm starts with three nodes, and with allocations that fail)
+
+The two warm-start cases revision 102 listed as not covered, and one small fault the review found on the way.
+
+`warm restore: three nodes and three personas, the same runs as cold`: tasks on three nodes each find their node's filesystem as setup left it and then overwrite it past a page; 450 runs warm give what 450 runs cold observed, with more than 400 warm starts. Only the first node holds anything from setup: a setup that starts a task on another node turns warm starts off for the campaign (`Sim.warmOnlySnapshotState`), which this test met and which was written down nowhere but in the code. So the other nodes' snapshots are of empty filesystems, and the copying of pages is exercised on one node.
+
+`warm restore: an allocation that fails anywhere gives the cold result or OutOfMemory, and leaks nothing`: the same campaign, short, in two parts. The allocator fails at one allocation after another (about forty of the campaign's 3,500, evenly spread): the check returns `OutOfMemory` or gives the cold result, and the test allocator sees no leak. Then the copy of a snapshot's pages is made to fail, each one of the campaign in turn, found by its size: the result is the cold one every time, with fewer warm starts.
+
+**Fixed:** when a snapshot was taken of several nodes and the allocation for a later node failed, the earlier nodes' pages kept the snapshot's reference until the end of that run, so a body that filled the disk was refused sooner there than in a cold run. `Vfs.unpin` takes the reference back. Found by reading, in the review; no test above reaches it (the failing allocation is not singled out), and the new `vfs.zig` test covers `unpin` alone.
+
 ## Revision 102 (tests: forked children against one process, and failing runs between warm starts)
 
 `plan3.md` A6. Two comparisons of configurations that were missing.

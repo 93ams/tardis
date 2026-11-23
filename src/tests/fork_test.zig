@@ -223,3 +223,168 @@ test "warm restore: failing runs between warm starts, on three personas, are the
         try testing.expect(report.restores > (@as(u64, warm[1].iteration) + 1) * base.personas.len);
     }
 }
+
+// --- warm starts with several nodes, and with allocations that fail ------------
+
+/// What every run of a campaign saw, summed: the same for the same runs.
+var nodes_sum: u64 = 0;
+
+fn nodeContent(env: *const Env, node: u8, buf: *[32]u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{s} on node {d}", .{ @tagName(env.persona), node }) catch unreachable;
+}
+
+/// A file on the first of three nodes, whose content names the persona.
+/// A setup that starts a task on another node is never kept as a
+/// snapshot (`Sim.warmOnlySnapshotState`), so the others start empty.
+fn setupOnNodes(env: *Env) !void {
+    var buf: [32]u8 = undefined;
+    try env.dir.writeFile(env.io, .{ .sub_path = "mine", .data = nodeContent(env, 0, &buf) });
+    // Seven pages in all: a size the copy of a snapshot's pages has to
+    // itself (`pages_copy_bytes`).
+    const pad: [5 * 4096 + 1]u8 = @splat('p');
+    try env.dir.writeFile(env.io, .{ .sub_path = "pad", .data = &pad });
+}
+
+const pages_copy_bytes = 7 * 4096;
+
+/// Fails the `fail_at`-th allocation of exactly `bytes` bytes, and counts
+/// them.
+const SizedFailing = struct {
+    backing: std.mem.Allocator,
+    bytes: usize,
+    fail_at: usize,
+    seen: usize = 0,
+
+    fn allocator(f: *SizedFailing) std.mem.Allocator {
+        return .{ .ptr = f, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const f: *SizedFailing = @ptrCast(@alignCast(ctx));
+        if (len == f.bytes) {
+            f.seen += 1;
+            if (f.seen - 1 == f.fail_at) return null;
+        }
+        return f.backing.rawAlloc(len, alignment, ra);
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const f: *SizedFailing = @ptrCast(@alignCast(ctx));
+        return f.backing.rawResize(memory, alignment, new_len, ra);
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const f: *SizedFailing = @ptrCast(@alignCast(ctx));
+        return f.backing.rawRemap(memory, alignment, new_len, ra);
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const f: *SizedFailing = @ptrCast(@alignCast(ctx));
+        f.backing.rawFree(memory, alignment, ra);
+    }
+};
+
+/// Finds its node as setup left it, whatever the run before did there,
+/// and changes it for the run after.
+fn readOnNode(env: *Env, node: u8, done: *bool) !void {
+    // Also when it fails: the body waits for this, and the failure is
+    // reported when the body returns.
+    defer done.* = true;
+    const io = env.io;
+    var want: [32]u8 = undefined;
+    var got: [32]u8 = undefined;
+    if (node == 0) {
+        try testing.expectEqualStrings(nodeContent(env, node, &want), try env.dir.readFile(io, "mine", &got));
+    } else {
+        try testing.expectError(error.FileNotFound, env.dir.readFile(io, "mine", &got));
+    }
+    // Grown past a page.
+    var big: [2 * 4096]u8 = undefined;
+    io.random(&big);
+    try env.dir.writeFile(io, .{ .sub_path = "mine", .data = &big });
+}
+
+fn bodyOnNodes(env: *Env) !void {
+    var done: [3]bool = @splat(false);
+    for (1..3) |n| try env.spawnOn(@intCast(n), readOnNode, .{ env, @as(u8, @intCast(n)), &done[n] });
+    try readOnNode(env, 0, &done[0]);
+    while (!done[1] or !done[2]) try env.io.sleep(.fromMilliseconds(1), .awake);
+    var h = std.hash.Wyhash.init(0);
+    h.update(std.mem.asBytes(&(try env.fuzz(u64))));
+    h.update(std.mem.asBytes(&env.nowNs()));
+    nodes_sum +%= h.final();
+}
+
+fn nodesCampaign(allocator: std.mem.Allocator, warm: bool, iterations: u32, report: ?*tardis.WarmReport) !u64 {
+    nodes_sum = 0;
+    try tardis.check(allocator, bodyOnNodes, .{
+        .iterations = iterations,
+        .nodes = 3,
+        .setup = setupOnNodes,
+        .personas = &.{ .linux_ext4, .windows_ntfs, .posix_strict },
+        .warm_restore = warm,
+        .warm_report = report,
+        .determinism_check_every = 0,
+        .report = false,
+    });
+    return nodes_sum;
+}
+
+test "warm restore: three nodes and three personas, the same runs as cold" {
+    var report: tardis.WarmReport = .{};
+    const cold = try nodesCampaign(gpa, false, 150, null);
+    try testing.expect(cold != 0);
+    try testing.expectEqual(cold, try nodesCampaign(gpa, true, 150, &report));
+    try testing.expectEqual(@as(u64, 0), report.mismatches);
+    if (!tardis.security_by_default) try testing.expect(report.active and report.restores > 400 and report.checks >= 6);
+}
+
+test "warm restore: an allocation that fails anywhere gives the cold result or OutOfMemory, and leaks nothing" {
+    // The snapshots, and the copies of their pages when the personas take
+    // turns, are the harness's own memory: one of those failing must cost
+    // warm starts at most. Not when the environment sets what a check
+    // runs: a failed allocation while it is read would lose the setting.
+    for ([_][]const u8{ "TARDIS_EXPLORE", "TARDIS_PRESET", "TARDIS_SEED", "TARDIS_REPLAY", "TARDIS_CORPUS_DIR", "TARDIS_CAMPAIGN_SALT", "TARDIS_ITERATIONS_SCALE" }) |name| {
+        if (testing.environ.getAlloc(gpa, name)) |value| {
+            gpa.free(value);
+            return error.SkipZigTest;
+        } else |_| {}
+    }
+    const cold = try nodesCampaign(gpa, false, 4, null);
+    var counting = std.testing.FailingAllocator.init(gpa, .{});
+    try testing.expectEqual(cold, try nodesCampaign(counting.allocator(), true, 4, null));
+    const total = counting.alloc_index;
+    try testing.expect(total > 20);
+    var failed: usize = 0;
+    var passed: usize = 0;
+    // Every allocation in turn where there are few, about 40 of them
+    // evenly spread where there are many.
+    const step = @max(1, total / 40);
+    var n: usize = 0;
+    while (n < total) : (n += step) {
+        var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = n });
+        if (nodesCampaign(failing.allocator(), true, 4, null)) |sum| {
+            try testing.expectEqual(cold, sum);
+            passed += 1;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            failed += 1;
+        }
+    }
+    // Both happen: a failure the campaign cannot do without, and one it can.
+    try testing.expect(failed > 0);
+    if (tardis.security_by_default) return;
+    try testing.expect(passed > 0);
+
+    // The copy of a snapshot's pages, one failure at a time: the
+    // snapshot is given up, the run goes on cold, and nothing else shows.
+    var whole: tardis.WarmReport = .{};
+    var sized: SizedFailing = .{ .backing = gpa, .bytes = pages_copy_bytes, .fail_at = std.math.maxInt(usize) };
+    try testing.expectEqual(cold, try nodesCampaign(sized.allocator(), true, 4, &whole));
+    const copies = sized.seen;
+    try testing.expect(copies >= 2 and copies <= 12);
+    var k: usize = 0;
+    while (k < copies) : (k += 1) {
+        var report: tardis.WarmReport = .{};
+        var one: SizedFailing = .{ .backing = gpa, .bytes = pages_copy_bytes, .fail_at = k };
+        try testing.expectEqual(cold, try nodesCampaign(one.allocator(), true, 4, &report));
+        try testing.expectEqual(@as(u64, 0), report.mismatches);
+        try testing.expect(report.restores < whole.restores);
+    }
+}

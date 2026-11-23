@@ -1120,7 +1120,11 @@ fn warmTake(s: *Sim, t: *Warm.Shot) !void {
     const files = try gpa.alloc(vfs_mod.Vfs.Snapshot, s.nodes.len);
     var taken: usize = 0;
     errdefer {
-        for (files[0..taken]) |*f| f.deinit(gpa);
+        // The nodes whose snapshot was taken keep no reference for it.
+        for (s.nodes[0..taken], files[0..taken]) |*n, *f| {
+            n.vfs.unpin();
+            f.deinit(gpa);
+        }
         gpa.free(files);
     }
     for (s.nodes, files) |*n, *f| {

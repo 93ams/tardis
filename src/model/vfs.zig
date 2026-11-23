@@ -538,6 +538,16 @@ pub const Vfs = struct {
         }
     }
 
+    /// Takes back the reference of a snapshot that is given up at once,
+    /// before anything else has touched the filesystem.
+    pub fn unpin(v: *Vfs) void {
+        for (v.page_refs[1..v.page_hwm]) |*r| {
+            if (r.* == 0) continue;
+            assert(r.* > 1);
+            r.* -= 1;
+        }
+    }
+
     /// Takes a snapshot and pins the pages it shares. No handle may be
     /// open (handles are not part of it).
     pub fn snapshot(v: *Vfs, gpa: Allocator) Allocator.Error!Snapshot {
@@ -2432,6 +2442,23 @@ test "fdatasync of a file commits a waiting unlink only for the file's creation 
             }
         }
     }
+}
+
+test "a snapshot given up at once leaves the pages as they were" {
+    var v = try testVfs(.linux_ext4);
+    defer v.deinit();
+    const a = try v.createFile(root_inode, "a", .{});
+    _ = try v.write(a, 0, "data");
+    v.sync(a);
+    _ = try v.write(a, 0, "more");
+    const before = try testing.allocator.dupe(u16, v.page_refs[0..v.page_hwm]);
+    defer testing.allocator.free(before);
+    var sn = try v.snapshot(testing.allocator);
+    try testing.expect(!std.mem.eql(u16, before, v.page_refs[0..v.page_hwm]));
+    v.unpin();
+    sn.deinit(testing.allocator);
+    try testing.expectEqualSlices(u16, before, v.page_refs[0..v.page_hwm]);
+    try v.checkPageConservation();
 }
 
 test "ntfs: sharing violation, case-insensitive, reserved names" {
