@@ -97,6 +97,8 @@ pub const syscall_root_fd: i32 = 0x7FFF_FFFF;
 /// Whether `Options.fork` forks on this target (Linux; macOS and the BSDs
 /// with libc). Elsewhere the same iterations run in-process.
 pub const fork_supported = forkserver.supported;
+/// The most `Options.nodes` can be.
+pub const nodes_max = net.nodes_limit;
 pub const Histogram = ledger.Histogram;
 pub const net = @import("model/net.zig");
 /// Atomics that the simulator schedules around, with store buffers for
@@ -161,7 +163,10 @@ pub const Options = struct {
     determinism_check_every: u32 = 16,
     epoch_offset_ns: u64 = 1_700_000_000 * std.time.ns_per_s,
     /// Simulated nodes, each with its own filesystem, address
-    /// (`10.0.0.(n+1)`) and clock. The test body runs on node 0.
+    /// (`10.0.0.(n+1)`) and clock. The test body runs on node 0. At most
+    /// 128 (`nodes_max`); at most 32 with a security layer attached,
+    /// which a check with more refuses with a panic. Each node costs
+    /// about a megabyte with the default limits (`docs/measurements.md`).
     nodes: u8 = 1,
     net: NetOptions = .{},
     /// Print failure reports (seed, recent events, replay command) to stderr.

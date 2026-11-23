@@ -67,19 +67,42 @@ reservation and the largest single allocations. The first of those:
 
 | Options | Most memory live at once |
 |---|---|
-| defaults (`.{}`) | 1.4 MiB |
+| defaults (`.{}`) | 1.5 MiB |
 | `nodes = 3` | 3.8 MiB |
 | `nodes = 8` | 9.6 MiB |
-| `nodes = 32` (the most there can be) | 37.6 MiB |
+| `nodes = 32` (the most with a security layer) | 37.7 MiB |
+| `nodes = 100` | 117.2 MiB |
+| `nodes = 128` (the most there can be) | 150.0 MiB |
 | `limits.tasks_max = 1024` | 3.7 MiB |
 | `explore = .guided` | 1.7 MiB |
 | `workers = 4` (four simulators and the caller's) | 7.2 MiB |
 | `limits.trace_ring_len = 4096` | 1.8 MiB |
 | security layer (`tardis_sec`, its defaults) | 2.2 MiB |
 | security layer with `shadow_memory` | 10.3 MiB |
-| security layer with `data_races` | 4.0 MiB |
+| security layer with `data_races` | 4.1 MiB |
 
-Measured on Windows at revision 86.
+Measured on Windows at revision 104.
+
+The same command prints what a run costs in time as nodes are added (a
+campaign of 200 runs of the small body, its start included, divided by
+200; `-Doptimize=ReleaseSafe`). This one depends on the machine:
+
+| Options | Time of one run |
+|---|---|
+| `nodes = 1` | 58 us |
+| `nodes = 3` | 69 us |
+| `nodes = 8` | 102 us |
+| `nodes = 32` | 256 us |
+| `nodes = 100` | 575 us |
+| `nodes = 128` | 877 us |
+
+The body does nothing on the other nodes, so this is what the nodes cost
+by being there: the campaign's start, which allots every node's tables
+once, and each run's formatting of every node again. The two were not
+taken apart, and with 200 runs the start weighs on the figure. A hundred
+nodes cost ten times one; why 128 cost more than their share was not
+looked into. What a test's own tasks on those nodes cost comes on top
+and was not measured.
 
 What the numbers are made of:
 

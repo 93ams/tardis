@@ -445,6 +445,9 @@ pub fn create(gpa: Allocator, config: Config) !*Sim {
     s.sec = null;
     s.sec_scratch = &.{};
     if (config.security) |sec| {
+        // Its tables are per node (a tenant, a sandbox): a node beyond
+        // them would go unwatched without a word.
+        if (config.nodes > sec.provider.nodes_max) std.debug.panic("tardis: {d} nodes, and the security layer attached to this check watches {d} at most", .{ config.nodes, sec.provider.nodes_max });
         s.sec_scratch = try gpa.alloc(u8, 2 * s.net.datagramCapacity());
         const a: seam.Attached = .{ .provider = sec.provider, .ctx = try sec.provider.create(gpa, sec.params) };
         s.sec = a;
@@ -2241,18 +2244,18 @@ pub const LeakReport = struct {
 /// A crashed node's heap is wiped, so a crash does not strand allocations.
 pub fn leaks(s: *Sim, exclude: TaskId) LeakReport {
     var r: LeakReport = .{ .tasks = 0, .handles = 0, .allocations = 0 };
-    var daemon_nodes: u32 = 0;
+    var daemon_nodes: u128 = 0;
     for (s.tasks, 0..) |*t, i| {
         if (i == 0 or i == s.current or i == exclude) continue;
         if (t.state == .free) continue;
         if (t.daemon) {
-            daemon_nodes |= @as(u32, 1) << @intCast(t.node);
+            daemon_nodes |= @as(u128, 1) << @intCast(t.node);
         } else {
             r.tasks += 1;
         }
     }
     for (s.nodes, 0..) |*node, i| {
-        if (daemon_nodes & (@as(u32, 1) << @intCast(i)) != 0) continue;
+        if (daemon_nodes & (@as(u128, 1) << @intCast(i)) != 0) continue;
         r.handles += node.vfs.openHandleCount();
         r.allocations += node.heap.live_count;
         r.sockets += s.net.openCountOn(@intCast(i));

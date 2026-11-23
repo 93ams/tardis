@@ -227,3 +227,70 @@ test "heap: a live daemon owns its node's memory; a crash wipes it" {
     try tardis.check(gpa, liveDaemonOwnsMemory, .{ .nodes = 2, .iterations = 5 });
     try tardis.check(gpa, crashedDaemonMemoryIsWiped, .{ .nodes = 2, .iterations = 5 });
 }
+
+// ---------------------------------------------------------------------------
+// A hundred nodes
+
+/// Sends `id` to `node`'s echo until its reply comes; false if none did.
+fn askNode(io: Io, sock: Io.net.Socket, server: IpAddress, id: u8) !bool {
+    for (0..8) |_| {
+        try sock.send(io, &server, &.{id});
+        var buf: [8]u8 = undefined;
+        // Replies to earlier questions are skipped.
+        while (true) {
+            const reply = sock.receiveTimeout(io, &buf, timeoutMs(20)) catch |err| switch (err) {
+                error.Timeout => break,
+                else => return err,
+            };
+            if (reply.data.len == 1 and reply.data[0] == id) return true;
+        }
+    }
+    return false;
+}
+
+fn hundredNodes(env: *Env) !void {
+    const io = env.io;
+    for (1..100) |n| try env.spawnOn(@intCast(n), udpEcho, .{io});
+    const sock = try any(0).bind(io, .{ .mode = .dgram });
+    defer sock.close(io);
+    for (1..100) |n| try testing.expect(try askNode(io, sock, env.address(@intCast(n), 53), @intCast(n)));
+    // A cut is of two nodes and no others, on either side of the 32nd
+    // and the 64th node.
+    for ([_]u8{ 31, 32, 33, 63, 64, 65, 99 }) |far| {
+        env.partition(0, far);
+        try testing.expect(!try askNode(io, sock, env.address(far, 53), far));
+        try testing.expect(try askNode(io, sock, env.address(far - 1, 53), far - 1));
+        if (far != 99) try testing.expect(try askNode(io, sock, env.address(far + 1, 53), far + 1));
+        env.healLink(0, far);
+        env.healLink(far, 0);
+        try testing.expect(try askNode(io, sock, env.address(far, 53), far));
+        // The way out alone, which is this node's own bit in the first
+        // node's row: the nodes 32 and 64 below it are not cut with it.
+        env.cutLink(0, far);
+        try testing.expect(!try askNode(io, sock, env.address(far, 53), far));
+        if (far > 32) try testing.expect(try askNode(io, sock, env.address(far - 32, 53), far - 32));
+        if (far > 64) try testing.expect(try askNode(io, sock, env.address(far - 64, 53), far - 64));
+        env.healLink(0, far);
+        try testing.expect(try askNode(io, sock, env.address(far, 53), far));
+    }
+    // One direction only: the question arrives, the answer does not.
+    env.cutLink(99, 0);
+    try testing.expect(!try askNode(io, sock, env.address(99, 53), 99));
+    env.healAll();
+    try testing.expect(try askNode(io, sock, env.address(99, 53), 99));
+}
+
+test "a hundred nodes: each answers, and a cut link cuts those two and no others" {
+    // The security layer watches 32 nodes and refuses a check with more.
+    if (tardis.security_by_default) return error.SkipZigTest;
+    try testing.expect(tardis.nodes_max >= 100);
+    try tardis.check(gpa, hundredNodes, .{
+        .nodes = 100,
+        .iterations = 3,
+        .swarm = false,
+        // No datagram is lost, and none comes twice: a second copy of an
+        // answer, still on its way, would speak for a node just cut off.
+        .faults = .{ .datagram_loss_ppm = 0, .datagram_duplicate_ppm = 0 },
+        .limits = .{ .tasks_max = 128, .net = .{ .sockets_max = 128 } },
+    });
+}

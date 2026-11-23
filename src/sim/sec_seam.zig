@@ -91,6 +91,9 @@ pub const Swap = struct {
 };
 
 pub const Provider = struct {
+    /// The most nodes the layer keeps state for. A simulator with more
+    /// does not start with the layer attached.
+    nodes_max: u8 = std.math.maxInt(u8),
     /// One instance per simulator (per worker thread), created with it.
     create: *const fn (gpa: std.mem.Allocator, params: Params) error{OutOfMemory}!*anyopaque,
     destroy: *const fn (gpa: std.mem.Allocator, ctx: *anyopaque) void,

@@ -119,12 +119,31 @@ fn row(comptime name: []const u8, options: tardis.Options) !void {
     std.debug.print(" |\n", .{});
 }
 
-pub fn main() !void {
+/// The time one run takes with `nodes` nodes: a campaign of `runs`
+/// iterations of the small body, its start included, divided by `runs`.
+fn timeRow(io: std.Io, nodes: u8) !void {
+    const runs = 200;
+    const o: tardis.Options = .{
+        .nodes = nodes,
+        .iterations = runs,
+        .report = false,
+        .determinism_check_every = 0,
+        .faults = .{ .io_error_ppm = 0, .oom_ppm = 0 },
+    };
+    const start = std.Io.Clock.awake.now(io).nanoseconds;
+    try tardis.check(std.heap.page_allocator, body, o);
+    const elapsed: u64 = @intCast(std.Io.Clock.awake.now(io).nanoseconds - start);
+    std.debug.print("| `nodes = {d}` | {d} us |\n", .{ nodes, elapsed / runs / 1000 });
+}
+
+pub fn main(init: std.process.Init) !void {
     std.debug.print("| Options | Most memory live at once | Fiber stacks (reserved, not memory until touched) | Largest allocations (KiB) |\n|---|---|---|---|\n", .{});
     try row("defaults (`.{}`)", .{});
     try row("`nodes = 3`", .{ .nodes = 3 });
     try row("`nodes = 8`", .{ .nodes = 8 });
-    try row("`nodes = 32` (the most there can be)", .{ .nodes = 32 });
+    try row("`nodes = 32` (the most with a security layer)", .{ .nodes = 32 });
+    try row("`nodes = 100`", .{ .nodes = 100 });
+    try row("`nodes = 128` (the most there can be)", .{ .nodes = 128 });
     try row("`limits.tasks_max = 1024`", .{ .limits = .{ .tasks_max = 1024 } });
     try row("`explore = .guided`", .{ .explore = .guided });
     try row("`workers = 4` (four simulators and the caller's)", .{ .workers = 4 });
@@ -132,4 +151,7 @@ pub fn main() !void {
     try row("security layer (`tardis_sec`, its defaults)", sec.withSecurity(sec.default_config));
     try row("security layer with `shadow_memory`", sec.withSecurity(.{ .shadow_memory = true }));
     try row("security layer with `data_races`", sec.withSecurity(.{ .data_races = true }));
+    // Depends on the machine: a second table.
+    std.debug.print("\n| Options | Time of one run of the small body (200 runs, the campaign's start included) |\n|---|---|\n", .{});
+    for ([_]u8{ 1, 3, 8, 32, 100, 128 }) |nodes| try timeRow(init.io, nodes);
 }

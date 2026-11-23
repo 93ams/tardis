@@ -25,8 +25,15 @@ const Allocator = std.mem.Allocator;
 const decide = @import("../sim/decide.zig");
 
 pub const NodeId = u8;
-/// Reachability rows are `u32` bitmasks.
-pub const nodes_limit = 32;
+/// The most nodes a simulation can have. A node's address is
+/// `10.0.0.(node+1)`, and a reachability row is one `Reach`.
+pub const nodes_limit = 128;
+/// A row of the reachability matrix: one bit per node.
+const Reach = u128;
+
+comptime {
+    assert(@bitSizeOf(Reach) == nodes_limit);
+}
 
 pub const Limits = struct {
     sockets_max: u16 = 64,
@@ -149,7 +156,7 @@ pub const Net = struct {
     seg_pool: []Segment,
     node_count: u8,
     /// `reach[a] & (1 << b) != 0`: packets flow from node a to node b.
-    reach: [nodes_limit]u32,
+    reach: [nodes_limit]Reach,
     ephemeral_next: [nodes_limit]u16,
 
     pub fn init(gpa: Allocator, limits: Limits, node_count: u8) !Net {
@@ -196,7 +203,7 @@ pub const Net = struct {
             s.kind = .free;
             s.generation = 0;
         }
-        net.reach = @splat(std.math.maxInt(u32));
+        net.reach = @splat(std.math.maxInt(Reach));
         net.ephemeral_next = @splat(ephemeral_port_first);
     }
 
@@ -204,7 +211,7 @@ pub const Net = struct {
     /// opened, no link cut, no port handed out.
     pub fn pristine(net: *const Net) bool {
         for (net.sockets) |s| if (s.kind != .free or s.generation != 0) return false;
-        for (net.reach) |r| if (r != std.math.maxInt(u32)) return false;
+        for (net.reach) |r| if (r != std.math.maxInt(Reach)) return false;
         for (net.ephemeral_next) |p| if (p != ephemeral_port_first) return false;
         return true;
     }
@@ -390,7 +397,7 @@ pub const Net = struct {
     }
 
     pub fn reachable(net: *const Net, a: NodeId, b: NodeId) bool {
-        return net.reach[a] & (@as(u32, 1) << @intCast(b)) != 0;
+        return net.reach[a] & (@as(Reach, 1) << @intCast(b)) != 0;
     }
 
     pub const EstablishError = error{ ConnectionRefused, SystemResources };
@@ -670,7 +677,7 @@ pub const Net = struct {
     /// Sets whether packets flow from `a` to `b`. Cutting a link holds
     /// undelivered segments; healing it schedules them.
     pub fn setLink(net: *Net, a: NodeId, b: NodeId, up: bool, now_ns: u64, d: *decide.Decider, o: Options) void {
-        const bit = @as(u32, 1) << @intCast(b);
+        const bit = @as(Reach, 1) << @intCast(b);
         const was = net.reach[a] & bit != 0;
         if (was == up) return;
         if (up) net.reach[a] |= bit else net.reach[a] &= ~bit;

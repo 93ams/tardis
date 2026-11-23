@@ -13,6 +13,16 @@ Tests, in the test of a thread's signal to itself: a thread raises `SIGUSR1` whi
 
 **Limits.** Only a simulated thread's signal is looked at. The thread a run began on has its real number, so its signal to itself goes to the kernel as before, and its handler runs on the body's own stack with its system calls trapped. A signal the kernel raises (`SIGSEGV`, `SIGPIPE`, a timer) is not modelled at all, as before.
 
+## Revision 104 (core: up to 128 nodes)
+
+`plan3.md` D8. A simulation could have 32 nodes: a row of the network's reachability matrix was 32 bits. It is 128 now (`tardis.nodes_max`), and `Options.nodes` up to 128 runs.
+
+`a hundred nodes: each answers, and a cut link cuts those two and no others` (in `udp_test.zig`): an echo on each of 99 nodes answers the first; a partition between the first node and the 32nd, 33rd, 34th, 64th, 65th, 66th and 100th in turn silences that one and not its neighbours; a link cut in one direction lets the question through and not the answer. The test found a second 32-bit set of nodes, in the leak check, which panicked with a daemon on a node past the 32nd.
+
+The security layer keeps state per node for 32 nodes (its memory budget is fixed, `plan2.md`), which was the core's limit too until now. A check with more than 32 nodes and a security layer attached panics with a message that says so, before the layer meets a node it has no place for, and the hundred-node test is skipped under `-Dsec`. That is a panic also when `TARDIS_SEC=1` or `-Dsec` attached the layer to a check that named none.
+
+Cost (`zig build membench`, `docs/measurements.md` §2): 100 nodes take 117 MiB and 128 take 150 MiB, about 1.2 MiB a node as before; a campaign of 200 runs of a small body takes 0.58 ms a run with 100 nodes against 0.06 ms with one, on this machine; the campaign's start, which allots those 117 MiB, is in that figure and was not taken apart from the runs. Not measured: 1,000 tasks in time, and a test that does work on all its nodes. Not looked at: exhaustive exploration with more than 64 tasks, whose sets of tasks are 64 bits (`Sim.zig`, `bit`).
+
 ## Revision 103 (tests and core: warm starts with three nodes, and with allocations that fail)
 
 The two warm-start cases revision 102 listed as not covered, and one small fault the review found on the way.

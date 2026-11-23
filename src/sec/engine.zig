@@ -1462,6 +1462,7 @@ fn onCampaignEnd(ctx: *anyopaque, end: *const seam.CampaignEnd) void {
 }
 
 pub const provider: seam.Provider = .{
+    .nodes_max = nodes_max,
     .create = create,
     .destroy = destroy,
     .begin_run = beginRun,
