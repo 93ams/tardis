@@ -1831,6 +1831,9 @@ fn campaignRange(gpa: Allocator, s: *Sim, comptime body: fn (*Env) anyerror!void
         }
         return;
     }
+    // The ring the determinism check's second run records into.
+    var rerun_ring: []trace.Event = &.{};
+    defer if (rerun_ring.len > 0) s.gpa.free(rerun_ring);
     var iteration: u32 = first;
     while (iteration < end) : (iteration += 1) {
         for (options.personas, 0..) |persona, pi| {
@@ -1872,15 +1875,27 @@ fn campaignRange(gpa: Allocator, s: *Sim, comptime body: fn (*Env) anyerror!void
             }
             const every = options.determinism_check_every;
             if (every != 0 and iteration % every == 0) {
+                // The second run records into a ring of its own, so that
+                // the two can be compared event by event if they differ.
+                const first_trace = s.trace;
+                if (rerun_ring.len == 0 and first_trace.ring.len > 0) {
+                    rerun_ring = s.gpa.alloc(trace.Event, first_trace.ring.len) catch rerun_ring;
+                }
+                if (rerun_ring.len > 0) s.trace.ring = rerun_ring;
                 s.rerun = true;
                 const again = runOnce(s, body, seed, persona, iteration, options.leak_check);
                 s.rerun = false;
+                const second_trace = s.trace;
+                s.trace = first_trace;
                 if (again.trace_hash != out.trace_hash) {
-                    if (options.report) std.debug.print(
-                        "tardis: NON-DETERMINISM: seed=0x{x:0>16} persona={s} produced trace 0x{x} then 0x{x}\n" ++
-                            "tardis: the code under test reads state that does not come from env.io/env.allocator\n",
-                        .{ seed, @tagName(persona), out.trace_hash, again.trace_hash },
-                    );
+                    if (options.report) {
+                        std.debug.print(
+                            "tardis: NON-DETERMINISM: seed=0x{x:0>16} persona={s} produced trace 0x{x} then 0x{x}\n" ++
+                                "tardis: the code under test reads state that does not come from env.io/env.allocator\n",
+                            .{ seed, @tagName(persona), out.trace_hash, again.trace_hash },
+                        );
+                        if (rerun_ring.len > 0) first_trace.dumpDivergence(&second_trace);
+                    }
                     s.overlay = null;
                     return error.NonDeterministic;
                 }

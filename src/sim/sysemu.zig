@@ -21,6 +21,7 @@
 //! `unlink`, `unlinkat`, `rmdir`, `mkdir`, `mkdirat`, `stat`, `lstat`,
 //! `fstat`, `newfstatat`, `statx`, `access`, `faccessat`, `faccessat2`,
 //! `getdents64`, `getcwd`, `fcntl` (descriptor flags and record locks),
+//! `ioctl` (only to say that a file is not a terminal),
 //! `chmod`, `fchmod`, `fchown`, `getuid` and its three relatives, `clock_gettime`,
 //! `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`,
 //! `getrandom`, and `futex` (waits and wakes, below).
@@ -392,8 +393,9 @@ pub fn emulate(number: u64, a: *const [6]u64) ?u64 {
         85 => open(s, at_fdcwd, a[0], o_creat | o_wronly | o_trunc), // creat
         257 => open(s, fd, a[1], @truncate(a[2])),
         // Calls on a descriptor: only on one of ours.
-        0, 1, 3, 5, 8, 17, 18, 19, 20, 32, 72, 74, 75, 77, 91, 93, 217, 295, 296 => {
+        0, 1, 3, 5, 8, 16, 17, 18, 19, 20, 32, 72, 74, 75, 77, 91, 93, 217, 295, 296 => {
             if (!simulated(fd)) return null;
+            if (number == 16) return ioctl(s, fd, @truncate(a[1]));
             // A duplicate of the random device is not emulated.
             const dups_it = number == 32 or (number == 72 and (@as(u32, @truncate(a[1])) == 0 or @as(u32, @truncate(a[1])) == 1030));
             if (fd == random_fd) return if (dups_it) null else randomDevice(s, number, a);
@@ -450,6 +452,18 @@ pub fn emulate(number: u64, a: *const [6]u64) ?u64 {
 }
 
 // --- files -------------------------------------------------------------------
+
+/// `ioctl` on a file, a directory or the random device: the requests
+/// that ask whether it is a terminal (`TCGETS` and `TCGETS2`, which are
+/// `isatty`, and `TIOCGWINSZ`, which musl's `fopen` makes to choose its
+/// buffering), and it is not. Any other is not emulated.
+fn ioctl(s: *Sim, fd: i32, request: u32) ?u64 {
+    if (fd != root_fd and fd != random_fd and handleOf(s, fd) == null) return fail(.BADF);
+    return switch (request) {
+        0x5401, 0x802C542A, 0x5413 => fail(.NOTTY),
+        else => null,
+    };
+}
 
 fn open(s: *Sim, dirfd: i32, path_ptr: u64, flags: u32) ?u64 {
     const path = cstr(path_ptr) orelse return fail(.FAULT);

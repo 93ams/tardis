@@ -43,8 +43,9 @@
 //! `sched_yield`, `rt_sigprocmask` (a mask per task, kept and never
 //! applied: a thread that blocks every signal on its way out would block
 //! the trap's own), `sigaltstack` in a thread (accepted, changes nothing),
-//! `set_robust_list` (accepted), `rseq` and `clone3` (`ENOSYS`, which libc
-//! takes as an old kernel and falls back from), and a thread's `munmap` of
+//! `set_robust_list` (accepted), `clone3` (`ENOSYS`, which libc takes as
+//! an old kernel and falls back from), `rseq` (accepted, on processor 0:
+//! see `rseq`), and a thread's `munmap` of
 //! the stack it is running on, which is put off until it has left it, and
 //! a signal a thread sends itself (`abort`), which is raised on the real
 //! thread.
@@ -170,7 +171,10 @@ pub fn emulate(s: *Sim, number: u64, a: *const [6]u64) ?u64 {
     return switch (number) {
         56 => clone(s, a),
         435 => fail(.NOSYS), // clone3: libc falls back to clone
-        334 => fail(.NOSYS), // rseq: libc does without
+        // Only a simulated thread's: on the thread the run began on,
+        // libc registered with the kernel before the run, and a program
+        // that registers by itself is told there is no such call.
+        334 => if (threadOf(s.current) == null) fail(.NOSYS) else rseq(a[0], a[1], a[2]),
         273 => 0, // set_robust_list
         24 => blk: { // sched_yield
             s.yieldNow();
@@ -261,6 +265,35 @@ fn exit(s: *Sim) ?u64 {
     live -= 1;
     if (live == 0) syscalls.setThreadCalls(false);
     s.exitThread(if (clear != 0) @ptrFromInt(clear) else null);
+}
+
+/// `rseq`, which glibc makes in every thread it starts and takes no
+/// refusal of: when the thread the program began on was registered, a
+/// thread whose registration fails aborts the process ("rseq registration
+/// failed"). So the registration is accepted and never given to the
+/// kernel, whose one registration for the real thread stands. The area is
+/// filled as the kernel fills it, with processor 0, which is where
+/// `sched_getcpu` then says every simulated thread runs. The kernel
+/// restarts a registered critical section when its thread is preempted or
+/// moved; here no other simulated thread runs until this one makes a
+/// system call, which no critical section contains, so none needs
+/// restarting. Laxer than the kernel, which also checks the area's
+/// alignment, its length (32 bytes or more) and the signature. On the
+/// thread a run began on, glibc's `sched_getcpu` reads the area the kernel
+/// keeps, and says the machine's processor: that one answer is not the
+/// simulation's.
+fn rseq(area: u64, len: u64, flags: u64) u64 {
+    if (flags & 1 != 0) return 0; // RSEQ_FLAG_UNREGISTER
+    if (area == 0) return fail(.FAULT);
+    if (len < 20) return fail(.INVAL);
+    const words: [*]align(1) u32 = @ptrFromInt(area);
+    words[0] = 0; // cpu_id_start
+    words[1] = 0; // cpu_id
+    if (len >= 28) {
+        words[5] = 0; // node_id
+        words[6] = 0; // mm_cid
+    }
+    return 0;
 }
 
 /// A signal to a simulated thread. To itself (`abort`, `raise`): raised

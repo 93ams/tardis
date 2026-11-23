@@ -228,7 +228,8 @@ makes system calls; `test/sqlite.zig` runs SQLite, built as it ships, and
 loses an acknowledged commit to a power loss when its `synchronous` setting
 allows that (`zig build test-sqlite -Dsqlite`). `test/rust.zig` runs a Rust
 crate the same way: `std::thread`, `std::fs`, sockets, and tokio's two
-runtimes (`zig build test-rust -Drust=<library>`).
+runtimes (`zig build test-rust -Drust=<library>`). `test/cpp.zig` runs a
+C++ program, on musl and on glibc, as part of `zig build test`.
 
 What to know before relying on it:
 

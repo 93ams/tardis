@@ -316,6 +316,28 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run the simulator benchmarks (ReleaseFast)");
     bench_step.dependOn(&run_bench.step);
 
+    // `zig build test-cpp`: a C++ program (`test/cpp/probe.cpp`) under
+    // system-call mode, which is also the default suite's test of a
+    // program linked with libc. Zig compiles the C++, so nothing is
+    // fetched and no other toolchain is needed: on Linux x86_64 it is part
+    // of `zig build test`, against the target's C library (musl or glibc).
+    const cpp_step = b.step("test-cpp", "Run a C++ program under system-call mode (Linux x86_64)");
+    if (target.result.os.tag != .linux or target.result.cpu.arch != .x86_64) {
+        cpp_step.dependOn(&b.addFail("test-cpp needs Linux on x86_64: system-call mode exists nowhere else").step);
+    } else {
+        const cpp_mod = b.createModule(.{
+            .root_source_file = b.path("test/cpp.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "tardis", .module = mod }},
+            .link_libc = true,
+            .link_libcpp = true,
+        });
+        cpp_mod.addCSourceFile(.{ .file = b.path("test/cpp/probe.cpp"), .flags = &.{"-std=c++20"} });
+        cpp_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cpp_mod, .filters = test_filters })).step);
+        test_step.dependOn(cpp_step);
+    }
+
     // `zig build test-sqlite -Dsqlite`: SQLite's amalgamation, built as it
     // ships with its own Unix VFS, run under system-call mode (plan3.md
     // D9). Linux on x86_64. Behind an option, so that nothing else fetches

@@ -31,9 +31,9 @@ mod.addCSourceFile(.{ .file = sqlite.path("sqlite3.c"), .flags = &.{"-DSQLITE_OM
 Nothing in the library is changed and it gets no shim: SQLite runs with its
 own Unix VFS. The one flag only removes its use of `dlopen`.
 
-The configuration that has been run is a static link against musl
-(`-Dtarget=x86_64-linux-musl`). The emulation has code for glibc's ways of
-making the same calls, and no C library has been run on glibc.
+The configuration that has been run most is a static link against musl
+(`-Dtarget=x86_64-linux-musl`). One C++ program has also been run on
+glibc 2.41, linked dynamically (`test/cpp.zig`); SQLite has not.
 
 ## 2. Write the body
 
@@ -101,6 +101,22 @@ The cure is the library's own reset, first thing in the body
 (`sqlite3_randomness(0, null)` for SQLite). When `check` reports
 `NonDeterministic` for a C library, look for state of this kind: a
 generator, a cache, a counter, a table filled on first use.
+
+The report says where to look: under the two hashes it prints the first
+event at which the two runs differ, and the four before it.
+
+```
+tardis: the two runs agree for 2 events (virtual time, task, event):
+    0.000000000s  t0   spawn         1 0 0
+    0.000000000s  t1   switch_to     0 1 0
+  first run:   0.000000000s  t1   random        8 0 0
+  second run:  0.000000000s  t1   spawn         2 0 0
+```
+
+That one is glibc, which draws eight random bytes when a process starts
+its first thread. It has no reset to call. Where there is none, do the
+once-only work before the first run: call the program once outside
+`check`, as `test/cpp.zig` does (`prime`).
 
 ## 5. Several tasks, and threads
 
@@ -228,5 +244,11 @@ threads, a mutex, a channel, a timed wait, files across a power loss, a
 blocking TCP echo, a connection and a file shared through `try_clone`,
 and a TCP echo on tokio's single-threaded runtime and
 on its work-stealing one with two and four workers.
+
+One C++ program, written for the test (`test/cpp/probe.cpp`, libc++):
+threads, a mutex, a condition variable, the steady and the system clock,
+exceptions, streams, a synced file across a power loss, and
+`std::random_device`, on musl and on glibc 2.41. It is part of
+`zig build test` on Linux x86_64.
 
 No C library that uses the network has been run this way.

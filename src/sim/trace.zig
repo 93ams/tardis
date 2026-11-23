@@ -138,6 +138,56 @@ pub const Trace = struct {
         try w.writeAll("\n]\n");
     }
 
+    /// The event with number `index` (the run's first is 0), if the ring
+    /// still holds it.
+    fn at(t: *const Trace, index: u64) ?*const Event {
+        const stored: u64 = @min(t.count, t.ring.len);
+        if (index >= t.count or index < t.count - stored) return null;
+        const back: usize = @intCast(t.count - index);
+        return &t.ring[(t.ring_next + t.ring.len - back) % t.ring.len];
+    }
+
+    fn same(x: *const Event, y: *const Event) bool {
+        return x.time_ns == y.time_ns and x.task == y.task and x.kind == y.kind and x.a == y.a and x.b == y.b and x.c == y.c and
+            std.mem.eql(u8, x.label[0..x.label_len], y.label[0..y.label_len]);
+    }
+
+    fn printEvent(prefix: []const u8, e: *const Event) void {
+        std.debug.print("{s}{d}.{d:0>9}s  t{d: <3} {s: <13} {d} {d} {d}  {s}\n", .{
+            prefix, e.time_ns / std.time.ns_per_s, e.time_ns % std.time.ns_per_s, e.task, @tagName(e.kind), e.a, e.b, e.c, e.label[0..e.label_len],
+        });
+    }
+
+    /// Two runs of one seed gave two traces: prints the first event at
+    /// which they part, with the few before it that they share. The two
+    /// must not share a ring. When they part before what the rings still
+    /// hold, says so.
+    pub fn dumpDivergence(first: *const Trace, second: *const Trace) void {
+        const from = @max(first.count - @min(first.count, first.ring.len), second.count - @min(second.count, second.ring.len));
+        const to = @min(first.count, second.count);
+        // What both rings still hold: nothing, when one run is longer
+        // than the other by more than a ring.
+        var i = from;
+        while (i < to) : (i += 1) {
+            if (!same(first.at(i).?, second.at(i).?)) break;
+        }
+        // The first event kept differs, or every one kept is the same,
+        // and events before them were dropped: the runs parted there.
+        if (from > 0 and (i == from or (i >= to and first.count == second.count))) {
+            std.debug.print("tardis: the two runs ({d} and {d} events) part before the events that are kept: raise Options.limits.trace_ring_len ({d}) to see where\n", .{ first.count, second.count, first.ring.len });
+            return;
+        }
+        if (i == to and first.count == second.count) {
+            std.debug.print("tardis: the two runs have the same {d} events and end differently (another result, another leak, or a label that differs past its first {d} bytes)\n", .{ to, label_bytes_max });
+            return;
+        }
+        std.debug.print("tardis: the two runs agree for {d} events (virtual time, task, event):\n", .{i});
+        var k = i - @min(i - from, 4);
+        while (k < i) : (k += 1) printEvent("    ", first.at(k).?);
+        if (first.at(i)) |e| printEvent("  first run:   ", e) else std.debug.print("  first run:   ends here\n", .{});
+        if (second.at(i)) |e| printEvent("  second run:  ", e) else std.debug.print("  second run:  ends here\n", .{});
+    }
+
     /// Prints the last `max` events in chronological order.
     pub fn dump(t: *const Trace, max: usize) void {
         if (t.ring.len == 0) return;
@@ -156,6 +206,34 @@ pub const Trace = struct {
         }
     }
 };
+
+test "the first event at which two traces part is found, in a ring that has wrapped too" {
+    var ring_a: [4]Event = undefined;
+    var ring_b: [4]Event = undefined;
+    var a = Trace.init(&ring_a);
+    var b = Trace.init(&ring_b);
+    for (0..6) |i| {
+        a.record(i, 0, .write, i, 0, 0, "x");
+        b.record(i, 0, .write, if (i == 4) 99 else i, 0, 0, "x");
+    }
+    // Events 2 to 5 are kept; 4 is the first that differs.
+    try std.testing.expect(a.at(1) == null and a.at(6) == null);
+    try std.testing.expectEqual(@as(u64, 2), a.at(2).?.a);
+    try std.testing.expectEqual(@as(u64, 5), a.at(5).?.a);
+    try std.testing.expect(Trace.same(a.at(3).?, b.at(3).?));
+    try std.testing.expect(!Trace.same(a.at(4).?, b.at(4).?));
+    a.dumpDivergence(&b);
+    // One run longer than the other by more than a ring (found by review:
+    // the count of shared events underflowed), and two that differ only
+    // in what the ring dropped.
+    var c = Trace.init(&ring_b);
+    c.record(0, 0, .write, 0, 0, 0, "x");
+    a.dumpDivergence(&c);
+    c.dumpDivergence(&a);
+    var d = Trace.init(&ring_b);
+    for (0..6) |i| d.record(i, 0, .write, if (i == 0) 99 else i, 0, 0, "x");
+    a.dumpDivergence(&d);
+}
 
 test "trace hash depends on order and content" {
     var ring_a: [4]Event = undefined;

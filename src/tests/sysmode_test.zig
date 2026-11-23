@@ -534,6 +534,40 @@ fn opensBesideRealDescriptor(env: *Env) !void {
     _ = openAt(2, "x", o_rdonly);
 }
 
+/// A file is not a terminal: `isatty` (`TCGETS`) and musl's `fopen`
+/// (`TIOCGWINSZ`) ask, and until revision 107 the question failed the
+/// run, so no C program could write a file through `fopen`.
+fn asksWhetherTerminal(env: *Env) !void {
+    _ = env;
+    const fd = try open("t", o_creat | o_rdwr);
+    var buf: [64]u8 = undefined;
+    try testing.expectEqual(errOf(.NOTTY), sys(.ioctl, fd, 0x5401, @intFromPtr(&buf), 0));
+    try testing.expectEqual(errOf(.NOTTY), sys(.ioctl, fd, 0x5413, @intFromPtr(&buf), 0));
+    try testing.expectEqual(errOf(.NOTTY), sys(.ioctl, fd, 0x802C542A, @intFromPtr(&buf), 0));
+    close(fd);
+    try testing.expectEqual(errOf(.BADF), sys(.ioctl, fd, 0x5401, @intFromPtr(&buf), 0));
+    const dir = try open(".", o_rdonly | o_directory);
+    defer close(dir);
+    try testing.expectEqual(errOf(.NOTTY), sys(.ioctl, dir, 0x5401, @intFromPtr(&buf), 0));
+    const random = try open("/dev/urandom", o_rdonly);
+    defer close(random);
+    try testing.expectEqual(errOf(.NOTTY), sys(.ioctl, random, 0x5401, @intFromPtr(&buf), 0));
+}
+
+test "system-call mode: a file, a directory and the random device are not terminals" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, asksWhetherTerminal, .{ .iterations = 5, .mode = .syscalls });
+}
+
+/// Any other `ioctl` on a file is not emulated.
+fn otherIoctlOnFile(env: *Env) !void {
+    _ = env;
+    const fd = try open("t", o_creat | o_rdwr);
+    defer close(fd);
+    var n: i32 = 0;
+    _ = sys(.ioctl, fd, 0x541B, @intFromPtr(&n), 0); // FIONREAD
+}
+
 fn mapsSimulatedFile(env: *Env) !void {
     _ = env;
     const fd = try open("m", o_creat | o_rdwr);
@@ -721,6 +755,7 @@ test "system-call mode: a call that is not emulated, or on a real descriptor, fa
     try testing.expectError(error.StraySyscall, tardis.check(gpa, readsRealDescriptor, options));
     try testing.expectError(error.StraySyscall, tardis.check(gpa, opensBesideRealDescriptor, options));
     try testing.expectError(error.StraySyscall, tardis.check(gpa, mapsSimulatedFile, options));
+    try testing.expectError(error.StraySyscall, tardis.check(gpa, otherIoctlOnFile, options));
     try testing.expectError(error.StraySyscall, tardis.check(gpa, mapsDuplicate, options));
     try testing.expectError(error.StraySyscall, tardis.check(gpa, duplicatesRandomDevice, options));
     try testing.expectError(error.StraySyscall, tardis.check(gpa, duplicatesRoot, options));
