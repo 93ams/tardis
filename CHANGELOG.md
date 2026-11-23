@@ -5,6 +5,14 @@ numbers (§) are `plan2.md`'s unless an entry names `plan.md`. Revision 1
 was the first draft of `plan2.md`; the core's earlier history is in
 `plan.md` §9 and §14.
 
+## Revision 105 (core: a caught signal a thread sends itself fails the run)
+
+The one fault of revision 99's review that was written down and not fixed. In system-call mode a simulated thread's signal to itself (`raise`, `abort`, `pthread_kill` of itself) is raised on the real thread it runs on. With the default action or with the signal ignored that is right. With a handler the program installed, the handler ran inside the call with the simulator's thread pointer and its system calls not trapped, so whatever it did happened outside the simulation, and the run passed. Now the signal's action is read first (`rt_sigaction`), and if it is a handler the signal is not raised, the call is counted as a stray and answers `ENOSYS`, and the run fails with `StraySyscall`, as a signal to another simulated thread does since revision 99.
+
+Tests, in the test of a thread's signal to itself: a thread raises `SIGUSR1` while the program ignores it (the call succeeds and nothing happens) and while the program catches it (the run fails). Linux (WSL2, kernel 6.18): the library suite, 278 passed, 2 skipped. Windows: the Debug suite passes. Not reviewed by a second reader: the change is twelve lines.
+
+**Limits.** Only a simulated thread's signal is looked at. The thread a run began on has its real number, so its signal to itself goes to the kernel as before, and its handler runs on the body's own stack with its system calls trapped. A signal the kernel raises (`SIGSEGV`, `SIGPIPE`, a timer) is not modelled at all, as before.
+
 ## Revision 103 (tests and core: warm starts with three nodes, and with allocations that fail)
 
 The two warm-start cases revision 102 listed as not covered, and one small fault the review found on the way.

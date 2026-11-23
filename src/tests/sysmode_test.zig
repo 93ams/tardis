@@ -2307,6 +2307,48 @@ fn threadSignalsAnother(env: *Env) !void {
     try testing.expectEqual(errOf(.NOSYS), result);
 }
 
+fn raisesInThread(signal: usize, result: *isize) void {
+    const pid: usize = @intCast(sys(.getpid, 0, 0, 0, 0));
+    const tid: usize = @intCast(sys(.gettid, 0, 0, 0, 0));
+    result.* = sys(.tgkill, pid, tid, signal, 0);
+}
+
+fn neverRuns(_: i32) callconv(.c) void {}
+
+const sigusr1 = 10;
+
+/// Sets what SIGUSR1 does, as the kernel's `struct sigaction` has it: 0
+/// the default, 1 ignored, else a handler.
+fn setUsr1(handler: usize) !void {
+    const action = [4]usize{ handler, 0, 0, 0 };
+    _ = try ok(sys(.rt_sigaction, sigusr1, @intFromPtr(&action), 0, @sizeOf(usize)));
+}
+
+/// A thread raises a signal the program ignores: delivered, and nothing
+/// happens.
+fn threadRaisesIgnored(env: *Env) !void {
+    _ = env;
+    try setUsr1(1);
+    defer setUsr1(0) catch {};
+    var result: isize = -1;
+    const t = try std.Thread.spawn(.{}, raisesInThread, .{ sigusr1, &result });
+    t.join();
+    try testing.expectEqual(@as(isize, 0), result);
+}
+
+/// A thread raises a signal the program catches: its handler would run
+/// outside the simulation, so the signal is not raised and the run fails
+/// (until revision 105 it ran there, and nothing said so).
+fn threadRaisesCaught(env: *Env) !void {
+    _ = env;
+    try setUsr1(@intFromPtr(&neverRuns));
+    defer setUsr1(0) catch {};
+    var result: isize = -1;
+    const t = try std.Thread.spawn(.{}, raisesInThread, .{ sigusr1, &result });
+    t.join();
+    try testing.expectEqual(errOf(.NOSYS), result);
+}
+
 fn threadSelfSignal(env: *Env) !void {
     _ = env;
     var first: [4]isize = @splat(-1);
@@ -2329,6 +2371,8 @@ test "system-call mode: a thread's signal to itself reaches the thread it runs o
     if (!supported or !tardis.syscallModeAvailable() or !tardis.syscallThreadsAvailable()) return error.SkipZigTest;
     try tardis.check(gpa, threadSelfSignal, .{ .iterations = 20, .mode = .syscalls });
     try testing.expectError(error.StraySyscall, tardis.check(gpa, threadSignalsAnother, .{ .iterations = 1, .mode = .syscalls, .report = false }));
+    try tardis.check(gpa, threadRaisesIgnored, .{ .iterations = 5, .mode = .syscalls });
+    try testing.expectError(error.StraySyscall, tardis.check(gpa, threadRaisesCaught, .{ .iterations = 1, .mode = .syscalls, .report = false }));
 }
 
 fn threadCrash(env: *Env) !void {

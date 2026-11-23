@@ -264,12 +264,13 @@ fn exit(s: *Sim) ?u64 {
 }
 
 /// A signal to a simulated thread. To itself (`abort`, `raise`): raised
-/// on the real thread it runs on, where the default action takes it. A
-/// handler the program installed for it runs inside this call, with the
-/// simulator's thread pointer and its system calls not trapped: a caught
-/// signal a thread sends itself is not emulated faithfully, and nothing
-/// reports it. To another: not emulated. To a number that is not a simulated
-/// thread's: not ours.
+/// on the real thread it runs on, where the default action takes it, or
+/// nothing does if the program ignores it. A handler the program
+/// installed for it would run inside this call, with the simulator's
+/// thread pointer and its system calls not trapped: a caught signal a
+/// thread sends itself is not emulated, and fails the run. To another:
+/// not emulated either. To a number that is not a simulated thread's: not
+/// ours.
 fn kill(s: *Sim, number: u64, tid: i32, signal: u64) ?u64 {
     // Not a simulated thread's number (the thread the run began on has
     // its real one): the kernel's to answer.
@@ -282,6 +283,16 @@ fn kill(s: *Sim, number: u64, tid: i32, signal: u64) ?u64 {
         // `pthread_cancel`): the run fails.
         syscalls.noteStray(number);
         return fail(.NOSYS);
+    }
+    if (signal != 0) {
+        // The kernel's `struct sigaction`: the handler first. 0 is the
+        // default action and 1 is to ignore.
+        var action: [4]u64 = @splat(0);
+        const rc: i64 = @bitCast(syscalls.raw6(13, signal, 0, @intFromPtr(&action), @sizeOf(u64), 0, 0)); // rt_sigaction
+        if (rc == 0 and action[0] > 1) {
+            syscalls.noteStray(number);
+            return fail(.NOSYS);
+        }
     }
     const pid = syscalls.raw6(39, 0, 0, 0, 0, 0, 0); // getpid
     const real = syscalls.raw6(186, 0, 0, 0, 0, 0, 0); // gettid
