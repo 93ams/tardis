@@ -5,6 +5,18 @@ numbers (§) are `plan2.md`'s unless an entry names `plan.md`. Revision 1
 was the first draft of `plan2.md`; the core's earlier history is in
 `plan.md` §9 and §14.
 
+## Revision 108 (tests: the network model against the loopback, datagrams and larger streams)
+
+`plan3.md` A4. `diff_net_test.zig` compared five stream scenarios with the real loopback interface; it compares ten. New: 256 KiB each way over one connection; three connections made before any is written to, written in the reverse order of connecting, each answered with its place in the accept order; three datagrams of 5, 1,200 and 1 bytes echoed back (boundaries and order kept); a datagram of 100 bytes received into 10 (the first 10 bytes and the truncation flag); a datagram of no bytes followed by one of one byte (both arrive, the first empty).
+
+Each side's bytes are summed weighed by their place, so a sum checks order as well as count. No model error found. Linux agrees on all ten. Windows agrees on eight, and on the other two is a known difference: a second listener on a taken port succeeds (as before), and a datagram larger than the receive buffer is an error there (`MessageOversize`, from WSAEMSGSIZE) where POSIX and the model truncate it; on Windows the truncation scenario therefore compares nothing. The stream scenarios run with the network's default range of latencies; the datagram scenarios with one latency, because a range lets the model reorder datagrams, which UDP allows and the loopback interface never does.
+
+Found on the way, in the test and not in the model: sending a datagram of no bytes from `&.{}` makes the real `std` panic on Linux (the kernel answered EFAULT to that address although no bytes were sent, and `std` treats EFAULT as a programmer error); the simulator accepted it. The test sends from a real buffer. And the real run's `Io` refuses a receive with a timeout (`ConcurrencyUnavailable`), so the datagram scenarios receive without one, and a timeout is not compared.
+
+**Review.** A fresh reviewer found the sums blind to order (a reordered stream of the repeating pattern summed the same), the truncation scenario checking no bytes, a failed second connect that would hang the real run (the server waited on a stream never shut; the test now returns and cancels it), the fixed latency applied to the stream scenarios too, and three comments that said more than the code. All fixed.
+
+Not compared yet: timeouts, name lookup, datagrams to a port nobody listens on, and a stream written after the peer has gone.
+
 ## Revision 107 (core: a C++ program and glibc in system-call mode, and where two runs of a seed part)
 
 C++ and glibc were the first two entries of every list of what system-call mode had not run. `test/cpp/probe.cpp` is C++ that knows nothing of TARDIS: four `std::thread`s with a `std::mutex` and a `std::condition_variable`, `sleep_for` and `wait_for` on the steady clock with the system clock beside them, exceptions thrown on a thread and on the body, an `ofstream` and an `ifstream`, a file written, synced and renamed that a power loss then keeps, and `std::random_device`. `test/cpp.zig` runs it, six tests of 50 seeds. Zig compiles the C++, so nothing is fetched: `zig build test-cpp`, and on Linux x86_64 it is part of `zig build test`, which until now linked no libc at all and so had no test of what revision 99 found (a C library's clock read through the vDSO; the first of the six tests is that one). It passes on musl, linked statically, and on glibc 2.41, linked dynamically (Debian 13 in WSL2, kernel 6.18), in Debug, ReleaseSafe and ReleaseFast.

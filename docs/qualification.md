@@ -40,7 +40,7 @@ build test`; file names are under `src/tests/` unless they say otherwise.
 | R4 | reduce a failure to decisions that still cause it, never to a different failure | `shrink_test.zig`; `sec/tests/pillar1_test.zig` (seam 4: a security finding is kept only while the same finding reproduces) |
 | R5 | model a power loss no more kindly than the persona's filesystem: what was not made durable may be lost | `fs_test.zig`, `link_test.zig`, `bugs_test.zig` (planted crash-consistency bugs are found per persona); `self_fuzz_test.zig` (what was synced survives) |
 | R6 | answer filesystem calls as the real filesystem does when no fault is injected | `diff_fs_test.zig`: random operation sequences compared with the host's filesystem (NTFS, ext4) |
-| R7 | answer stream-socket calls as the real loopback does when no fault is injected | `diff_net_test.zig`: five scenarios compared with the host |
+| R7 | answer stream- and datagram-socket calls as the real loopback does when no fault is injected | `diff_net_test.zig`: ten scenarios compared with the host |
 | R8 | schedule tasks only at `std.Io` calls, and explore their interleavings from the seed | `scheduler_test.zig`; `examples/counter.zig`, `examples/check_then_act.zig` (races found) |
 | R9 | detect a run in which every task is blocked, a run that makes no progress within a stated bound (`Env.expectProgress`), and a run that leaves a handle, a task or memory behind | `scheduler_test.zig`, `liveness_test.zig`, `fs_test.zig`, `net_test.zig`; `examples/deadlock.zig`, `examples/livelock.zig`, `examples/error_leak.zig` |
 | R10 | deliver, delay, reorder, drop and duplicate network traffic only as its options allow, and hold stream data across a partition | `net_test.zig`, `udp_test.zig`, `chaos_test.zig` |
