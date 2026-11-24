@@ -226,6 +226,10 @@ pub fn build(b: *std.Build) void {
     }
     const bugbench = b.addExecutable(.{ .name = "tardis-bugbench", .root_module = bugbench_mod });
     const bugbench_step = b.step("bugbench", "Run the bug benchmark: planted bugs, found or not, and what they shrink to");
+    // `zig build install-bugbench`: the program itself, to run under a
+    // profiler (docs/measurements.md §5).
+    const install_bugbench = b.step("install-bugbench", "Install the bug benchmark's program, to run under a profiler");
+    install_bugbench.dependOn(&b.addInstallArtifact(bugbench, .{}).step);
     const run_bugbench = b.addRunArtifact(bugbench);
     bugbench_step.dependOn(&run_bugbench.step);
     // `zig build bugbench-rates`: the detection table (plan3.md A5).

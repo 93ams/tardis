@@ -401,13 +401,22 @@ fn baselineRow(gpa: std.mem.Allocator, io: std.Io, comptime name: []const u8, co
     return found and fix_holds;
 }
 
+/// `--without=<name>`: the example left out of the table, for a profiler
+/// that cannot run it (docs/measurements.md §5: callgrind and
+/// `syscall_rename`, which traps its own system calls).
+var without: ?[]const u8 = null;
+var without_found = false;
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
     var args = try init.minimal.args.iterateAllocator(gpa);
     defer args.deinit();
     _ = args.skip();
-    const mode = args.next() orelse "";
+    var mode: []const u8 = "";
+    while (args.next()) |arg| {
+        if (std.mem.startsWith(u8, arg, "--without=")) without = arg["--without=".len..] else mode = arg;
+    }
     if (std.mem.eql(u8, mode, "--baselines")) {
         std.debug.print("| Program | The example's own trouble | No faults | No preemption | Neither | Default | Failing run of the default |\n|---|---|---|---|---|---|---|\n", .{});
         if (!try all(gpa, io, baselineRow)) {
@@ -443,32 +452,45 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn all(gpa: std.mem.Allocator, io: std.Io, comptime each: anytype) !bool {
+    const Each = struct {
+        fn call(gpa_: std.mem.Allocator, io_: std.Io, comptime name: []const u8, comptime class: []const u8, comptime module: type) !bool {
+            if (without) |w| if (std.mem.eql(u8, w, name)) {
+                without_found = true;
+                return true;
+            };
+            return each(gpa_, io_, name, class, module);
+        }
+    };
     var ok = true;
-    ok = try each(gpa, io, "wal_kv", "acknowledged before durable", @import("wal_kv")) and ok;
-    ok = try each(gpa, io, "dir_sync", "missing fsync of a directory", @import("dir_sync")) and ok;
-    ok = try each(gpa, io, "rename_unsynced", "renamed before the data is durable", @import("rename_unsynced")) and ok;
-    ok = try each(gpa, io, "syscall_rename", "renamed before the data is durable, by system call", @import("syscall_rename")) and ok;
-    ok = try each(gpa, io, "in_place_rewrite", "a file rewritten in place", @import("in_place_rewrite")) and ok;
-    ok = try each(gpa, io, "index_before_data", "two files made durable in the wrong order", @import("index_before_data")) and ok;
-    ok = try each(gpa, io, "id_reuse", "identifier handed out twice after a restart", @import("id_reuse")) and ok;
-    ok = try each(gpa, io, "jobs", "applied twice after a restart", @import("jobs")) and ok;
-    ok = try each(gpa, io, "short_write", "short write taken for a whole one", @import("short_write")) and ok;
-    ok = try each(gpa, io, "short_read", "short read taken for a whole one", @import("short_read")) and ok;
-    ok = try each(gpa, io, "error_leak", "resource leaked on an error path", @import("error_leak")) and ok;
-    ok = try each(gpa, io, "oom_partial", "half-finished update when memory runs out", @import("oom_partial")) and ok;
-    ok = try each(gpa, io, "counter", "lost update between tasks", @import("counter")) and ok;
-    ok = try each(gpa, io, "check_then_act", "check, then act", @import("check_then_act")) and ok;
-    ok = try each(gpa, io, "lin_register", "a compare-and-swap that is not atomic", @import("lin_register")) and ok;
-    ok = try each(gpa, io, "write_skew", "write skew between transactions", @import("write_skew")) and ok;
-    ok = try each(gpa, io, "deadlock", "deadlock from lock order", @import("deadlock")) and ok;
-    ok = try each(gpa, io, "livelock", "livelock from retrying in step", @import("livelock")) and ok;
-    ok = try each(gpa, io, "hidden_state", "state that survives a run", @import("hidden_state")) and ok;
-    ok = try each(gpa, io, "never_retried", "code the test never reaches", @import("never_retried")) and ok;
-    ok = try each(gpa, io, "lease", "a duration measured with the wall clock", @import("lease")) and ok;
-    ok = try each(gpa, io, "udp_retry", "a retry applied twice", @import("udp_retry")) and ok;
-    ok = try each(gpa, io, "udp_order", "trusting the order of arrival", @import("udp_order")) and ok;
-    ok = try each(gpa, io, "udp_no_timeout", "waiting for ever for a lost message", @import("udp_no_timeout")) and ok;
-    ok = try each(gpa, io, "stale_read", "a stale read from a follower", @import("stale_read")) and ok;
-    ok = try each(gpa, io, "replica", "replica left behind by a partition", @import("replica")) and ok;
+    ok = try Each.call(gpa, io, "wal_kv", "acknowledged before durable", @import("wal_kv")) and ok;
+    ok = try Each.call(gpa, io, "dir_sync", "missing fsync of a directory", @import("dir_sync")) and ok;
+    ok = try Each.call(gpa, io, "rename_unsynced", "renamed before the data is durable", @import("rename_unsynced")) and ok;
+    ok = try Each.call(gpa, io, "syscall_rename", "renamed before the data is durable, by system call", @import("syscall_rename")) and ok;
+    ok = try Each.call(gpa, io, "in_place_rewrite", "a file rewritten in place", @import("in_place_rewrite")) and ok;
+    ok = try Each.call(gpa, io, "index_before_data", "two files made durable in the wrong order", @import("index_before_data")) and ok;
+    ok = try Each.call(gpa, io, "id_reuse", "identifier handed out twice after a restart", @import("id_reuse")) and ok;
+    ok = try Each.call(gpa, io, "jobs", "applied twice after a restart", @import("jobs")) and ok;
+    ok = try Each.call(gpa, io, "short_write", "short write taken for a whole one", @import("short_write")) and ok;
+    ok = try Each.call(gpa, io, "short_read", "short read taken for a whole one", @import("short_read")) and ok;
+    ok = try Each.call(gpa, io, "error_leak", "resource leaked on an error path", @import("error_leak")) and ok;
+    ok = try Each.call(gpa, io, "oom_partial", "half-finished update when memory runs out", @import("oom_partial")) and ok;
+    ok = try Each.call(gpa, io, "counter", "lost update between tasks", @import("counter")) and ok;
+    ok = try Each.call(gpa, io, "check_then_act", "check, then act", @import("check_then_act")) and ok;
+    ok = try Each.call(gpa, io, "lin_register", "a compare-and-swap that is not atomic", @import("lin_register")) and ok;
+    ok = try Each.call(gpa, io, "write_skew", "write skew between transactions", @import("write_skew")) and ok;
+    ok = try Each.call(gpa, io, "deadlock", "deadlock from lock order", @import("deadlock")) and ok;
+    ok = try Each.call(gpa, io, "livelock", "livelock from retrying in step", @import("livelock")) and ok;
+    ok = try Each.call(gpa, io, "hidden_state", "state that survives a run", @import("hidden_state")) and ok;
+    ok = try Each.call(gpa, io, "never_retried", "code the test never reaches", @import("never_retried")) and ok;
+    ok = try Each.call(gpa, io, "lease", "a duration measured with the wall clock", @import("lease")) and ok;
+    ok = try Each.call(gpa, io, "udp_retry", "a retry applied twice", @import("udp_retry")) and ok;
+    ok = try Each.call(gpa, io, "udp_order", "trusting the order of arrival", @import("udp_order")) and ok;
+    ok = try Each.call(gpa, io, "udp_no_timeout", "waiting for ever for a lost message", @import("udp_no_timeout")) and ok;
+    ok = try Each.call(gpa, io, "stale_read", "a stale read from a follower", @import("stale_read")) and ok;
+    ok = try Each.call(gpa, io, "replica", "replica left behind by a partition", @import("replica")) and ok;
+    if (without) |w| if (!without_found) {
+        std.debug.print("bugbench: no example is called `{s}`\n", .{w});
+        return error.UnknownExample;
+    };
     return ok;
 }

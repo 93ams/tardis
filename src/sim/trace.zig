@@ -71,6 +71,10 @@ pub const Event = struct {
 
 pub const label_bytes_max = 40;
 
+/// Labels up to this long are hashed in one call with the event's words;
+/// longer ones (rare: long paths) through the streaming interface.
+const inline_label_max = 256;
+
 pub const Trace = struct {
     hash: u64,
     count: u64,
@@ -88,28 +92,38 @@ pub const Trace = struct {
     }
 
     pub fn record(t: *Trace, time_ns: u64, task: u16, kind: Kind, a: u64, b: u64, c: u64, label: []const u8) void {
-        var words = [_]u64{ time_ns, task, @backingInt(kind), a, b, c };
-        var h = std.hash.Wyhash.init(t.hash);
-        h.update(std.mem.sliceAsBytes(&words));
-        h.update(label);
-        t.hash = h.final();
+        // The hash of the event's six words followed by its label. One call
+        // of `Wyhash.hash` over the bytes gives the value its streaming
+        // interface gives (`init`, `update`, `final`), for about half the
+        // work, which matters: this runs for every event (plan3.md E6).
+        const words_bytes = 6 * @sizeOf(u64);
+        var bytes: [words_bytes + inline_label_max]u8 align(@alignOf(u64)) = undefined;
+        const words: *[6]u64 = @ptrCast(&bytes);
+        words.* = .{ time_ns, task, @backingInt(kind), a, b, c };
+        if (label.len <= inline_label_max) {
+            @memcpy(bytes[words_bytes..][0..label.len], label);
+            t.hash = std.hash.Wyhash.hash(t.hash, bytes[0 .. words_bytes + label.len]);
+        } else {
+            var h = std.hash.Wyhash.init(t.hash);
+            h.update(bytes[0..words_bytes]);
+            h.update(label);
+            t.hash = h.final();
+        }
         t.count += 1;
 
         if (t.ring.len == 0) return;
         const e = &t.ring[t.ring_next];
         const n: u8 = @intCast(@min(label.len, label_bytes_max));
-        e.* = .{
-            .time_ns = time_ns,
-            .task = task,
-            .kind = kind,
-            .a = a,
-            .b = b,
-            .c = c,
-            .label = undefined,
-            .label_len = n,
-        };
+        e.time_ns = time_ns;
+        e.task = task;
+        e.kind = kind;
+        e.a = a;
+        e.b = b;
+        e.c = c;
+        e.label_len = n;
         @memcpy(e.label[0..n], label[0..n]);
-        t.ring_next = (t.ring_next + 1) % t.ring.len;
+        t.ring_next += 1;
+        if (t.ring_next == t.ring.len) t.ring_next = 0;
     }
 
     /// Writes the events in the ring, oldest first, as a Chrome trace
@@ -233,6 +247,23 @@ test "the first event at which two traces part is found, in a ring that has wrap
     var d = Trace.init(&ring_b);
     for (0..6) |i| d.record(i, 0, .write, if (i == 0) 99 else i, 0, 0, "x");
     a.dumpDivergence(&d);
+}
+
+test "trace hash: a long label is hashed as a short one is" {
+    // The one call and the streaming fallback give the hash of the words
+    // followed by the label, whatever its length.
+    var label: [inline_label_max + 50]u8 = undefined;
+    for (&label, 0..) |*x, i| x.* = @truncate(i *% 7 +% 3);
+    for ([_]usize{ 0, 1, 16, 40, inline_label_max, inline_label_max + 1, label.len }) |n| {
+        var t = Trace.init(&.{});
+        t.hash = 0x1234;
+        t.record(5, 2, .write, 7, 8, 9, label[0..n]);
+        var h = std.hash.Wyhash.init(0x1234);
+        const words = [_]u64{ 5, 2, @backingInt(Kind.write), 7, 8, 9 };
+        h.update(std.mem.sliceAsBytes(&words));
+        h.update(label[0..n]);
+        try std.testing.expectEqual(h.final(), t.hash);
+    }
 }
 
 test "trace hash depends on order and content" {

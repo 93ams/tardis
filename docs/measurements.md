@@ -1,7 +1,7 @@
 # Measurements
 
-Four sections of tables that the repository can print again at any
-time. Numbers in the first, the third and the fourth follow from the
+Five sections of tables that the repository can print again at any
+time (the fifth, a profile, with a tool from outside it). Numbers in the first, the third and the fourth follow from the
 seeds and are the same on every machine; in the second, memory depends on
 the allocator's rounding and may move by a few kilobytes, and time
 depends on the machine.
@@ -409,3 +409,49 @@ about depth, which matters more as programs grow; `pct_steps` was left at
 the run's own would place the change points better.
 
 Measured on Windows at revision 90.
+
+## 5. Where a run's time goes
+
+`plan3.md` E6. A profile of the simulator on the bug benchmark's
+detection table (`zig build bugbench-rates`): 25 of the examples, each
+found 20 times by campaigns of 10, 50 and 200 iterations, so the runs are
+the examples' own programs, not empty ones. The example that runs by
+system call is left out, since the profiler cannot run a program that
+traps its own system calls. Linux x86_64 (WSL2), static musl,
+ReleaseFast, Valgrind's callgrind; the count is of instructions, which
+callgrind counts the same on every run, where time on this machine moves
+by a fifth from run to run.
+
+```
+zig build install-bugbench -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast
+valgrind --tool=callgrind ./zig-out/bin/tardis-bugbench --rates --without=syscall_rename
+callgrind_annotate --inclusive=yes callgrind.out.<pid>
+```
+
+At revision 116, 6.96 billion instructions. The largest costs, each with
+what it calls (inclusive), as a share of the whole:
+
+| Part | Share | What it is |
+|---|---|---|
+| Recording a trace event (`Trace.record`) | 25.2% | Every event is folded into the run's hash with Wyhash's streaming interface (two updates and a finish, about 180 instructions), then copied into the ring of recent events with a division for the wrap. |
+| Drawing a decision (`Decider.nextRaw`) | 9.3% | About 100 instructions a keyed draw: four SplitMix64 rounds to make the key from the stream, the task's path and the counter, one more for the value, and the checks for the shrinker's and the explorer's hooks. Two of the four rounds depend only on the stream and the task, and could be kept per task. |
+| Looking for the network's next event (`Net.nextEventAfter`) | 7.9% | Each wait on the network scans all 64 socket slots, most of them free, about 570 instructions a call. A mark of the highest slot in use would end the scan early. |
+| The examples' own parsing (`Io.Reader.peekDelimiterInclusive`) | 8.1% | Not the simulator: `replica` reads its messages a line at a time. |
+| Copying memory (`memcpy`) | 5.2% | Spread over many callers. |
+
+Not in the count: more than half of the wall-clock time of this run is
+spent in the kernel (2.0 seconds of user time, 4.4 of system time, on
+this machine), which the profiler does not see.
+
+**Fixed: the first item** (revision 117). One call of `Wyhash.hash` over
+the event's words and label gives the value the streaming interface
+gives, so every trace hash is unchanged (the golden hash test passes as
+it was) and the bug benchmark's detection table is printed the same.
+The ring's wrap is a comparison. After: 5.81 billion instructions, 16.5%
+fewer (1.15 billion), and
+`Trace.record` takes 8.4% of them; its own drop looks larger (1.27
+billion), as some of what it did is now counted to the functions it was
+inlined into. In time, the median user time of five runs went from 1.70
+to 1.51 seconds, an indication only, inside the noise of this machine.
+
+Measured at revision 116 and with the change.
