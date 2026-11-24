@@ -5,6 +5,20 @@ numbers (§) are `plan2.md`'s unless an entry names `plan.md`. Revision 1
 was the first draft of `plan2.md`; the core's earlier history is in
 `plan.md` §9 and §14.
 
+## Revision 112 (core: a program that asks how many processors there are)
+
+Revision 110 named, as a limit, the files a runtime reads to count the machine's processors, and said none had been met. Three probes that ask were written, and all three failed with `StraySyscall`: C++'s `std::thread::hardware_concurrency` with `sysconf` on glibc (`/sys/devices/system/cpu/online`, then `/proc/stat`), Rust's `std::thread::available_parallelism` on both C libraries (`/proc/self/cgroup`), and tokio's work-stealing runtime built the way most programs build it, with no worker count given, which asks the same. The Rust tests since revision 99 passed because each gave tokio a worker count.
+
+Four more paths are now answered as missing, as revision 110 answered glibc's `/proc/sys/vm/overcommit_memory`: `/sys/devices/system/cpu/online`, `/sys/devices/system/cpu/possible`, `/proc/stat` and `/proc/self/cgroup`. Each runtime then asks `sched_getaffinity`, which has said one processor since revision 75. So the answer is one, on every machine: `hardware_concurrency`, `sysconf(_SC_NPROCESSORS_ONLN)`, `sysconf(_SC_NPROCESSORS_CONF)` and `available_parallelism` all return 1, and tokio's default runtime starts one worker and passes its echo test. Each path is needed: with `/proc/stat` or `possible` taken off the list the glibc C++ test fails again, and `online` and `/proc/self/cgroup` are the two the first failures named.
+
+**What this gives up.** A program that reads one of these five files for its own purposes finds it missing and is not told, as it was before, that it asked about the real machine. Every other path under `/proc` and `/sys` is still a stray. Only an `open` for reading is answered: one that writes, and `stat` or `access` of the same paths, is a stray.
+
+**Review.** A fresh reviewer found no fault in the answer itself and three things worth changing, all changed: an `open` of one of these paths that writes or creates was answered as missing too (the kernel would not say that; it is a stray again); the tokio test showed only that the runtime ran, not how many workers it started (it now fails unless there is one); and the comment gave glibc's order of files without a version (2.41 was run; 2.36 and later read the same files by their source, and 2.34 and 2.35 list the directory `/sys/devices/system/cpu` for the configured count, which is still a stray). Written down and not changed: tokio reads `TOKIO_WORKER_THREADS` from the environment before it asks the machine; the C++ test on musl passed before this revision too, since musl asks `sched_getaffinity` only, so it is the glibc build that tests the change; `sysinfo` (glibc's count of memory pages) is a stray.
+
+Tested on Linux: the library suite, 283 passed and 2 skipped, and all 41 Linux test binaries pass; C++ 8 of 8 and Rust 10 of 10 on musl and on glibc 2.41, glibc also in ReleaseSafe. Windows: the full verification script passed in all five configurations before the review's changes, and Debug after them (417 of 471 passed, 54 skipped, none failed).
+
+**Limits.** One processor is the only answer: a program cannot be run as if on eight. One glibc (2.41), one Rust (1.99), one tokio (1.54); another version may read another file, and the report will name it. Go, Java, Python and Node count processors too and none has been run. `dup2` and `dup3` are still strays, and stay so: the program picks the number, and the simulated descriptors live in ranges of their own.
+
 ## Revision 110 (core: SQLite and Rust on glibc, and the hang it found)
 
 Revision 107 ran one small C++ program on glibc and said that was no claim about glibc programs in general. SQLite and the Rust crate (tokio included) are now run on it too: glibc 2.41, linked dynamically, Debian 13 in WSL2. The Rust crate passed 8 of 8 as it was. SQLite failed 3 of 7, for two reasons that are the tool's, both fixed, and now passes 7 of 7.

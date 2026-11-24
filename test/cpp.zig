@@ -158,6 +158,19 @@ fn random(env: *Env) !void {
     drawn = cpp_random();
 }
 
+extern fn cpp_processors() c_int;
+
+fn processors(env: *Env) !void {
+    _ = env;
+    // One processor, asked three ways.
+    try testing.expectEqual(@as(c_int, 10101), cpp_processors());
+}
+
+test "c++: the processor count is one, on every machine" {
+    if (skip()) return error.SkipZigTest;
+    try tardis.check(testing.allocator, processors, options);
+}
+
 test "c++: std::random_device follows the seed" {
     if (skip()) return error.SkipZigTest;
     try tardis.check(testing.allocator, random, .{ .iterations = 1, .seed = 1, .mode = .syscalls });

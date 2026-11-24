@@ -2,7 +2,9 @@
 //!
 //! `test/rust` is a Rust crate built as a static library for
 //! `x86_64-unknown-linux-musl`: the standard library's threads, locks,
-//! channels, clock, files and sockets, and tokio's two runtimes. It knows
+//! channels, clock, files and sockets, and tokio's two runtimes (the
+//! work-stealing one with a worker count given and with the one it
+//! picks). It knows
 //! nothing of TARDIS. System-call mode answers its system calls from the
 //! simulation, and its threads are simulated tasks.
 //!
@@ -140,6 +142,29 @@ fn tokioTwoWorkers(env: *Env) !void {
 fn tokioFourWorkers(env: *Env) !void {
     _ = env;
     try testing.expectEqual(@as(c_int, 0), rust_tokio_workers(4));
+}
+
+extern fn rust_parallelism() usize;
+extern fn rust_tokio_default() c_int;
+
+fn parallelism(env: *Env) !void {
+    _ = env;
+    try testing.expectEqual(@as(usize, 1), rust_parallelism());
+}
+
+test "rust: available_parallelism is one, on every machine" {
+    if (skip()) return error.SkipZigTest;
+    try tardis.check(testing.allocator, parallelism, options);
+}
+
+fn tokioDefault(env: *Env) !void {
+    _ = env;
+    try testing.expectEqual(@as(c_int, 0), rust_tokio_default());
+}
+
+test "rust: tokio's work-stealing runtime with the worker count it picks" {
+    if (skip()) return error.SkipZigTest;
+    try tardis.check(testing.allocator, tokioDefault, options);
 }
 
 test "rust: tokio's work-stealing runtime, two workers and four" {

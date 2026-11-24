@@ -253,6 +253,12 @@ pub extern "C" fn rust_hash_order() -> u64 {
     t.join().unwrap_or(0)
 }
 
+/// How many threads the standard library says are worth starting.
+#[no_mangle]
+pub extern "C" fn rust_parallelism() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0)
+}
+
 #[cfg(feature = "tokio")]
 mod with_tokio {
     use std::time::Duration;
@@ -346,6 +352,24 @@ mod with_tokio {
     pub extern "C" fn rust_tokio_current() -> i32 {
         std::thread::spawn(|| {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().rng_seed(seed()).build() else { return 100 };
+            rt.block_on(echo(3))
+        })
+        .join()
+        .unwrap_or(101)
+    }
+
+    /// tokio's work-stealing runtime as most programs build it: as many
+    /// workers as the machine has processors, which tokio asks for.
+    /// One, under simulation.
+    #[no_mangle]
+    pub extern "C" fn rust_tokio_default() -> i32 {
+        std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_multi_thread().enable_all().rng_seed(seed()).build() else { return 100 };
+            // The simulated machine has one processor. (tokio reads
+            // `TOKIO_WORKER_THREADS` from the environment first.)
+            if rt.metrics().num_workers() != 1 {
+                return 102;
+            }
             rt.block_on(echo(3))
         })
         .join()

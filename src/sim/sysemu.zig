@@ -41,7 +41,9 @@
 //! `O_TMPFILE`, `mmap` of a simulated file, `dup2`, `dup3` and `select`
 //! are not emulated: they are stray, as is `dup` of the root descriptor
 //! or of the random device, any
-//! path under `/proc`, `/sys` or `/dev` (but `/dev/urandom`) and any call
+//! path under `/proc`, `/sys` or `/dev` (but `/dev/urandom`, and five
+//! files a runtime reads to learn about the machine, which are answered
+//! as missing: `libcProbe`) and any call
 //! relative to a directory descriptor the simulator did not issue. The
 //! root descriptor (`root_fd`) serves as a directory to be relative to,
 //! and can be stat-ed, synced and closed, not listed.
@@ -465,20 +467,45 @@ fn ioctl(s: *Sim, fd: i32, request: u32) ?u64 {
     };
 }
 
-/// A file a C library reads once in the life of the process, to tune
-/// itself: glibc's allocator asks whether the kernel overcommits memory
-/// the first time a thread's heap shrinks. It is not the program's
-/// business, and it is not there: the answer is given at once, with no
-/// event and no decision, so that the run in which the library happens to
-/// ask is the same run as every other of its seed. glibc takes the
-/// missing file as the default setting.
+/// A file a language's runtime reads to learn about the machine, which
+/// is answered as missing: at once, with no event and no decision, so
+/// that the run in which the runtime happens to ask (often once in the
+/// life of the process) is the same run as every other of its seed. Each
+/// runtime takes the missing file as a default, and where the question is
+/// the number of processors it goes on to `sched_getaffinity`, which says
+/// one.
+///
+/// - glibc's allocator asks whether the kernel overcommits memory, the
+///   first time a thread's heap shrinks.
+/// - glibc (2.41 was run; 2.36 and later by its source) counts
+///   processors from `online` and `possible`, then from `/proc/stat`
+///   (`sysconf`, `get_nprocs`, and through them C++'s
+///   `hardware_concurrency`). musl asks `sched_getaffinity` only.
+/// - Rust's `available_parallelism` reads the process's cgroup for a
+///   limit on processor time. tokio sizes its runtime with it.
+///
+/// Only an `open` for reading of exactly these paths (one that writes or
+/// creates is a stray, as before). A program that reads one of them
+/// for its own purposes finds it missing too, and is not told that it
+/// asked about the real machine; any other path under `/proc` or `/sys`
+/// is still a stray.
 fn libcProbe(path: []const u8) bool {
-    return std.mem.eql(u8, path, "/proc/sys/vm/overcommit_memory");
+    const probes = [_][]const u8{
+        "/proc/sys/vm/overcommit_memory",
+        "/sys/devices/system/cpu/online",
+        "/sys/devices/system/cpu/possible",
+        "/proc/stat",
+        "/proc/self/cgroup",
+    };
+    for (probes) |probe| {
+        if (std.mem.eql(u8, path, probe)) return true;
+    }
+    return false;
 }
 
 fn open(s: *Sim, dirfd: i32, path_ptr: u64, flags: u32) ?u64 {
     const path = cstr(path_ptr) orelse return fail(.FAULT);
-    if (libcProbe(path)) return fail(.NOENT);
+    if (flags & (o_accmode | o_creat) == 0 and libcProbe(path)) return fail(.NOENT);
     const dir = switch (dirOf(s, dirfd, path)) {
         .dir => |d| d,
         .closed => return fail(.BADF),

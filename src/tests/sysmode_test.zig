@@ -568,14 +568,27 @@ fn otherIoctlOnFile(env: *Env) !void {
     _ = sys(.ioctl, fd, 0x541B, @intFromPtr(&n), 0); // FIONREAD
 }
 
-/// glibc's allocator opens this file once in the life of the process:
-/// it is answered as missing, and is no stray (revision 110).
+/// Files a runtime opens to learn about the machine (glibc's allocator
+/// and its processor count, Rust's `available_parallelism`): they are
+/// answered as missing, and are no strays (revisions 110 and 112).
 fn opensLibcProbe(env: *Env) !void {
     _ = env;
-    try testing.expectEqual(errOf(.NOENT), openAt(cwd, "/proc/sys/vm/overcommit_memory", o_rdonly));
+    const paths = [_][*:0]const u8{
+        "/proc/sys/vm/overcommit_memory",
+        "/sys/devices/system/cpu/online",
+        "/sys/devices/system/cpu/possible",
+        "/proc/stat",
+        "/proc/self/cgroup",
+    };
+    for (paths) |path| try testing.expectEqual(errOf(.NOENT), openAt(cwd, path, o_rdonly));
+    // One processor, for the code that goes on to ask the kernel.
+    var mask: [16]u8 = @splat(0xff);
+    try testing.expectEqual(@as(usize, 8), linux.syscall3(.sched_getaffinity, 0, mask.len, @intFromPtr(&mask)));
+    try testing.expectEqual(@as(u8, 1), mask[0]);
+    for (mask[1..8]) |byte| try testing.expectEqual(@as(u8, 0), byte);
 }
 
-test "system-call mode: the file glibc's allocator probes is missing, and not a stray" {
+test "system-call mode: the files a runtime reads about the machine are missing, and not strays" {
     if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
     try tardis.check(gpa, opensLibcProbe, .{ .iterations = 5, .mode = .syscalls });
 }

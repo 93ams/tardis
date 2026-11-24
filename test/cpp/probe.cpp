@@ -142,4 +142,15 @@ uint32_t cpp_random() {
     return device();
 }
 
+// How many processors the program is told of, asked three ways: the C++
+// library's, those online and those configured. Each in two decimal
+// digits of the result.
+int cpp_processors() {
+    const long hardware = std::thread::hardware_concurrency();
+    const long online = sysconf(_SC_NPROCESSORS_ONLN);
+    const long configured = sysconf(_SC_NPROCESSORS_CONF);
+    if (hardware < 0 || hardware > 99 || online < 0 || online > 99 || configured < 0 || configured > 99) return -1;
+    return static_cast<int>(hardware * 10000 + online * 100 + configured);
+}
+
 }

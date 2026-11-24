@@ -173,9 +173,11 @@ What to do depends on the call:
 - A feature the library can do without: turn it off. SQLite's WAL mode
   maps a file into memory, which is not emulated; the default rollback
   journal needs no `mmap`.
-- A call that asks about the real machine (a path under `/proc`, the
-  number of processors): it is usually made once, on first use, and often
-  has a compile-time or run-time switch.
+- A call that asks about the real machine (a path under `/proc`): it is
+  usually made once, on first use, and often has a compile-time or
+  run-time switch. The number of processors is answered, and is one:
+  `sysconf`, C++'s `hardware_concurrency`, Rust's
+  `available_parallelism`.
 - Anything else is a gap in the emulation. The list of what is answered is
   at the top of `src/sim/sysemu.zig` and `src/sim/sysnet.zig`.
 
@@ -245,8 +247,9 @@ One Rust crate, written for the test (`test/rust`, Rust 1.99, tokio 1.54):
 threads, a mutex, a channel, a timed wait, files across a power loss, a
 blocking TCP echo, a connection and a file shared through `try_clone`,
 and a TCP echo on tokio's single-threaded runtime and
-on its work-stealing one with two and four workers. On musl and on
-glibc.
+on its work-stealing one with two and four workers, and with the
+number it picks itself (one: the simulated machine has one processor).
+On musl and on glibc.
 
 One C++ program, written for the test (`test/cpp/probe.cpp`, libc++):
 threads, a mutex, a condition variable, the steady and the system clock,
