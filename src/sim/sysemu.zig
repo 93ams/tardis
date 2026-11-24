@@ -439,6 +439,7 @@ pub fn emulate(number: u64, a: *const [6]u64) ?u64 {
         21, 90 => access(s, at_fdcwd, a[0]), // access; chmod, which changes nothing
         269, 439 => access(s, fd, a[1]),
         79 => getcwd(a[0], a[1]),
+        63 => uname(a[0]),
         102, 104, 107, 108 => owner_id, // getuid, getgid, geteuid, getegid
         228 => clockGettime(s, @truncate(a[0]), a[1]),
         229 => if (clockOf(@truncate(a[0])) == null) fail(.INVAL) else clockGetres(a[1]),
@@ -909,6 +910,19 @@ fn getcwd(buf_ptr: u64, len: u64) u64 {
     buf[0] = '/';
     buf[1] = 0;
     return 2;
+}
+
+/// `uname`: the same machine everywhere, so that what a program prints
+/// or decides from it does not depend on where the test runs. Six fields
+/// of 65 bytes: system, node, release, version, machine, domain. glibc
+/// asks for the domain when it looks a host name up.
+fn uname(buf_ptr: u64) u64 {
+    if (buf_ptr == 0) return fail(.FAULT);
+    const buf: *[6 * 65]u8 = @ptrFromInt(buf_ptr);
+    @memset(buf, 0);
+    const texts = [6][]const u8{ "Linux", "tardis", "6.1.0", "#1 SMP", "x86_64", "(none)" };
+    for (texts, 0..) |field, i| @memcpy(buf[i * 65 ..][0..field.len], field);
+    return 0;
 }
 
 // --- stat ----------------------------------------------------------------------

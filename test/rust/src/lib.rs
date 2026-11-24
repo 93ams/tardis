@@ -336,7 +336,7 @@ mod with_tokio {
     /// each runtime from a counter the process keeps, so the second run
     /// of a seed would not be the first. `rng_seed` needs
     /// `--cfg tokio_unstable` (`.cargo/config.toml`).
-    fn seed() -> tokio::runtime::RngSeed {
+    pub(crate) fn seed() -> tokio::runtime::RngSeed {
         use std::hash::BuildHasher;
         let n = std::collections::hash_map::RandomState::new().hash_one(0u8);
         tokio::runtime::RngSeed::from_bytes(&n.to_le_bytes())
@@ -382,6 +382,140 @@ mod with_tokio {
         std::thread::spawn(move || {
             let Ok(rt) = tokio::runtime::Builder::new_multi_thread().worker_threads(workers).enable_all().rng_seed(seed()).build() else { return 100 };
             rt.block_on(echo(3))
+        })
+        .join()
+        .unwrap_or(101)
+    }
+}
+
+/// A host name looked up through the C library (`getaddrinfo`), as
+/// `connect("localhost:80")` does: how many addresses, or a negative
+/// number when the lookup fails or gives one that is not the loopback.
+#[no_mangle]
+pub extern "C" fn rust_resolve() -> i32 {
+    use std::net::ToSocketAddrs;
+    let Ok(addrs) = "localhost:7200".to_socket_addrs() else { return -1 };
+    let mut count = 0;
+    for addr in addrs {
+        if !addr.ip().is_loopback() || addr.port() != 7200 {
+            return -2;
+        }
+        count += 1;
+    }
+    count
+}
+
+/// An HTTP/1.1 server and its clients on hyper, over tokio's sockets: what
+/// a web service in Rust is made of.
+#[cfg(feature = "http")]
+mod with_http {
+    use http_body_util::{BodyExt, Full};
+    use hyper::body::{Bytes, Incoming};
+    use hyper::{Request, Response};
+    use hyper_util::rt::TokioIo;
+    use std::convert::Infallible;
+
+    /// Answers with the request's path and body. `/slow` takes a minute.
+    async fn answer(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+        if req.uri().path() == "/slow" {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
+        let mut text = req.uri().path().as_bytes().to_vec();
+        let body = req.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default();
+        text.push(b':');
+        text.extend_from_slice(&body);
+        Ok(Response::new(Full::new(Bytes::from(text))))
+    }
+
+    async fn serve(listener: tokio::net::TcpListener, connections: usize) {
+        let mut tasks = Vec::new();
+        for _ in 0..connections {
+            let Ok((stream, _)) = listener.accept().await else { return };
+            tasks.push(tokio::spawn(async move {
+                let service = hyper::service::service_fn(answer);
+                let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(stream), service).await;
+            }));
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
+
+    /// One connection kept alive for `requests` requests.
+    async fn client(id: u8, requests: u8) -> i32 {
+        let Ok(stream) = tokio::net::TcpStream::connect("127.0.0.1:7200").await else { return 10 };
+        let Ok((mut sender, connection)) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await else { return 11 };
+        let driver = tokio::spawn(connection);
+        for n in 0..requests {
+            let path = format!("/echo/{id}/{n}");
+            // The last request of each client carries 200 KiB: more than
+            // a socket takes at once, in either direction.
+            let mut body = format!("client {id} request {n}");
+            if n + 1 == requests {
+                body.push_str(&"x".repeat(200 * 1024));
+            }
+            let Ok(req) = Request::post(path.as_str()).header("host", "sim").body(Full::new(Bytes::from(body.clone()))) else { return 12 };
+            let Ok(resp) = sender.send_request(req).await else { return 13 };
+            if resp.status() != hyper::StatusCode::OK {
+                return 14;
+            }
+            let Ok(got) = resp.into_body().collect().await else { return 15 };
+            if got.to_bytes().as_ref() != format!("{path}:{body}").as_bytes() {
+                return 16;
+            }
+        }
+        // A request the server is slow to answer, given up on after five
+        // seconds. Hours on a real clock would be a hang; here it is
+        // virtual time.
+        let Ok(req) = Request::get("/slow").header("host", "sim").body(Full::new(Bytes::new())) else { return 17 };
+        let started = tokio::time::Instant::now();
+        if tokio::time::timeout(std::time::Duration::from_secs(5), sender.send_request(req)).await.is_ok() {
+            return 18;
+        }
+        let waited = started.elapsed();
+        if waited < std::time::Duration::from_secs(5) || waited > std::time::Duration::from_secs(6) {
+            return 19;
+        }
+        drop(sender);
+        driver.abort();
+        let _ = driver.await;
+        0
+    }
+
+    async fn exchange() -> i32 {
+        let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:7200").await else { return 1 };
+        let server = tokio::spawn(serve(listener, 3));
+        let mut clients = Vec::new();
+        for id in 0..3u8 {
+            clients.push(tokio::spawn(client(id, 4)));
+        }
+        for c in clients {
+            match c.await {
+                Ok(0) => {}
+                Ok(code) => return code,
+                Err(_) => return 2,
+            }
+        }
+        if server.await.is_err() {
+            return 3;
+        }
+        0
+    }
+
+    /// Three clients, four requests each, against one server: on tokio's
+    /// single-threaded runtime (`workers` 0) or its work-stealing one.
+    #[no_mangle]
+    pub extern "C" fn rust_http(workers: usize) -> i32 {
+        std::thread::spawn(move || {
+            let mut builder = if workers == 0 {
+                tokio::runtime::Builder::new_current_thread()
+            } else {
+                let mut b = tokio::runtime::Builder::new_multi_thread();
+                b.worker_threads(workers);
+                b
+            };
+            let Ok(rt) = builder.enable_all().rng_seed(crate::with_tokio::seed()).build() else { return 100 };
+            rt.block_on(exchange())
         })
         .join()
         .unwrap_or(101)

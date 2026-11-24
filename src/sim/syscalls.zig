@@ -46,6 +46,9 @@ threadlocal var selector: u8 = allow;
 threadlocal var armed = false;
 threadlocal var stray_count: u32 = 0;
 threadlocal var stray_first: u64 = 0;
+/// The first stray call's first three arguments, when they are known:
+/// what tells one `socket` or `ioctl` from another in a report.
+threadlocal var stray_args: ?[3]u64 = null;
 /// The path the first stray call named, if it names one: what a report
 /// needs to say which file a library went looking for.
 threadlocal var stray_path: [96]u8 = undefined;
@@ -203,6 +206,7 @@ fn onSigsys(_: i32, _: ?*anyopaque, context: ?*anyopaque) callconv(.c) void {
         }
         if (stray_count == 0) {
             stray_first = number;
+            stray_args = .{ a, gregs[@backingInt(Reg.rsi)], gregs[@backingInt(Reg.rdx)] };
             notePath(number, a, gregs[@backingInt(Reg.rsi)]);
         }
         stray_count +|= 1;
@@ -454,6 +458,7 @@ pub fn begin(emulate: ?Emulator) bool {
     if (!arm()) return false;
     stray_count = 0;
     stray_first = 0;
+    stray_args = null;
     stray_path_len = 0;
     stray_refused = 0;
     emulator = emulate;
@@ -465,8 +470,9 @@ pub fn begin(emulate: ?Emulator) bool {
 /// `count` stray calls, the first of them `number`; `refused` of them
 /// would have started a thread or a process and were not made.
 /// `path`: what the first one named, if it names a file (cut at 96
-/// bytes; valid until the thread's next run).
-pub const Stray = struct { number: u64, count: u32, refused: u32, path: []const u8 = "" };
+/// bytes; valid until the thread's next run). `args`: the first one's
+/// first three arguments, when it came by the trap.
+pub const Stray = struct { number: u64, count: u32, refused: u32, path: []const u8 = "", args: ?[3]u64 = null };
 
 /// The run ended: the first system call that left the simulation, if any.
 pub fn end() ?Stray {
@@ -475,7 +481,7 @@ pub fn end() ?Stray {
     active = false;
     emulator = null;
     if (stray_count == 0) return null;
-    return .{ .number = stray_first, .count = stray_count, .refused = stray_refused, .path = stray_path[0..stray_path_len] };
+    return .{ .number = stray_first, .count = stray_count, .refused = stray_refused, .path = stray_path[0..stray_path_len], .args = stray_args };
 }
 
 /// A vDSO function the code under test called (`vdso.zig`): answered as
@@ -563,6 +569,7 @@ pub fn name(number: u64) []const u8 {
         425 => "io_uring_setup",
         441 => "epoll_pwait2",
         32 => "dup",
+        63 => "uname",
         72 => "fcntl",
         73 => "flock",
         79 => "getcwd",

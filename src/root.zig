@@ -287,6 +287,22 @@ pub const Options = struct {
     /// its threads are simulated tasks, one running at a time, whatever
     /// the count.
     processors: u8 = 1,
+    /// Run the body once before any run that counts, and throw that run
+    /// away: its result, its trace and whatever it prints. For code with
+    /// state it sets up once in the life of the process and cannot reset
+    /// (a C library's tables for looking host names up, a lazily built
+    /// cache): without it the first run of a seed does that work and no
+    /// later one does, so the first run differs from its own replay and
+    /// `check` fails with `error.NonDeterministic`. The run is made inside
+    /// the simulation, with seed 0, before the first run of each simulator:
+    /// by `check`, a replay, `traceHash`, `traceJson` and `exhaustive`
+    /// alike, so a failure found after it replays after it; once on each
+    /// worker's thread, and once in each forked iteration. It counts for
+    /// nothing (`sometimes`, a security layer's tallies), except that with
+    /// `warm_restore` it is the run that captures.
+    /// What the once-only work read in that run stays for the process: a
+    /// fault injected into it may be remembered.
+    prime: bool = false,
     /// Answer `rdtsc` and `rdtscp` with the run's virtual time in
     /// nanoseconds (plus the number of reads so far), so code that times
     /// itself with the processor's counter follows the seed. Linux on
@@ -549,6 +565,7 @@ fn simConfig(o: Options) Sim.Config {
         .trap_syscalls = o.mode == .syscalls or (o.trap_syscalls orelse trapSyscallsFromEnv()),
         .emulate_syscalls = o.mode == .syscalls,
         .processors = o.processors,
+        .prime = o.prime,
         .virtual_tsc = o.virtual_tsc,
         .faults = o.faults,
         .limits = o.limits,
@@ -1150,7 +1167,25 @@ fn BodyThunk(comptime body: fn (*Env) anyerror!void) type {
     };
 }
 
+/// `Options.prime`: one run that does the body's once-only work and is
+/// thrown away, before this simulator's first run. Marked as a rerun, as
+/// the shrinker's runs are, so that a security layer does not tally it.
+fn primeRun(s: *Sim, comptime body: fn (*Env) anyerror!void, persona: Persona) void {
+    s.config.prime = false; // once for this simulator
+    const print = s.config.report;
+    s.config.report = false;
+    defer s.config.report = print;
+    const was_rerun = s.rerun;
+    s.rerun = true;
+    defer s.rerun = was_rerun;
+    const out = runOnce(s, body, 0, persona, 0, false);
+    out.result catch {};
+    // What it reached with `sometimes` is not the campaign's.
+    s.catalog.resetCounts();
+}
+
 fn runOnce(s: *Sim, comptime body: fn (*Env) anyerror!void, seed: u64, persona: Persona, iteration: u32, leak_check: bool) RunOutcome {
+    if (s.config.prime) primeRun(s, body, persona);
     if (s.config.emulate_syscalls) startOneThread();
     s.beginRun(s.setup_seed orelse seed, persona);
     s.iteration = iteration;
@@ -1192,6 +1227,7 @@ fn runOnce(s: *Sim, comptime body: fn (*Env) anyerror!void, seed: u64, persona: 
     if (stray) |call| {
         if (s.config.report) std.debug.print("tardis: the code under test tried {d} real system call(s), the first one {s} (number {d}): it left the simulation, so the run does not depend on its seed alone\n", .{ call.count, syscalls.name(call.number), call.number });
         if (s.config.report and call.path.len > 0) std.debug.print("tardis: that call named \"{s}\"\n", .{call.path});
+        if (s.config.report) if (call.args) |args| std.debug.print("tardis: its first three arguments were 0x{x}, 0x{x}, 0x{x}\n", .{ args[0], args[1], args[2] });
         if (s.config.report and call.refused != 0) std.debug.print("tardis: {d} of them would have started a thread or a process, which the simulation cannot hold: refused, not made (docs/threads.md)\n", .{call.refused});
         // A run that left the simulation proves nothing, whether it passed
         // or failed: its outcome does not follow from its seed.

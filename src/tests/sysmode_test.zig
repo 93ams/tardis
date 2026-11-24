@@ -517,7 +517,7 @@ test "system-call mode: getrandom follows the seed" {
 
 fn opensSocket(env: *Env) !void {
     _ = env;
-    const rc = sys(.socket, 1, 1, 0, 0); // AF_UNIX, SOCK_STREAM: not emulated
+    const rc = sys(.socket, 17, 3, 0, 0); // AF_PACKET, SOCK_RAW: not emulated
     if (rc >= 0) _ = linux.close(@intCast(rc));
 }
 
@@ -609,6 +609,25 @@ fn oneProcessor(env: *Env) !void {
     try testing.expectEqual(@as(u64, 1), try affinityMask());
 }
 
+fn machineIdentity(env: *Env) !void {
+    _ = env;
+    var name: [6][65]u8 = undefined;
+    try testing.expectEqual(@as(isize, 0), sys(.uname, @intFromPtr(&name), 0, 0, 0));
+    try testing.expectEqualStrings("Linux", std.mem.sliceTo(&name[0], 0));
+    try testing.expectEqualStrings("tardis", std.mem.sliceTo(&name[1], 0));
+    try testing.expectEqualStrings("x86_64", std.mem.sliceTo(&name[4], 0));
+    try testing.expectEqual(errOf(.FAULT), sys(.uname, 0, 0, 0, 0));
+    // No Unix-domain sockets, no netlink, no IPv6: said so, and no stray.
+    for ([_]usize{ 1, 16, 10 }) |family| {
+        try testing.expectEqual(errOf(.AFNOSUPPORT), sys(.socket, family, 1, 0, 0));
+    }
+}
+
+test "system-call mode: uname is the same machine everywhere, and it has IPv4 sockets only" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, machineIdentity, .{ .iterations = 3, .mode = .syscalls });
+}
+
 test "system-call mode: the program is told of as many processors as the test asks for" {
     if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
     try tardis.check(gpa, sixProcessors, .{ .iterations = 3, .mode = .syscalls, .processors = 6 });
@@ -680,7 +699,7 @@ fn renamesOnHost(env: *Env) !void {
 
 fn failsAndStrays(env: *Env) !void {
     _ = env;
-    _ = sys(.socket, 1, 1, 0, 0); // AF_UNIX: not emulated
+    _ = sys(.socket, 17, 3, 0, 0); // AF_PACKET: not emulated
     return error.TestUnexpectedResult;
 }
 

@@ -117,8 +117,11 @@ tardis: the two runs agree for 2 events (virtual time, task, event):
 That one is glibc, which draws eight random bytes when a process starts
 its first thread. It has no reset to call, and the tool now takes care
 of it: a run in system-call mode starts one real thread first. Where a
-library of yours has once-only work and no reset, do that work before
-the first run: call the code once outside `check`.
+library of yours has once-only work and no reset, set `.prime = true`
+in the options: the body is run once first, inside the simulation, and
+that run is thrown away. (Calling the code once outside `check` does the
+work against the real machine, which is right only for code that makes
+no system call.)
 
 ## 5. Several tasks, and threads
 
@@ -165,7 +168,8 @@ Either way:
 ## 6. When the run fails with `StraySyscall`
 
 The library made a call the mode does not answer. The report names the
-call, and the file when the call names one. The call was refused with `ENOSYS` and never reached the machine,
+call, gives its first three arguments, and the file when the call names
+one. The call was refused with `ENOSYS` and never reached the machine,
 but the run proves nothing, so it fails whatever the body returned.
 
 What to do depends on the call:
@@ -249,8 +253,14 @@ blocking TCP echo, a connection and a file shared through `try_clone`,
 and a TCP echo on tokio's single-threaded runtime and
 on its work-stealing one with two and four workers, and with the
 number it picks itself (one, or six when the test's `processors`
-option says six).
+option says six); an HTTP/1.1 server and three clients on hyper; and
+`localhost` looked up through the C library.
 On musl and on glibc.
+
+A program that looks host names up finds the ones the test writes to
+`/etc/hosts` in the simulated filesystem, which starts empty; there is
+no name server. On glibc the lookup also needs `.prime = true`, since
+glibc builds its lookup tables once (`test/rust.zig`, `resolves`).
 
 One C++ program, written for the test (`test/cpp/probe.cpp`, libc++):
 threads, a mutex, a condition variable, the steady and the system clock,

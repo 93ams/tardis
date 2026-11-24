@@ -4,7 +4,8 @@
 //! `x86_64-unknown-linux-musl`: the standard library's threads, locks,
 //! channels, clock, files and sockets, and tokio's two runtimes (the
 //! work-stealing one with a worker count given and with the one it
-//! picks). It knows
+//! picks), an HTTP server and clients on hyper, a host name looked up.
+//! It knows
 //! nothing of TARDIS. System-call mode answers its system calls from the
 //! simulation, and its threads are simulated tasks.
 //!
@@ -184,4 +185,48 @@ test "rust: tokio's work-stealing runtime, two workers and four" {
     if (skip()) return error.SkipZigTest;
     try tardis.check(testing.allocator, tokioTwoWorkers, options);
     try tardis.check(testing.allocator, tokioFourWorkers, options);
+}
+
+extern fn rust_http(workers: usize) c_int;
+
+fn httpCurrent(env: *Env) !void {
+    _ = env;
+    try testing.expectEqual(@as(c_int, 0), rust_http(0));
+}
+
+fn httpTwoWorkers(env: *Env) !void {
+    _ = env;
+    try testing.expectEqual(@as(c_int, 0), rust_http(2));
+}
+
+test "rust: an HTTP server and three clients on hyper, on both of tokio's runtimes" {
+    if (skip()) return error.SkipZigTest;
+    try tardis.check(testing.allocator, httpCurrent, options);
+    try tardis.check(testing.allocator, httpTwoWorkers, options);
+}
+
+extern fn rust_resolve() c_int;
+
+/// The simulated filesystem starts empty: the program's host names are
+/// the ones the test writes to `/etc/hosts`. Without the file a C library
+/// asks a name server that is not there, and gives up after five seconds
+/// of virtual time.
+fn resolves(env: *Env) !void {
+    _ = env;
+    _ = std.c.mkdir("/etc", 0o755);
+    const fd = std.c.open("/etc/hosts", .{ .ACCMODE = .WRONLY, .CREAT = true }, @as(std.c.mode_t, 0o644));
+    const text = "127.0.0.1 localhost\n";
+    var done: usize = 0;
+    while (done < text.len) done += @intCast(std.c.write(fd, text[done..].ptr, text.len - done));
+    _ = std.c.close(fd);
+    try testing.expect(rust_resolve() > 0);
+}
+
+test "rust: localhost is looked up through the C library" {
+    if (skip()) return error.SkipZigTest;
+    // glibc builds its tables for looking names up once in the life of
+    // the process: a run to do that, thrown away.
+    var primed = options;
+    primed.prime = true;
+    try tardis.check(testing.allocator, resolves, primed);
 }

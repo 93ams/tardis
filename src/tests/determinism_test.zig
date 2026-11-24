@@ -59,3 +59,40 @@ test "golden trace hash (cross-build, cross-host)" {
         return error.GoldenHashMismatch;
     }
 }
+
+/// Set up once in the life of the process, as a C library's tables are.
+var set_up_once = false;
+
+fn onceOnly(env: *tardis.Env) !void {
+    if (!set_up_once) {
+        set_up_once = true;
+        var f = try env.dir.createFile(env.io, "set-up-once", .{});
+        f.close(env.io);
+    }
+    var buf: [4]u8 = undefined;
+    env.io.random(&buf);
+}
+
+fn sometimesAtSeedZero(env: *tardis.Env) !void {
+    env.sometimes("only the seed the prime run uses", env.seed == 0);
+}
+
+test "Options.prime: work done once in the life of the process does not make the first run differ" {
+    const gpa = testing.allocator;
+    // Without it, the first run of the process is not the second.
+    set_up_once = false;
+    const first = try tardis.traceHash(gpa, onceOnly, 7, .linux_ext4, .{});
+    const second = try tardis.traceHash(gpa, onceOnly, 7, .linux_ext4, .{});
+    try testing.expect(first != second);
+    // With it, it is: the once-only work is done in a run thrown away.
+    set_up_once = false;
+    const primed = try tardis.traceHash(gpa, onceOnly, 7, .linux_ext4, .{ .prime = true });
+    try testing.expectEqual(second, primed);
+    try testing.expectEqual(primed, try tardis.traceHash(gpa, onceOnly, 7, .linux_ext4, .{ .prime = true }));
+    // And `check` passes, which re-runs its first seed and compares.
+    set_up_once = false;
+    try tardis.check(gpa, onceOnly, .{ .iterations = 3, .prime = true });
+    // The run thrown away counts for nothing: what only it reached with
+    // `sometimes` is still never reached.
+    try testing.expectError(error.SometimesNeverTrue, tardis.check(gpa, sometimesAtSeedZero, .{ .iterations = 3, .prime = true, .report = false }));
+}

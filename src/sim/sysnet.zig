@@ -47,7 +47,8 @@
 //! `epoll` is in `sysfd.zig`. Not emulated (stray): `select` and
 //! `pselect6`; `sendmsg`, `recvmsg`, `MSG_PEEK`,
 //! `MSG_OOB`, `MSG_WAITALL`; a datagram `writev` of more than one vector;
-//! Unix-domain and other families. A stream `bind` reserves its port, as
+//! families other than IPv4, IPv6, Unix-domain and netlink (those three
+//! are refused with `EAFNOSUPPORT`: the machine has none). A stream `bind` reserves its port, as
 //! the kernel's does, and `listen` or `connect` after it use that port.
 
 const std = @import("std");
@@ -242,8 +243,10 @@ fn errnoOf(err: anyerror) E {
 
 // --- addresses -------------------------------------------------------------------
 
+const af_unix = 1;
 const af_inet = 2;
 const af_inet6 = 10;
+const af_netlink = 16;
 const sockaddr_in_len = 16;
 
 /// A `sockaddr_in`, read from the caller.
@@ -347,7 +350,11 @@ pub fn emulate(s: *Sim, number: u64, a: *const [6]u64) ?u64 {
 }
 
 fn socket(s: *Sim, domain: u32, type_and_flags: u32, protocol: u32) ?u64 {
-    if (domain == af_inet6) return fail(.AFNOSUPPORT);
+    // The simulated machine has IPv4 and nothing else. A C library asks
+    // for the other three in passing, when it looks a host name up (IPv6,
+    // a name-service cache on a Unix-domain socket, the interfaces over
+    // netlink), and goes on without them when told they are not there.
+    if (domain == af_inet6 or domain == af_unix or domain == af_netlink) return fail(.AFNOSUPPORT);
     if (domain != af_inet) return null;
     const mode: Mode = switch (type_and_flags & ~@as(u32, sock_nonblock | sock_cloexec)) {
         sock_stream => if (protocol == 0 or protocol == 6) .stream else return fail(.PROTONOSUPPORT),

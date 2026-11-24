@@ -139,6 +139,9 @@ pub const Config = struct {
     /// The processor count `sched_getaffinity` gives in system-call mode,
     /// 1 to 64 (a value outside is taken as the nearer end).
     processors: u8 = 1,
+    /// `Options.prime`: a run to throw away is still owed, before this
+    /// simulator's first.
+    prime: bool = false,
     /// Answer `rdtsc` with virtual time (`tsc.zig`).
     virtual_tsc: bool = false,
     /// An optional security layer (plan2.md §2.2), one instance per `Sim`.
