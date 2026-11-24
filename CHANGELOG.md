@@ -5,6 +5,20 @@ numbers (§) are `plan2.md`'s unless an entry names `plan.md`. Revision 1
 was the first draft of `plan2.md`; the core's earlier history is in
 `plan.md` §9 and §14.
 
+## Revision 114 (core: a test says how many processors the program is told of)
+
+Revision 112 made the processor count one on every machine, and gave as its first limit that a program could not be run as if on eight. A runtime that sizes itself by the count (a thread pool, tokio's workers) was therefore always tested at its smallest, with one worker, where work is never stolen and two workers never meet.
+
+`Options.processors` (1 to 64, one unless the test says otherwise; a value outside is taken as the nearer end) is the count system-call mode gives: `sched_getaffinity` answers with the first so many processors. Told of six, C++'s `hardware_concurrency` and both of `sysconf`'s counts are six, Rust's `available_parallelism` is six, and tokio's work-stealing runtime, built with no worker count, starts six workers and passes its echo test (`test/cpp.zig`, `test/rust.zig`; the mask itself in the default suite, for 6, 64, 200 and 0). On musl and on glibc 2.41.
+
+It changes what the program is told and nothing else. Its threads are simulated tasks, one running at a time, whatever the count; the count decides how many of them the program starts.
+
+**Review.** A fresh reviewer found no fault in the change and that the option reaches every place a simulation is made from the options. Two comments still said the answer is one; corrected. Written down and not changed, all older than this revision and easier to meet now that a program can be told of several processors: `sched_setaffinity` is a stray, so a runtime that pins a thread to each processor fails the run; a thread's processor number is always 0 (the vDSO's `getcpu`, `rseq`), except on the test's own thread under glibc, where `sched_getcpu` gives the real machine's; `getcpu` as a direct system call is a stray.
+
+Tested on Linux: on top of revision 113, the library suite, 300 passed and 2 skipped, and all 41 Linux test binaries pass; C++ 9 of 9 and Rust 11 of 11 on musl and on glibc 2.41, glibc also in ReleaseSafe. Windows: on top of revision 113, Debug (432 of 488 passed, 56 skipped, none failed); before that merge, the full verification script in all five configurations.
+
+**Limits.** Those the review names. 64 processors at most. One glibc, one Rust, one tokio; no other language's runtime.
+
 ## Revision 113 (core: writing to a connection the peer closed)
 
 `plan3.md` A4. Two more scenarios in the differential test of the network model (`src/tests/diff_net_test.zig`), run on the simulated network and on the machine's loopback interface. **A write after the peer has gone:** the server accepts and closes, the client reads to the end, then writes four times with a pause before each, then reads again. **A datagram to a closed port**, then one to a live server, echoed back to the same client socket.
@@ -70,7 +84,6 @@ Tested on Linux: the library suite, 283 passed and 2 skipped, and all 41 Linux t
 **Review.** A fresh reviewer confirmed every row runs with its test's options, found the use-after-free row's "fixed" program to be another test's program (now "no fixed version"), the columns to be nested samples rather than independent ones (now said), and an unbounded copy of the label, now bounded.
 
 Not in the table: the timing and information-flow assertions, glitched decisions, the Spectre-v1 shape, the C shims, shadow memory and the race detector.
-||||||| base
 
 ## Revision 108 (tests: the network model against the loopback, datagrams and larger streams)
 

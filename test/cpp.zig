@@ -171,6 +171,18 @@ test "c++: the processor count is one, on every machine" {
     try tardis.check(testing.allocator, processors, options);
 }
 
+fn sixProcessors(env: *Env) !void {
+    _ = env;
+    try testing.expectEqual(@as(c_int, 60606), cpp_processors());
+}
+
+test "c++: the processor count is the one the test asks for" {
+    if (skip()) return error.SkipZigTest;
+    var six = options;
+    six.processors = 6;
+    try tardis.check(testing.allocator, sixProcessors, six);
+}
+
 test "c++: std::random_device follows the seed" {
     if (skip()) return error.SkipZigTest;
     try tardis.check(testing.allocator, random, .{ .iterations = 1, .seed = 1, .mode = .syscalls });

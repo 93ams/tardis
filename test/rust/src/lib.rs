@@ -360,14 +360,14 @@ mod with_tokio {
 
     /// tokio's work-stealing runtime as most programs build it: as many
     /// workers as the machine has processors, which tokio asks for.
-    /// One, under simulation.
+    /// `expected`: how many the test told the simulation to say.
     #[no_mangle]
-    pub extern "C" fn rust_tokio_default() -> i32 {
+    pub extern "C" fn rust_tokio_default(expected: usize) -> i32 {
         std::thread::spawn(move || {
             let Ok(rt) = tokio::runtime::Builder::new_multi_thread().enable_all().rng_seed(seed()).build() else { return 100 };
-            // The simulated machine has one processor. (tokio reads
-            // `TOKIO_WORKER_THREADS` from the environment first.)
-            if rt.metrics().num_workers() != 1 {
+            // (tokio reads `TOKIO_WORKER_THREADS` from the environment
+            // before it asks the machine.)
+            if rt.metrics().num_workers() != expected {
                 return 102;
             }
             rt.block_on(echo(3))

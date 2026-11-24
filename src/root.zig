@@ -277,6 +277,16 @@ pub const Options = struct {
     /// implies `trap_syscalls`, runs iterations in this process whatever
     /// `fork` says, and does not apply to `sim`'s loop form.
     mode: SimMode = .std_io,
+    /// How many processors system-call mode tells the code under test it
+    /// has (`sched_getaffinity`, and through it `sysconf`, C++'s
+    /// `hardware_concurrency`, Rust's `available_parallelism`), 1 to 64
+    /// (a value outside is taken as the nearer end).
+    /// The same answer on every machine, so a runtime that sizes itself by
+    /// the count (a thread pool, tokio's workers) is the same size
+    /// everywhere. It changes what the program is told and nothing else:
+    /// its threads are simulated tasks, one running at a time, whatever
+    /// the count.
+    processors: u8 = 1,
     /// Answer `rdtsc` and `rdtscp` with the run's virtual time in
     /// nanoseconds (plus the number of reads so far), so code that times
     /// itself with the processor's counter follows the seed. Linux on
@@ -538,6 +548,7 @@ fn simConfig(o: Options) Sim.Config {
         .swarm = o.swarm,
         .trap_syscalls = o.mode == .syscalls or (o.trap_syscalls orelse trapSyscallsFromEnv()),
         .emulate_syscalls = o.mode == .syscalls,
+        .processors = o.processors,
         .virtual_tsc = o.virtual_tsc,
         .faults = o.faults,
         .limits = o.limits,

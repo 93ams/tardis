@@ -175,9 +175,9 @@ What to do depends on the call:
   journal needs no `mmap`.
 - A call that asks about the real machine (a path under `/proc`): it is
   usually made once, on first use, and often has a compile-time or
-  run-time switch. The number of processors is answered, and is one:
-  `sysconf`, C++'s `hardware_concurrency`, Rust's
-  `available_parallelism`.
+  run-time switch. The number of processors is answered: one, or
+  what the test's `processors` option says (`sysconf`, C++'s
+  `hardware_concurrency`, Rust's `available_parallelism`).
 - Anything else is a gap in the emulation. The list of what is answered is
   at the top of `src/sim/sysemu.zig` and `src/sim/sysnet.zig`.
 
@@ -248,7 +248,8 @@ threads, a mutex, a channel, a timed wait, files across a power loss, a
 blocking TCP echo, a connection and a file shared through `try_clone`,
 and a TCP echo on tokio's single-threaded runtime and
 on its work-stealing one with two and four workers, and with the
-number it picks itself (one: the simulated machine has one processor).
+number it picks itself (one, or six when the test's `processors`
+option says six).
 On musl and on glibc.
 
 One C++ program, written for the test (`test/cpp/probe.cpp`, libc++):

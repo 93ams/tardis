@@ -145,7 +145,7 @@ fn tokioFourWorkers(env: *Env) !void {
 }
 
 extern fn rust_parallelism() usize;
-extern fn rust_tokio_default() c_int;
+extern fn rust_tokio_default(expected: usize) c_int;
 
 fn parallelism(env: *Env) !void {
     _ = env;
@@ -159,12 +159,25 @@ test "rust: available_parallelism is one, on every machine" {
 
 fn tokioDefault(env: *Env) !void {
     _ = env;
-    try testing.expectEqual(@as(c_int, 0), rust_tokio_default());
+    try testing.expectEqual(@as(c_int, 0), rust_tokio_default(1));
 }
 
 test "rust: tokio's work-stealing runtime with the worker count it picks" {
     if (skip()) return error.SkipZigTest;
     try tardis.check(testing.allocator, tokioDefault, options);
+}
+
+fn sixProcessors(env: *Env) !void {
+    _ = env;
+    try testing.expectEqual(@as(usize, 6), rust_parallelism());
+    try testing.expectEqual(@as(c_int, 0), rust_tokio_default(6));
+}
+
+test "rust: told of six processors, tokio starts six workers" {
+    if (skip()) return error.SkipZigTest;
+    var six = options;
+    six.processors = 6;
+    try tardis.check(testing.allocator, sixProcessors, six);
 }
 
 test "rust: tokio's work-stealing runtime, two workers and four" {

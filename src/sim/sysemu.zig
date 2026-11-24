@@ -444,7 +444,7 @@ pub fn emulate(number: u64, a: *const [6]u64) ?u64 {
         229 => if (clockOf(@truncate(a[0])) == null) fail(.INVAL) else clockGetres(a[1]),
         96 => gettimeofday(s, a[0]),
         201 => time(s, a[0]),
-        204 => schedGetaffinity(a[1], a[2]),
+        204 => schedGetaffinity(s, a[1], a[2]),
         202 => futex(s, a),
         35 => sleep(s, 1, 0, a[0], a[1]),
         230 => sleep(s, @truncate(a[0]), @truncate(a[1]), a[2], a[3]),
@@ -473,7 +473,7 @@ fn ioctl(s: *Sim, fd: i32, request: u32) ?u64 {
 /// life of the process) is the same run as every other of its seed. Each
 /// runtime takes the missing file as a default, and where the question is
 /// the number of processors it goes on to `sched_getaffinity`, which says
-/// one.
+/// one, or what `Options.processors` says.
 ///
 /// - glibc's allocator asks whether the kernel overcommits memory, the
 ///   first time a thread's heap shrinks.
@@ -578,14 +578,16 @@ fn truncateAny(s: *Sim, handle: Io.File.Handle) !void {
     try f.setLength(s.io(), 0);
 }
 
-/// `sched_getaffinity`: one processor, the same on every machine, so code
-/// that sizes itself by the processor count runs the same everywhere.
-fn schedGetaffinity(len: u64, mask_ptr: u64) u64 {
+/// `sched_getaffinity`: the processors the test asked for
+/// (`Options.processors`, one unless it says otherwise), the same on
+/// every machine, so code that sizes itself by the processor count runs
+/// the same everywhere. The first so many, as a mask of 64.
+fn schedGetaffinity(s: *Sim, len: u64, mask_ptr: u64) u64 {
     if (len < 8) return fail(.INVAL);
     if (mask_ptr == 0) return fail(.FAULT);
-    const mask: [*]u8 = @ptrFromInt(mask_ptr);
-    @memset(mask[0..8], 0);
-    mask[0] = 1;
+    const count: u7 = @intCast(std.math.clamp(s.config.processors, 1, 64));
+    const bits: u64 = if (count == 64) ~@as(u64, 0) else (@as(u64, 1) << @intCast(count)) - 1;
+    @as(*align(1) u64, @ptrFromInt(mask_ptr)).* = std.mem.nativeToLittle(u64, bits);
     return 8;
 }
 

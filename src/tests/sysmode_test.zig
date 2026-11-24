@@ -588,6 +588,36 @@ fn opensLibcProbe(env: *Env) !void {
     for (mask[1..8]) |byte| try testing.expectEqual(@as(u8, 0), byte);
 }
 
+fn affinityMask() !u64 {
+    var mask: [16]u8 = @splat(0xff);
+    try testing.expectEqual(@as(usize, 8), linux.syscall3(.sched_getaffinity, 0, mask.len, @intFromPtr(&mask)));
+    return std.mem.readInt(u64, mask[0..8], .little);
+}
+
+fn sixProcessors(env: *Env) !void {
+    _ = env;
+    try testing.expectEqual(@as(u64, 0b111111), try affinityMask());
+}
+
+fn sixtyFourProcessors(env: *Env) !void {
+    _ = env;
+    try testing.expectEqual(~@as(u64, 0), try affinityMask());
+}
+
+fn oneProcessor(env: *Env) !void {
+    _ = env;
+    try testing.expectEqual(@as(u64, 1), try affinityMask());
+}
+
+test "system-call mode: the program is told of as many processors as the test asks for" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, sixProcessors, .{ .iterations = 3, .mode = .syscalls, .processors = 6 });
+    try tardis.check(gpa, sixtyFourProcessors, .{ .iterations = 3, .mode = .syscalls, .processors = 64 });
+    // Outside 1 to 64: the nearer end.
+    try tardis.check(gpa, sixtyFourProcessors, .{ .iterations = 3, .mode = .syscalls, .processors = 200 });
+    try tardis.check(gpa, oneProcessor, .{ .iterations = 3, .mode = .syscalls, .processors = 0 });
+}
+
 test "system-call mode: the files a runtime reads about the machine are missing, and not strays" {
     if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
     try tardis.check(gpa, opensLibcProbe, .{ .iterations = 5, .mode = .syscalls });
