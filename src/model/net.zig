@@ -141,6 +141,9 @@ pub const SendCheck = union(enum) {
     /// The peer closed; bytes are discarded and this socket is reset after
     /// a round trip.
     peer_gone,
+    /// Reset after the peer's FIN had arrived (Linux: the socket was in
+    /// CLOSE_WAIT, so `tcp_reset` records `EPIPE`, not `ECONNRESET`).
+    broken_pipe,
     /// The peer's receive ring is full.
     would_block,
 };
@@ -375,7 +378,7 @@ pub const Net = struct {
         const s = &net.sockets[slot];
         assert(s.kind == .listener);
         for (s.backlog[0..s.backlog_len]) |sv| {
-            if (net.peerOf(sv)) |c| net.setFault(c, .reset, now_ns + drawLatency(d, o));
+            if (net.peerOf(sv)) |c| net.resetFromPeer(c, now_ns + drawLatency(d, o));
             net.release(sv);
         }
         s.backlog_len = 0;
@@ -515,7 +518,12 @@ pub const Net = struct {
     pub fn recv(net: *Net, slot: u16, data: []const []u8, limit: usize, now_ns: u64) RecvResult {
         net.settle(slot, now_ns);
         const s = &net.sockets[slot];
-        if (activeFault(s, now_ns)) |f| return .{ .fault = f };
+        if (activeFault(s, now_ns)) |f| {
+            // After the peer's FIN, what arrived stays readable, then the
+            // end, whatever the error: Linux checks `SOCK_DONE` before
+            // `sk_err`. Only a write sees the error.
+            if (!s.eof) return .{ .fault = f };
+        }
         if (s.shut_recv) return .eof;
         if (s.rx_ready > 0) {
             var want: usize = @min(limit, s.rx_ready);
@@ -546,8 +554,14 @@ pub const Net = struct {
     }
 
     pub fn checkSend(net: *Net, slot: u16, now_ns: u64) SendCheck {
+        net.settle(slot, now_ns);
         const s = &net.sockets[slot];
-        if (activeFault(s, now_ns)) |f| return .{ .fault = f };
+        if (activeFault(s, now_ns)) |f| {
+            // CLOSE_WAIT only: with our own FIN sent too (LAST_ACK) Linux
+            // records `ECONNRESET`.
+            if (f == .reset and s.eof and !s.shut_send) return .broken_pipe;
+            return .{ .fault = f };
+        }
         if (s.shut_send) return .shut_down;
         const p = net.peerOf(slot) orelse return .peer_gone;
         const ps = &net.sockets[p];
@@ -594,8 +608,15 @@ pub const Net = struct {
         // peer resets itself and answers with RST (RFC 1122 4.2.2.13).
         if (len > 0 and !held and ps.shut_recv and ps.shut_send) {
             net.setFault(p, .reset, at);
-            net.setFault(slot, .reset, at + drawLatency(d, o));
+            net.resetFromPeer(slot, at + drawLatency(d, o));
         }
+    }
+
+    /// A reset from `slot`'s peer, sent at `at`: it arrives after every
+    /// segment the peer sent before it (a FIN among them), as TCP orders
+    /// them.
+    pub fn resetFromPeer(net: *Net, slot: u16, at: u64) void {
+        net.setFault(slot, .reset, @max(at, net.sockets[slot].last_deliver_at));
     }
 
     /// Marks `slot` as failing with `fault` from `at` on.
@@ -609,7 +630,7 @@ pub const Net = struct {
     /// Resets both ends of the connection (random RST injection).
     pub fn resetConnection(net: *Net, slot: u16, now_ns: u64, d: *decide.Decider, o: Options) void {
         net.setFault(slot, .reset, now_ns);
-        if (net.peerOf(slot)) |p| net.setFault(p, .reset, now_ns + drawLatency(d, o));
+        if (net.peerOf(slot)) |p| net.resetFromPeer(p, now_ns + drawLatency(d, o));
     }
 
     pub fn shutdownSend(net: *Net, slot: u16, now_ns: u64, d: *decide.Decider, o: Options) void {
@@ -629,7 +650,7 @@ pub const Net = struct {
             .listener => {
                 // Un-accepted connections are reset.
                 for (s.backlog[0..s.backlog_len]) |sv| {
-                    if (net.peerOf(sv)) |c| net.setFault(c, .reset, now_ns + drawLatency(d, o));
+                    if (net.peerOf(sv)) |c| net.resetFromPeer(c, now_ns + drawLatency(d, o));
                     net.release(sv);
                 }
                 s.backlog_len = 0;
@@ -639,7 +660,7 @@ pub const Net = struct {
                 const unread = s.rx_len > 0;
                 if (unread or activeFault(s, now_ns) != null) {
                     // RST: the peer loses whatever is still in flight.
-                    net.setFault(p, .reset, now_ns + drawLatency(d, o));
+                    net.resetFromPeer(p, now_ns + drawLatency(d, o));
                 } else if (!s.shut_send) {
                     net.commit(slot, 0, true, now_ns, d, o);
                 }
@@ -661,7 +682,7 @@ pub const Net = struct {
                         if (d.chance(.net, o.blackhole_ppm)) {
                             net.setFault(p, .timed_out, now_ns + o.blackhole_timeout_ns);
                         } else {
-                            net.setFault(p, .reset, now_ns + drawLatency(d, o));
+                            net.resetFromPeer(p, now_ns + drawLatency(d, o));
                         }
                     }
                 }
@@ -921,6 +942,71 @@ test "close with unread data resets the peer" {
     var vec = [_][]u8{&buf};
     try testing.expectEqual(RecvResult{ .fault = .reset }, net.recv(c, &vec, 4, 200));
     try testing.expectEqual(SendCheck.peer_gone, net.checkSend(c, 50));
+}
+
+test "a reset after the peer's FIN: reads end, writes break (Linux CLOSE_WAIT)" {
+    var net = try testNet(2);
+    defer net.deinit();
+    var d = decide.Decider.init(3);
+    const o: Options = .{ .latency_min_ns = 10, .latency_max_ns = 10 };
+    const l = try net.listen(1, 80, 4);
+    const c = try net.establish(0, 50000, l);
+    const sv = net.popBacklog(l).?;
+    net.push(sv, "bye");
+    net.commit(sv, 3, false, 0, &d, o);
+    net.close(sv, 0, &d, o); // read everything there was: a FIN, no RST
+    var buf: [4]u8 = undefined;
+    var vec = [_][]u8{&buf};
+    // The client writes into the closed connection; the RST comes back.
+    try testing.expectEqual(SendCheck.peer_gone, net.checkSend(c, 100));
+    net.setFault(c, .reset, 120);
+    try testing.expectEqual(SendCheck.broken_pipe, net.checkSend(c, 200));
+    try testing.expectEqual(RecvResult{ .data = 3 }, net.recv(c, &vec, 4, 200));
+    try testing.expect(net.recv(c, &vec, 4, 200) == .eof);
+    // Our own FIN sent as well (LAST_ACK): a reset is a reset to a write.
+    const c3 = try net.establish(0, 50002, l);
+    const sv3 = net.popBacklog(l).?;
+    net.close(sv3, 300, &d, o);
+    net.shutdownSend(c3, 300, &d, o);
+    net.setFault(c3, .reset, 320);
+    try testing.expectEqual(SendCheck{ .fault = .reset }, net.checkSend(c3, 400));
+    try testing.expect(net.recv(c3, &vec, 4, 400) == .eof);
+    // Without the FIN first, a reset is a reset.
+    const c2 = try net.establish(0, 50001, l);
+    net.setFault(c2, .reset, 10);
+    try testing.expectEqual(SendCheck{ .fault = .reset }, net.checkSend(c2, 20));
+    try testing.expectEqual(RecvResult{ .fault = .reset }, net.recv(c2, &vec, 4, 20));
+}
+
+test "a reset from the peer arrives after the FIN it sent first" {
+    var net = try testNet(2);
+    defer net.deinit();
+    var d = decide.Decider.init(1);
+    // The FIN may take 2 ms; the reset is sent after 100 us.
+    const o: Options = .{ .latency_min_ns = 50_000, .latency_max_ns = 2_000_000 };
+    var seed: u64 = 0;
+    while (seed < 64) : (seed += 1) {
+        d = decide.Decider.init(seed);
+        net.reset();
+        const l = try net.listen(1, 80, 4);
+        const c = try net.establish(0, 50000, l);
+        const sv = net.popBacklog(l).?;
+        net.push(sv, "bye");
+        net.commit(sv, 3, false, 0, &d, o);
+        net.close(sv, 0, &d, o);
+        try testing.expectEqual(SendCheck.peer_gone, net.checkSend(c, 0));
+        net.resetFromPeer(c, 100_000);
+        // Whenever the client looks, it never sees the reset before the
+        // data and the FIN.
+        var buf: [4]u8 = undefined;
+        var vec = [_][]u8{&buf};
+        var t: u64 = 0;
+        while (t <= 3_000_000) : (t += 50_000) {
+            const r = net.recv(c, &vec, 0, t);
+            try testing.expect(r != .fault);
+        }
+        try testing.expectEqual(SendCheck.broken_pipe, net.checkSend(c, 3_000_000));
+    }
 }
 
 test "datagrams: loss, duplication, reordering, separate port space" {

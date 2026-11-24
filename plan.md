@@ -713,6 +713,8 @@ Not verified, and the limits: threads switch only at system calls, so a thread s
 
 Still not verified after revision 99: glibc; C++; a Rust program that is an executable and not a library linked into the test; tokio's blocking pool, signals and child processes; `dup` of a socket (`TcpStream::try_clone`) or a file, `dup2` and `dup3`, which are stray. A caught signal that a thread sends itself ran its handler outside the simulation, unreported; since revision 105 it fails the run. The libc clock test is behind `-Dsqlite`: the default suite links no libc, so it has no test of this.
 
+**Revision 113: a write to a connection the peer closed.** Compared with the real loopback, the model failed the writes that follow a peer's reset as reset, where Linux, having seen the peer's FIN first, fails them as a broken pipe and lets the read end the stream. Fixed; a datagram to a closed port agrees.
+
 **Revision 111: programs that start other programs.** A test registers what each command does, and a spawn runs it as a simulated process, with pipes that hold 64 KiB and block as real ones do. Waiting for a child that waits for its input, or before reading more output than a pipe holds, is found as the deadlock it is.
 
 **Revision 109: how often the security layer finds what it should.** A table for its oracles, like the core's: every planted bug of its tests found in every campaign of 200 iterations, no false alarm on a fixed program. One claim of a test did not hold: a hash seeded from the run's seed does not stop guided exploration, which keeps a parent's seed for the inputs it derives from it.

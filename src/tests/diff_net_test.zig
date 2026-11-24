@@ -33,9 +33,11 @@ const Outcome = struct {
     server: Seen = .{},
     /// The error of the call the scenario is about, or "ok".
     call: []const u8 = "ok",
+    /// How a later read on the client ends, where a scenario makes one.
+    after: []const u8 = "none",
 
     fn eql(a: Outcome, b: Outcome) bool {
-        return a.client.eql(b.client) and a.server.eql(b.server) and std.mem.eql(u8, a.call, b.call);
+        return a.client.eql(b.client) and a.server.eql(b.server) and std.mem.eql(u8, a.call, b.call) and std.mem.eql(u8, a.after, b.after);
     }
 };
 
@@ -91,12 +93,18 @@ const Scenario = enum {
     /// different length, in the reverse order of connecting, and the
     /// server answers each with its place in the accept order.
     several_connections,
+    /// The server accepts and closes at once; the client reads to the end
+    /// and then writes `writes_after_close` times, a pause before each.
+    write_after_close,
     /// Three datagrams of 5, 1,200 and 1 bytes, echoed back.
     dgram_boundaries,
     /// A datagram of 100 bytes received into a buffer of 10.
     dgram_truncated,
     /// A datagram of no bytes, then one of one byte.
     dgram_empty,
+    /// A datagram to a port nobody has bound, then one to the server,
+    /// echoed back to the same client socket.
+    dgram_closed_port,
 
     fn datagram(s: Scenario) bool {
         return @backingInt(s) >= @backingInt(Scenario.dgram_boundaries);
@@ -126,6 +134,7 @@ fn sendLarge(io: Io, stream: Stream, len: usize) []const u8 {
 }
 
 const connections = 3;
+const writes_after_close = 4;
 
 const Server = struct {
     io: Io,
@@ -144,7 +153,7 @@ const Server = struct {
                 s.seen = drain(s.io, stream);
                 _ = send(s.io, stream, "reply");
             },
-            .close_without_data => {},
+            .close_without_data, .write_after_close => {},
             .close_with_unread => {
                 // One byte, so the client's data has arrived; the rest is
                 // left unread when the stream closes.
@@ -179,7 +188,7 @@ const Server = struct {
                 }
             },
             .refused, .address_in_use => {},
-            .dgram_boundaries, .dgram_truncated, .dgram_empty => unreachable,
+            .dgram_boundaries, .dgram_truncated, .dgram_empty, .dgram_closed_port => unreachable,
         }
     }
 };
@@ -257,6 +266,40 @@ fn playDatagram(io: Io, scenario: Scenario, bind_at: IpAddress, reach: ?IpAddres
                 out.server.sum += msg.data.len * (k + 1);
             }
         },
+        .dgram_closed_port => {
+            // A port that was bound and is not any more: on the real
+            // system the kernel picked it, here it is beyond the ports
+            // the test listens on.
+            var closed = target;
+            if (reach == null) {
+                var gone_at = bind_at;
+                gone_at.setPort(0);
+                const gone = try gone_at.bind(io, .{ .mode = .dgram });
+                closed = gone.address;
+                gone.close(io);
+            } else closed.setPort(target.getPort() + 1000);
+            client.send(io, &closed, "lost") catch |e| {
+                out.call = @errorName(e);
+            };
+            client.send(io, &target, "ping") catch |e| {
+                out.call = @errorName(e);
+                return out;
+            };
+            const msg = server.receive(io, &buf) catch |e| {
+                out.server.end = @errorName(e);
+                return out;
+            };
+            out.server.len = msg.data.len;
+            client.send(io, &msg.from, msg.data) catch |e| {
+                out.call = @errorName(e);
+                return out;
+            };
+            // Where the closed port's refusal would show, if anywhere.
+            if (client.receive(io, &buf)) |back| {
+                out.client.len = back.data.len;
+                out.client.end = "echo";
+            } else |e| out.client.end = @errorName(e);
+        },
         else => unreachable,
     }
     return out;
@@ -308,6 +351,26 @@ fn play(io: Io, scenario: Scenario, listen_at: IpAddress, reach: ?IpAddress) !Ou
             out.client = drain(io, stream);
         },
         .close_without_data => out.client = drain(io, stream),
+        .write_after_close => {
+            // Read to the end first, so the peer's close has arrived; then
+            // write. What the writes answer, in order: `client.len` writes
+            // succeed, `client.end` is the first error and `call` the last.
+            const got = drain(io, stream);
+            if (!std.mem.eql(u8, got.end, "eof")) out.call = got.end;
+            out.client.end = "none";
+            for (0..writes_after_close) |_| {
+                try io.sleep(.fromMilliseconds(5), .awake);
+                const r = send(io, stream, "x");
+                if (std.mem.eql(u8, r, "ok")) {
+                    out.client.len += 1;
+                    continue;
+                }
+                if (std.mem.eql(u8, out.client.end, "none")) out.client.end = r;
+                out.call = r;
+            }
+            // And a read after the writes.
+            out.after = drain(io, stream).end;
+        },
         .close_with_unread => {
             out.call = send(io, stream, "12345678");
             out.client = drain(io, stream);
@@ -354,7 +417,7 @@ fn play(io: Io, scenario: Scenario, listen_at: IpAddress, reach: ?IpAddress) !Ou
             }
         },
         .refused, .address_in_use => unreachable,
-        .dgram_boundaries, .dgram_truncated, .dgram_empty => unreachable,
+        .dgram_boundaries, .dgram_truncated, .dgram_empty, .dgram_closed_port => unreachable,
     }
     try group.await(io);
     out.server = server.seen;
@@ -385,10 +448,21 @@ fn body(env: *Env) !void {
         // where POSIX systems and the model give the first bytes and the
         // truncation flag. On Windows this scenario compares nothing.
         if (builtin.os.tag == .windows and scenario == .dgram_truncated and std.mem.eql(u8, real[i].call, "MessageOversize")) continue;
+        // Known and accepted, a gap in std: on Windows a write after the
+        // peer's reset fails with NTSTATUS LOCAL_DISCONNECT, which std
+        // does not map (`Unexpected`). The writes that succeed first
+        // still agree.
+        if (builtin.os.tag == .windows and scenario == .write_after_close and std.mem.eql(u8, real[i].call, "Unexpected") and real[i].client.len == got.client.len) continue;
+        // Known and accepted: Windows reports the ICMP port-unreachable
+        // of an earlier datagram on an unconnected socket's next receive
+        // (WSAECONNRESET, `PortUnreachable`); Linux, like the model,
+        // reports it only on a connected socket, and the echo arrives.
+        if (builtin.os.tag == .windows and scenario == .dgram_closed_port and std.mem.eql(u8, real[i].client.end, "PortUnreachable") and
+            real[i].server.eql(got.server) and std.mem.eql(u8, real[i].call, got.call)) continue;
         mismatches += 1;
         if (mismatches <= 8) std.debug.print(
-            "diff_net: {t}: simulated call {s}, client {d} bytes sum {d} end {s}, server {d} bytes end {s}; real call {s}, client {d} bytes sum {d} end {s}, server {d} bytes end {s}\n",
-            .{ scenario, got.call, got.client.len, got.client.sum, got.client.end, got.server.len, got.server.end, real[i].call, real[i].client.len, real[i].client.sum, real[i].client.end, real[i].server.len, real[i].server.end },
+            "diff_net: {t}: simulated call {s}, client {d} bytes sum {d} end {s}, server {d} bytes end {s}, after {s}; real call {s}, client {d} bytes sum {d} end {s}, server {d} bytes end {s}, after {s}\n",
+            .{ scenario, got.call, got.client.len, got.client.sum, got.client.end, got.server.len, got.server.end, got.after, real[i].call, real[i].client.len, real[i].client.sum, real[i].client.end, real[i].server.len, real[i].server.end, real[i].after },
         );
     }
 }

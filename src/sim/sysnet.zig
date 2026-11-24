@@ -711,7 +711,10 @@ fn send(s: *Sim, slot: *Slot, buf_ptr: u64, len: u64, flags: u32, to_ptr: u64, t
                 const r = io.operate(.{ .net_write = .{ .socket_handle = slot.handle, .data = &data } }) catch
                     return if (sent > 0) sent else fail(.INTR);
                 const n = r.net_write catch |err| {
-                    if (err == error.ConnectionResetByPeer) {
+                    // On a connected stream, an unconnected socket is a
+                    // reset that came after the peer's FIN (the model's
+                    // broken pipe): reported as the reset, once.
+                    if (err == error.ConnectionResetByPeer or err == error.SocketUnconnected) {
                         slot.reset_reported = true;
                         return if (sent > 0) sent else fail(resetErrno(s, slot));
                     }

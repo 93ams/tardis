@@ -1166,6 +1166,60 @@ fn socketErrors(env: *Env) !void {
     try testing.expectEqual(@as(u32, 0), err_value);
 }
 
+var resets_injected = false;
+
+fn acceptAndClose(listener: usize) void {
+    const conn = sys(.accept, listener, 0, 0, 0);
+    if (conn >= 0) _ = sys(.close, @intCast(conn), 0, 0, 0);
+}
+
+fn pause5ms() void {
+    const req: Timespec = .{ .sec = 0, .nsec = 5 * std.time.ns_per_ms };
+    _ = sys(.nanosleep, @intFromPtr(&req), 0, 0, 0);
+}
+
+/// A connection the peer closed: read to the end, write (the peer answers
+/// with a reset), then what Linux gives, measured: the read ends, every
+/// write fails with `EPIPE`, never `ENOTCONN` (the socket was in
+/// CLOSE_WAIT when the reset came).
+fn closeWaitReset(env: *Env) !void {
+    const listener = try ok(sys(.socket, 2, 1, 0, 0));
+    defer _ = sys(.close, listener, 0, 0, 0);
+    const at = sockaddr(.{ 127, 0, 0, 1 }, 7100);
+    _ = try ok(sys(.bind, listener, @intFromPtr(&at), @sizeOf(SockaddrIn), 0));
+    _ = try ok(sys(.listen, listener, 8, 0, 0));
+    var server = try env.io.concurrent(acceptAndClose, .{listener});
+    const client = try ok(sys(.socket, 2, 1, 0, 0));
+    defer _ = sys(.close, client, 0, 0, 0);
+    _ = try ok(sys(.connect, client, @intFromPtr(&at), @sizeOf(SockaddrIn), 0));
+    server.await(env.io);
+    var buf: [4]u8 = undefined;
+    const injected = resets_injected;
+    const first_read = sys(.read, client, @intFromPtr(&buf), buf.len, 0);
+    // An injected reset may come before the FIN: then it is a reset.
+    if (injected and first_read == errOf(.CONNRESET)) return;
+    try testing.expectEqual(@as(isize, 0), first_read);
+    const first = sys6(.sendto, client, @intFromPtr("x"), 1, 0x4000, 0, 0);
+    if (injected) {
+        if (first != 1) try testing.expectEqual(errOf(.PIPE), first);
+    } else try testing.expectEqual(@as(isize, 1), first);
+    pause5ms();
+    try testing.expectEqual(@as(isize, 0), sys(.read, client, @intFromPtr(&buf), buf.len, 0));
+    try testing.expectEqual(errOf(.PIPE), sys6(.sendto, client, @intFromPtr("x"), 1, 0x4000, 0, 0));
+    try testing.expectEqual(errOf(.PIPE), sys6(.sendto, client, @intFromPtr("x"), 1, 0x4000, 0, 0));
+    try testing.expectEqual(@as(isize, 0), sys(.read, client, @intFromPtr(&buf), buf.len, 0));
+}
+
+test "system-call mode: a write to a connection the peer closed breaks the pipe, as Linux does" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    resets_injected = false;
+    try tardis.check(gpa, closeWaitReset, .{ .iterations = 50, .mode = .syscalls, .faults = .{ .net_reset_ppm = 0 } });
+    resets_injected = true;
+    defer resets_injected = false;
+    // Every read and write may meet an injected reset.
+    try tardis.check(gpa, closeWaitReset, .{ .iterations = 50, .mode = .syscalls, .faults = .{ .net_reset_ppm = 1_000_000 } });
+}
+
 test "system-call mode: datagrams and socket errors, by system calls" {
     if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
     try tardis.check(gpa, datagrams, .{ .iterations = 50, .mode = .syscalls, .faults = .{ .datagram_loss_ppm = 0, .datagram_duplicate_ppm = 0 } });

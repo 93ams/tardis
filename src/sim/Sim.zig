@@ -4145,9 +4145,15 @@ fn netWriteStep(s: *Sim, op: Io.Operation.NetWrite) ?Io.Operation.NetWrite.Resul
             return netFaultError(E, f);
         },
         .shut_down => return error.SocketUnconnected,
+        // Linux's `EPIPE`, which std reports as an unconnected socket.
+        .broken_pipe => {
+            s.record(.net_fault, slot, @backingInt(net_mod.Fault.reset), 2, "reset after fin");
+            return error.SocketUnconnected;
+        },
         .peer_gone => {
-            // The bytes vanish; the peer answers with RST a round trip later.
-            s.net.setFault(slot, .reset, s.now_ns + 2 * s.config.net.latency_min_ns);
+            // The bytes vanish; the peer answers with RST a round trip
+            // later, after its FIN.
+            s.net.resetFromPeer(slot, s.now_ns + 2 * s.config.net.latency_min_ns);
             s.record(.net_write, slot, total, 1, "peer closed");
             return total;
         },
