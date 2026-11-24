@@ -575,6 +575,23 @@ pub const Error = error{
     SyscallModeUnsupported,
 };
 
+/// A simulated process: what a program registered with
+/// `Env.registerProgram` is given. Its streams are pipes to the parent
+/// where the parent asked for them (`StdIo.pipe`); for `StdIo.file`, a
+/// duplicate of a pipe end (so a pipeline works and either side may close
+/// its own) or the parent's own filesystem file, shared, not duplicated;
+/// and otherwise a stream that reads as empty and discards writes.
+pub const Process = struct {
+    io: std.Io,
+    /// The node's volatile heap, as `Env.allocator`.
+    allocator: Allocator,
+    /// The process's own copy of its arguments.
+    argv: []const []const u8,
+    stdin: std.Io.File,
+    stdout: std.Io.File,
+    stderr: std.Io.File,
+};
+
 /// The simulated world handed to a test body.
 pub const Env = struct {
     sim: *Sim,
@@ -819,6 +836,45 @@ pub const Env = struct {
             }
         };
         try env.sim.spawnDaemon(node, Wrapper.start, std.mem.asBytes(&args), .of(Args));
+    }
+
+    /// Registers a program for this run (plan3.md D4): a
+    /// `std.process.spawn` (or `std.process.run`) whose `argv[0]` is
+    /// `name`, or a path ending in `/name`, runs `function` as a process
+    /// on the caller's node instead of failing. `function` takes a
+    /// `*Process` and returns its exit code (`u8`) or an error, which exits
+    /// with 1 and is noted in the trace. Only `argv[0]` is matched
+    /// (`SpawnOptions.exe` is not looked at). Pipes block as real ones do
+    /// (64 KiB), so a parent that waits before it drains a pipe, or that
+    /// never closes the child's standard input, deadlocks here as it would
+    /// on a real system. The working directory and the environment are not
+    /// modelled. A name nobody registered fails to spawn with
+    /// `error.FileNotFound`. Registrations end with the run; registering
+    /// in `Options.setup` turns warm starts off.
+    pub fn registerProgram(env: *Env, name: []const u8, comptime function: fn (*Process) anyerror!u8) !void {
+        const Wrapper = struct {
+            fn start(context: *const anyopaque, result: *anyopaque) void {
+                const slot: *const u8 = @ptrCast(context);
+                const s = Sim.active();
+                const view = s.procView(slot.*);
+                var p: Process = .{
+                    .io = s.io(),
+                    .allocator = s.nodes[s.currentNode()].heap.allocator(),
+                    .argv = view.argv,
+                    .stdin = view.stdin,
+                    .stdout = view.stdout,
+                    .stderr = view.stderr,
+                };
+                var failed: ?anyerror = null;
+                const code: u8 = function(&p) catch |err| blk: {
+                    failed = err;
+                    break :blk 1;
+                };
+                s.procExited(slot.*, code, failed);
+                @as(*u8, @ptrCast(result)).* = code;
+            }
+        };
+        try env.sim.registerProgram(.{ .name = name, .start = Wrapper.start });
     }
 
     /// Crashes and reboots one node (see `Sim.crashNode`). Other nodes keep
@@ -3258,6 +3314,8 @@ test {
     _ = @import("tests/self_fuzz_net_test.zig");
     _ = @import("tests/corpus_test.zig");
     _ = @import("tests/diff_net_test.zig");
+    _ = @import("tests/process_test.zig");
+    _ = @import("model/pipe.zig");
     _ = syscalls;
     _ = atomic;
     _ = @import("tests/fs_test.zig");

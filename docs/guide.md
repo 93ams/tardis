@@ -165,6 +165,35 @@ Code that has an `Io` but no `Env` can call `tardis.fuzzInput(T, io)`
 and `tardis.assertSometimes(io, name, cond)`. `tardis.isSimulated(io)`
 says whether an `Io` is a simulated one.
 
+**Child processes.** A program that shells out is tested by registering,
+for the run, what each command does. `env.registerProgram(name, f)` makes
+a `std.process.spawn` or `std.process.run` whose `argv[0]` is `name` (or a
+path ending in it) run `f` as a process on the caller's node. `f` takes a
+`*tardis.Process`, with its own `io`, `argv`, `stdin`, `stdout` and
+`stderr`, and returns the exit code. From
+[`src/tests/process_test.zig`](../src/tests/process_test.zig):
+
+```zig
+fn upper(p: *tardis.Process) anyerror!u8 {
+    // reads p.stdin to its end, writes it upper-cased to p.stdout
+}
+
+try env.registerProgram("upper", upper);
+var child = try std.process.spawn(env.io, .{ .argv = &.{"upper"}, .stdin = .pipe, .stdout = .pipe });
+```
+
+Pipes hold 64 KiB and block as real ones do, so the two classic bugs are
+found as deadlocks: waiting for a child whose standard input was never
+closed, and waiting before reading output larger than a pipe. A pipe end
+passed to a second child (`.stdin = .{ .file = a.stdout.? }`) is
+duplicated, so a pipeline works when the parent closes its copy. A child
+never waited for is a leak. A command nobody registered fails with
+`error.FileNotFound`; only `argv[0]` is matched. Not modelled: the working
+directory and the environment of the child, signals other than `kill`
+(which cancels the program at its next cancelation point, so a program
+that never reaches one is waited for), resource usage statistics, and,
+for the security layer, taint carried through a pipe.
+
 ## 3. The oracles
 
 An oracle is how a test says what must be true. Give each a name: the

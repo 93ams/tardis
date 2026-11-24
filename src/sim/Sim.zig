@@ -25,6 +25,7 @@ const sched = @import("sched.zig");
 const vfs_mod = @import("../model/vfs.zig");
 const fuzz = @import("../search/fuzz.zig");
 const net_mod = @import("../model/net.zig");
+const pipe_mod = @import("../model/pipe.zig");
 const explore = @import("../search/explore.zig");
 const persist = @import("../search/persist.zig");
 const seam = @import("sec_seam.zig");
@@ -146,6 +147,43 @@ pub const task_buffer_bytes = 1024;
 const task_buffer_align = 64;
 
 const State = enum(u8) { free, runnable, blocked, finished };
+
+pub const programs_max = 16;
+pub const program_name_bytes = 64;
+pub const procs_max = 16;
+const proc_args_max = 32;
+const proc_argv_bytes = 2048;
+
+/// A program a test registered (`Env.registerProgram`): what a spawn of
+/// `name` runs, as a future whose result is the exit code (one byte).
+pub const Program = struct {
+    name: []const u8,
+    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+};
+
+/// A spawned process: a task on its parent's node running a registered
+/// program, with its own copy of the arguments and the child's ends of
+/// its standard streams.
+const Proc = struct {
+    used: bool = false,
+    generation: u16 = 0,
+    task: TaskId = 0,
+    node: NodeId = 0,
+    /// The child's standard streams (handle values).
+    stdio: [3]u32 = @splat(pipe_mod.closed_value),
+    argc: u8 = 0,
+    argv: [proc_args_max][]const u8 = undefined,
+    argv_bytes: [proc_argv_bytes]u8 = undefined,
+};
+
+/// What a program's wrapper (root.zig) is given: its arguments and its
+/// standard streams.
+pub const ProcView = struct {
+    argv: []const []const u8,
+    stdin: File,
+    stdout: File,
+    stderr: File,
+};
 
 const Block = union(enum) {
     none,
@@ -367,6 +405,13 @@ reported_len: u8 = 0,
 /// The port the last stream `connect` used, failed or not (system-call
 /// mode's `getsockname` after a failed attempt).
 last_connect_port: u16 = 0,
+/// Child processes (plan3.md D4): the programs a test registered for this
+/// run, the processes they run as, and the pipes between them.
+pipes: pipe_mod.Pipes,
+programs: [programs_max]Program,
+program_names: [programs_max][program_name_bytes]u8,
+programs_len: u8,
+procs: [procs_max]Proc,
 boot_count: u32,
 crash_count: u32,
 
@@ -419,6 +464,11 @@ pub fn create(gpa: Allocator, config: Config) !*Sim {
     s.hosts = try gpa.alloc(Host, limits.hosts_max);
     errdefer gpa.free(s.hosts);
     s.hosts_len = 0;
+    // Pipe handles use bit 15 of a filesystem handle value (pipe.zig).
+    assert(limits.vfs.handles_max < 0x8000);
+    s.pipes = .init(gpa);
+    s.programs_len = 0;
+    s.procs = @splat(.{});
     s.daemon_error = null;
     s.daemons_spawned = 0;
     s.stats = .{};
@@ -520,6 +570,7 @@ pub fn destroy(s: *Sim) void {
     }
     s.warm.drop(gpa);
     gpa.free(s.hosts);
+    s.pipes.deinit();
     s.net.deinit();
     for (s.nodes) |*n| {
         n.vfs.deinit();
@@ -586,6 +637,8 @@ pub fn beginRun(s: *Sim, seed: u64, persona: Persona) void {
     }
     s.vfs = &s.nodes[0].vfs;
     s.net.reset();
+    s.resetProcs(true);
+    s.programs_len = 0;
     s.hosts_len = 0;
     s.daemon_error = null;
     s.daemons_spawned = 0;
@@ -984,6 +1037,8 @@ fn warmOnlySnapshotState(s: *const Sim) bool {
     if (s.daemon_error != null or s.deadlocked or s.chaos_active or s.heal_at_ns != 0) return false;
     if (s.boot_count != 1 or s.crash_count != 0) return false;
     if (s.plan.hasTargeted() or !s.net.pristine()) return false;
+    // Programs registered by setup, processes and pipes are not in a snapshot.
+    if (s.programs_len != 0 or !s.pipes.pristine()) return false;
     if (s.catalog.len != s.warm.catalog_len or s.catalogReached() != s.warm.catalog_reached) return false;
     for (s.nodes) |*n| {
         if (n.crash_count != 0 or !n.heap.pristine() or !n.vfs.noHandles()) return false;
@@ -1919,6 +1974,7 @@ pub fn crashAndReboot(s: *Sim, mode: CrashMode) void {
     for (s.nodes, 0..) |*n, i| s.crashVfs(&n.vfs, @intCast(i), mode);
     s.dropTasks(null);
     s.net.reset();
+    s.resetProcs(false);
     sysemu.dropNode(null);
     sysnet.dropNode(null);
     sysfd.dropNode(null);
@@ -1987,6 +2043,10 @@ pub fn crashNode(s: *Sim, node: NodeId, mode: CrashMode) void {
     }
     s.crashVfs(&s.nodes[node].vfs, node, mode);
     s.dropTasks(node);
+    for (&s.procs) |*p| {
+        if (p.used and p.node == node) p.used = false;
+    }
+    s.pipes.closeNode(node);
     sysemu.dropNode(node);
     sysnet.dropNode(node);
     sysfd.dropNode(node);
@@ -2256,7 +2316,7 @@ pub fn leaks(s: *Sim, exclude: TaskId) LeakReport {
     }
     for (s.nodes, 0..) |*node, i| {
         if (daemon_nodes & (@as(u128, 1) << @intCast(i)) != 0) continue;
-        r.handles += node.vfs.openHandleCount();
+        r.handles += node.vfs.openHandleCount() + s.pipes.openEndsOn(@intCast(i));
         r.allocations += node.heap.live_count;
         r.sockets += s.net.openCountOn(@intCast(i));
     }
@@ -2465,6 +2525,8 @@ const vtable: Io.VTable = blk: {
     v.dirSymLink = dirSymLink;
     v.dirReadLink = dirReadLink;
     v.processSpawn = processSpawn;
+    v.childWait = childWait;
+    v.childKill = childKill;
     v.processReplace = processReplace;
     v.fileIsTty = fileIsTty;
     v.fileSupportsAnsiEscapeCodes = fileSupportsAnsiEscapeCodes;
@@ -2523,7 +2585,6 @@ fn refusalIsQuiet(comptime name: []const u8) bool {
 fn refusalPanics(comptime name: []const u8) bool {
     for ([_][]const u8{
         "lockStderr",           "unlockStderr",
-        "childWait",            "childKill",
         "fileMemoryMapDestroy", "fileMemoryMapSetLength",
         "fileMemoryMapRead",    "fileMemoryMapWrite",
         "netInterfaceName",
@@ -3192,6 +3253,22 @@ fn fileStat(userdata: ?*anyopaque, file: File) File.StatError!File.Stat {
     const s = fromUserdata(userdata);
     const E = File.StatError;
     try s.enter(E);
+    if (isPipe(file)) {
+        const v = handleValue(file.handle);
+        if (v != pipe_mod.null_value and s.pipes.decode(v) == null) return vfsError(E, error.InvalidHandle);
+        const t: Io.Timestamp = .{ .nanoseconds = @as(i96, s.config.epoch_offset_ns) + @as(i96, s.now_ns) };
+        return .{
+            .inode = intOrVoid(File.INode, 0),
+            .nlink = intOrVoid(File.NLink, 1),
+            .size = 0,
+            .permissions = .default_file,
+            .kind = .named_pipe,
+            .atime = null,
+            .mtime = t,
+            .ctime = t,
+            .block_size = vfs_mod.page_bytes,
+        };
+    }
     const h = s.fileHandle(file) catch |err| return vfsError(E, err);
     return s.makeStat(h.inode);
 }
@@ -3208,6 +3285,10 @@ fn fileClose(userdata: ?*anyopaque, files: []const File) void {
     const s = fromUserdata(userdata);
     for (files) |f| {
         const v = handleValue(f.handle);
+        if (pipe_mod.Pipes.isPipeValue(v)) {
+            s.pipeClose(v);
+            continue;
+        }
         if (s.fileHandle(f)) |h| {
             if (h.lock != .none) s.secFileLock(h.inode, false);
         } else |_| {}
@@ -3250,6 +3331,8 @@ fn fileWritePositional(userdata: ?*anyopaque, file: File, header: []const u8, da
     const s = fromUserdata(userdata);
     const E = File.WritePositionalError;
     try s.enter(E);
+    // A pipe has no position: std's reader and writer then stream.
+    if (isPipe(file)) return fault.castError(E, error.Unseekable);
     s.ioLatency();
     const h = s.fileHandle(file) catch |err| return vfsError(E, err);
     if (!h.writable) return vfsError(E, error.NotOpenForWriting);
@@ -3286,6 +3369,8 @@ fn fileReadPositional(userdata: ?*anyopaque, file: File, data: []const []u8, off
     const s = fromUserdata(userdata);
     const E = File.ReadPositionalError;
     try s.enter(E);
+    // A pipe has no position: std's reader and writer then stream.
+    if (isPipe(file)) return fault.castError(E, error.Unseekable);
     s.ioLatency();
     const h = s.fileHandle(file) catch |err| return vfsError(E, err);
     if (!h.readable) return vfsError(E, error.NotOpenForReading);
@@ -3302,6 +3387,7 @@ fn fileSeekBy(userdata: ?*anyopaque, file: File, relative_offset: i64) File.Seek
     const s = fromUserdata(userdata);
     const E = File.SeekError;
     try s.enter(E);
+    if (isPipe(file)) return fault.castError(E, error.Unseekable);
     const h = s.fileHandle(file) catch |err| return vfsError(E, err);
     const pos: i64 = @as(i64, @intCast(h.pos)) + relative_offset;
     if (pos < 0) return fault.castError(E, error.Unseekable);
@@ -3312,6 +3398,7 @@ fn fileSeekTo(userdata: ?*anyopaque, file: File, absolute_offset: u64) File.Seek
     const s = fromUserdata(userdata);
     const E = File.SeekError;
     try s.enter(E);
+    if (isPipe(file)) return fault.castError(E, error.Unseekable);
     const h = s.fileHandle(file) catch |err| return vfsError(E, err);
     h.pos = absolute_offset;
 }
@@ -3929,6 +4016,9 @@ fn preOperate(s: *Sim, operation: Io.Operation) ?Io.Operation.Result {
             s.maybeYield();
             if (s.injected(Io.Operation.NetSend.Error, .net_write)) |e| return .{ .net_send = .{ e, 0 } };
         },
+        // A pipe's scheduling point (a file's is in `readStreaming`).
+        .file_read_streaming => |op| if (isPipe(op.file)) s.maybeYield(),
+        .file_write_streaming => |op| if (isPipe(op.file)) s.maybeYield(),
         else => {},
     }
     return null;
@@ -3936,8 +4026,8 @@ fn preOperate(s: *Sim, operation: Io.Operation) ?Io.Operation.Result {
 
 fn stepOperate(s: *Sim, operation: Io.Operation) ?Io.Operation.Result {
     return switch (operation) {
-        .file_read_streaming => |op| .{ .file_read_streaming = s.readStreaming(op) },
-        .file_write_streaming => |op| .{ .file_write_streaming = s.writeStreaming(op) },
+        .file_read_streaming => |op| if (isPipe(op.file)) (if (s.pipeRead(op)) |r| .{ .file_read_streaming = r } else null) else .{ .file_read_streaming = s.readStreaming(op) },
+        .file_write_streaming => |op| if (isPipe(op.file)) (if (s.pipeWrite(op)) |r| .{ .file_write_streaming = r } else null) else .{ .file_write_streaming = s.writeStreaming(op) },
         .net_read => |op| if (s.netReadStep(op)) |r| .{ .net_read = r } else null,
         .net_write => |op| if (s.netWriteStep(op)) |r| .{ .net_write = r } else null,
         .net_send => |op| .{ .net_send = s.netSendStep(op) },
@@ -4165,12 +4255,313 @@ fn netBindIp(userdata: ?*anyopaque, address: *const ionet.IpAddress, options: io
     return .{ .handle = toHandle(v), .address = ip4(a.bytes, port) };
 }
 
-/// Core runs no processes: a spawn or an exec fails as on a system without
-/// them, after the security layer has seen the command.
+// --- child processes (plan3.md D4) ------------------------------------------
+
+/// Registers `name` for this run: a spawn whose `argv[0]` is `name`, or a
+/// path ending in it, runs `program.start`. Registrations end with the run.
+pub fn registerProgram(s: *Sim, program: Program) error{ TooManyPrograms, NameTooLong }!void {
+    for (s.programs[0..s.programs_len]) |*have| {
+        if (std.mem.eql(u8, have.name, program.name)) {
+            have.start = program.start;
+            return;
+        }
+    }
+    if (s.programs_len == programs_max) return error.TooManyPrograms;
+    if (program.name.len > program_name_bytes) return error.NameTooLong;
+    // The run keeps its own copy of the name.
+    const buf = &s.program_names[s.programs_len];
+    @memcpy(buf[0..program.name.len], program.name);
+    s.programs[s.programs_len] = .{ .name = buf[0..program.name.len], .start = program.start };
+    s.programs_len += 1;
+}
+
+/// Ends every process and pipe. A new run (`fresh`) starts the generations
+/// again, so its handle values do not depend on earlier runs; a crash keeps
+/// them counting, so a handle the body kept across it names nothing.
+fn resetProcs(s: *Sim, fresh: bool) void {
+    for (&s.procs) |*p| {
+        p.used = false;
+        if (fresh) p.generation = 0;
+    }
+    s.pipes.reset();
+    if (fresh) for (&s.pipes.pipes) |*q| {
+        q.generation = 0;
+    };
+}
+
+fn findProgram(s: *const Sim, arg0: []const u8) ?u8 {
+    const base_at = if (std.mem.lastIndexOfAny(u8, arg0, "/\\")) |i| i + 1 else 0;
+    for (s.programs[0..s.programs_len], 0..) |p, i| {
+        if (std.mem.eql(u8, p.name, arg0) or std.mem.eql(u8, p.name, arg0[base_at..])) return @intCast(i);
+    }
+    return null;
+}
+
+fn isPipe(file: File) bool {
+    return pipe_mod.Pipes.isPipeValue(handleValue(file.handle));
+}
+
+/// Process ids: distinct from any real one a test might print, and
+/// different for each use of a slot.
+const proc_id_base: u32 = 0x10_0000;
+
+fn procIdValue(slot: usize, generation: u16) u32 {
+    return proc_id_base + @as(u32, generation) * procs_max + @as(u32, @intCast(slot));
+}
+
+fn procId(v: u32) std.process.Child.Id {
+    if (is_windows) return @ptrFromInt(@as(usize, v));
+    if (builtin.os.tag == .wasi) return {};
+    return @intCast(v);
+}
+
+/// The live process `child` names, or null (already reaped, or dropped by a
+/// crash).
+fn procOf(s: *Sim, child: *const std.process.Child) ?usize {
+    const id = child.id orelse return null;
+    const v: u32 = if (is_windows) @intCast(@intFromPtr(id)) else @intCast(id);
+    if (v < proc_id_base) return null;
+    const slot = (v - proc_id_base) % procs_max;
+    const gen = (v - proc_id_base) / procs_max;
+    const p = &s.procs[slot];
+    if (!p.used or p.generation != gen) return null;
+    return slot;
+}
+
+/// For a program's wrapper (root.zig): the arguments and streams of the
+/// process the running task is.
+pub fn procView(s: *Sim, slot: u8) ProcView {
+    const p = &s.procs[slot];
+    return .{
+        .argv = p.argv[0..p.argc],
+        .stdin = makeFile(p.stdio[0]),
+        .stdout = makeFile(p.stdio[1]),
+        .stderr = makeFile(p.stdio[2]),
+    };
+}
+
+/// For a program's wrapper: the program returned (or failed, with
+/// `err`). Its ends of its pipes close, as the system closes a dead
+/// process's descriptors.
+pub fn procExited(s: *Sim, slot: u8, code: u8, err: ?anyerror) void {
+    const p = &s.procs[slot];
+    if (err) |e| s.record(.note, p.node, @intFromError(e), code, @errorName(e));
+    for (p.stdio) |v| {
+        if (s.pipes.decode(v) != null) s.pipeClose(v);
+    }
+    p.stdio = @splat(pipe_mod.closed_value);
+}
+
+fn pipeClose(s: *Sim, v: u32) void {
+    s.record(.close, v, 0, 0, "pipe");
+    const r = s.pipes.decode(v) orelse return;
+    s.pipes.close(r);
+    s.netWakeAll();
+}
+
+/// Closes the parent's ends of `child`'s pipes, as std's own wait does.
+fn closeChildStreams(s: *Sim, child: *std.process.Child) void {
+    inline for (.{ "stdin", "stdout", "stderr" }) |name| {
+        if (@field(child, name)) |f| {
+            s.pipeClose(handleValue(f.handle));
+            @field(child, name) = null;
+        }
+    }
+}
+
+/// Runs a registered program as a task on the caller's node, after the
+/// security layer has seen the command. A name nobody registered is
+/// `error.FileNotFound`, as on a system without that program. The
+/// working directory and the environment are not modelled: the program
+/// sees the run's one filesystem.
 fn processSpawn(userdata: ?*anyopaque, options: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
     const s = fromUserdata(userdata);
     s.secCapability(.process_spawn, options.argv);
-    return error.OperationUnsupported;
+    if (options.argv.len == 0) return error.InvalidName;
+    const program = s.findProgram(options.argv[0]) orelse return error.FileNotFound;
+    const slot = for (s.procs, 0..) |p, i| {
+        if (!p.used) break i;
+    } else return error.SystemResources;
+    const p = &s.procs[slot];
+    if (options.argv.len > proc_args_max) return error.SystemResources;
+    var used: usize = 0;
+    for (options.argv) |a| used += a.len;
+    if (used > proc_argv_bytes) return error.SystemResources;
+
+    const node = s.tasks[s.current].node;
+    // The child's end, then the parent's end, of each stream.
+    var child_end: [3]u32 = undefined;
+    var parent_end: [3]?u32 = @splat(null);
+    const streams = [3]std.process.SpawnOptions.StdIo{ options.stdin, options.stdout, options.stderr };
+    for (streams, 0..) |io_opt, i| {
+        child_end[i] = switch (io_opt) {
+            .inherit, .ignore => pipe_mod.null_value,
+            .close => pipe_mod.closed_value,
+            // A pipe end is duplicated, as a real spawn duplicates the
+            // descriptor: either side may close its own.
+            .file => |f| blk: {
+                const v = handleValue(f.handle);
+                if (s.pipes.decode(v)) |r| s.pipes.dup(r) catch {
+                    s.undoSpawnStreams(parent_end[0..i], child_end[0..i]);
+                    return error.SystemResources;
+                };
+                break :blk v;
+            },
+            .pipe => blk: {
+                const pipe = (s.pipes.create(node, node) catch null) orelse {
+                    s.undoSpawnStreams(parent_end[0..i], child_end[0..i]);
+                    return error.SystemResources;
+                };
+                // stdin: the child reads; stdout and stderr: the child writes.
+                const child_reads = i == 0;
+                parent_end[i] = s.pipes.encode(pipe, if (child_reads) .write else .read);
+                break :blk s.pipes.encode(pipe, if (child_reads) .read else .write);
+            },
+        };
+    }
+
+    p.* = .{ .used = true, .generation = (p.generation +% 1) & 0x0FFF, .node = node, .stdio = child_end };
+    var at: usize = 0;
+    for (options.argv, 0..) |a, i| {
+        @memcpy(p.argv_bytes[at..][0..a.len], a);
+        p.argv[i] = p.argv_bytes[at..][0..a.len];
+        at += a.len;
+    }
+    p.argc = @intCast(options.argv.len);
+    const context: u8 = @intCast(slot);
+    const id = s.spawn(.{ .future = s.programs[program].start }, std.mem.asBytes(&context), null, 1) orelse {
+        p.used = false;
+        s.undoSpawnStreams(&parent_end, &child_end);
+        return error.SystemResources;
+    };
+    p.task = id;
+    s.record(.spawn, id, 4, slot, "process");
+    const v = procIdValue(slot, p.generation);
+    const child: std.process.Child = .{
+        .id = procId(v),
+        .thread_handle = if (is_windows) @ptrFromInt(@as(usize, v)) else {},
+        .stdin = if (parent_end[0]) |e| makeFile(e) else null,
+        .stdout = if (parent_end[1]) |e| makeFile(e) else null,
+        .stderr = if (parent_end[2]) |e| makeFile(e) else null,
+        .request_resource_usage_statistics = false,
+    };
+    s.maybeYield();
+    return child;
+}
+
+/// A spawn that failed lets go of the streams it had made or duplicated.
+fn undoSpawnStreams(s: *Sim, parent_end: []const ?u32, child_end: []const u32) void {
+    for (parent_end) |pe| if (pe) |v| s.pipes.close(s.pipes.decode(v).?);
+    for (child_end) |ce| if (s.pipes.decode(ce)) |r| s.pipes.close(r);
+}
+
+/// Waits for the program to return; its exit code is the term. A process
+/// that a crash dropped is `.unknown`. Cancelable while it waits; as with
+/// std's own, a canceled wait still closes the parent's streams.
+fn childWait(userdata: ?*anyopaque, child: *std.process.Child) std.process.Child.WaitError!std.process.Child.Term {
+    const s = fromUserdata(userdata);
+    defer {
+        s.closeChildStreams(child);
+        child.id = null;
+    }
+    try s.cancelPoint();
+    const slot = s.procOf(child) orelse return .{ .unknown = 0 };
+    const task = s.procs[slot].task;
+    const t = &s.tasks[task];
+    while (t.state != .finished) {
+        t.awaiter = s.current;
+        s.block(.{ .await_task = task }, null, true);
+        s.cancelPoint() catch |err| {
+            t.awaiter = null;
+            return err;
+        };
+    }
+    var code: [1]u8 = undefined;
+    s.awaitTask(task, &code);
+    s.procs[slot].used = false;
+    s.record(.finish, s.procs[slot].task, 4, code[0], "process");
+    return .{ .exited = code[0] };
+}
+
+/// Cancels the program's task and waits for it: a program blocked in a
+/// pipe read or a sleep ends there; one that never reaches a cancelation
+/// point is waited for.
+fn childKill(userdata: ?*anyopaque, child: *std.process.Child) void {
+    const s = fromUserdata(userdata);
+    defer {
+        s.closeChildStreams(child);
+        child.id = null;
+    }
+    const slot = s.procOf(child) orelse return;
+    const task = s.procs[slot].task;
+    var code: [1]u8 = undefined;
+    s.requestCancel(task);
+    s.awaitTask(task, &code);
+    s.procs[slot].used = false;
+    s.record(.finish, task, 4, code[0], "process killed");
+}
+
+/// A read of a pipe; null while it would block.
+fn pipeRead(s: *Sim, op: Io.Operation.FileReadStreaming) ?Io.Operation.FileReadStreaming.Result {
+    const E = Io.Operation.FileReadStreaming.Error;
+    const v = handleValue(op.file.handle);
+    var total: usize = 0;
+    for (op.data) |d| total += d.len;
+    if (v == pipe_mod.null_value) return if (total > 0) error.EndOfStream else 0;
+    const r = s.pipes.decode(v) orelse return vfsError(E, error.InvalidHandle);
+    if (r.end != .read) return vfsError(E, error.NotOpenForReading);
+    switch (s.pipes.read(r.slot, op.data)) {
+        .data => |n| {
+            s.record(.read, v, 0, n, "pipe");
+            if (n > 0) {
+                s.secSync(.acquire, s.current, seam.pipeKey(r.slot));
+                s.netWakeAll();
+            }
+            return n;
+        },
+        .end => return error.EndOfStream,
+        .would_block => return null,
+    }
+}
+
+/// A write to a pipe; null while it is full.
+fn pipeWrite(s: *Sim, op: Io.Operation.FileWriteStreaming) ?Io.Operation.FileWriteStreaming.Result {
+    const E = Io.Operation.FileWriteStreaming.Error;
+    const v = handleValue(op.file.handle);
+    var total: usize = op.header.len;
+    if (op.data.len > 0) {
+        for (op.data[0 .. op.data.len - 1]) |d| total += d.len;
+        total += op.data[op.data.len - 1].len * op.splat;
+    }
+    if (v == pipe_mod.null_value) return total;
+    const r = s.pipes.decode(v) orelse return vfsError(E, error.InvalidHandle);
+    if (r.end != .write) return vfsError(E, error.NotOpenForWriting);
+    if (total == 0) return 0;
+    // Segment k: 0 = header, 1..data.len-1 = data[k-1], then `splat`
+    // copies of the last element.
+    const segments: usize = if (op.data.len == 0) 1 else op.data.len + op.splat;
+    var written: usize = 0;
+    var k: usize = 0;
+    while (k < segments) : (k += 1) {
+        const seg: []const u8 = if (k == 0) op.header else if (k < op.data.len) op.data[k - 1] else op.data[op.data.len - 1];
+        if (seg.len == 0) continue;
+        switch (s.pipes.write(r.slot, seg)) {
+            .written => |n| {
+                written += n;
+                if (n < seg.len) break;
+            },
+            .broken => {
+                if (written > 0) break;
+                return error.BrokenPipe;
+            },
+            .would_block => break,
+        }
+    }
+    if (written == 0) return null;
+    s.record(.write, v, 0, written, "pipe");
+    s.secSync(.release, s.current, seam.pipeKey(r.slot));
+    s.netWakeAll();
+    return written;
 }
 
 fn processReplace(userdata: ?*anyopaque, options: std.process.ReplaceOptions) std.process.ReplaceError {

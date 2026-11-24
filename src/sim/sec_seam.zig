@@ -62,7 +62,8 @@ pub const Capability = enum(u8) {
     net_connect,
     /// `listen` on a stream port or `bind` a datagram port.
     net_listen,
-    /// `std.process.spawn`, or `std.process.replace` (core runs neither).
+    /// `std.process.spawn` (a registered program, `Env.registerProgram`),
+    /// or `std.process.replace` (which core does not run).
     process_spawn,
 };
 
@@ -194,6 +195,14 @@ pub const TaskSync = enum(u8) {
 /// address a group or an atomic has.
 pub fn futureKey(id: usize) usize {
     return id * 2 + 1;
+}
+
+/// The `TaskSync` key of pipe `slot` (child processes): a write releases
+/// it and a read that takes bytes acquires it, so what the writer did
+/// before the write comes before what the reader does after. Odd, and
+/// beyond any task's `futureKey`.
+pub fn pipeKey(slot: usize) usize {
+    return (@as(usize, 1) << (@bitSizeOf(usize) - 2)) | (slot * 2 + 1);
 }
 
 /// What `campaign_end` is told.

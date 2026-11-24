@@ -61,7 +61,8 @@ ran, no run broke a property the test stated. It does not mean more.
 **What the tool does not see**
 
 - Code that does not go through `std.Io`: a C library doing its own I/O, a
-  direct system call, a child process, real threads. On Linux x86_64
+  direct system call, a child process the test did not register
+  (`Env.registerProgram`, revision 111), real threads. On Linux x86_64
   `Options.trap_syscalls` turns a stray system call into a failure, and
   `Options.mode = .syscalls` (revision 75) answers the file, clock, sleep
   and random-byte calls from the simulation; on other platforms nothing
