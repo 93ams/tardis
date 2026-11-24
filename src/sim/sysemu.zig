@@ -361,6 +361,12 @@ pub fn emulate(number: u64, a: *const [6]u64) ?u64 {
     const fd = resolve(s, raw);
     // Sockets, and any call on a socket descriptor (`sysnet.zig`).
     if ((number >= 41 and number <= 55) or number == 288) {
+        // A pair of sockets is two pipes (`sysfd.zig`).
+        if (number == 53) return sysfd.emulate(s, number, a);
+        if (number != 41 and sysfd.isFd(fd)) {
+            sysfd.touched(fd);
+            return sysfd.emulate(s, number, a);
+        }
         if (number != 41) sysfd.touched(fd);
         return sysnet.emulate(s, number, a);
     }

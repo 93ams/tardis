@@ -4,7 +4,8 @@
 //! `x86_64-unknown-linux-musl`: the standard library's threads, locks,
 //! channels, clock, files and sockets, and tokio's two runtimes (the
 //! work-stealing one with a worker count given and with the one it
-//! picks), an HTTP server and clients on hyper, a host name looked up.
+//! picks), an HTTP server and clients on hyper, a host name looked up,
+//! a pair of Unix-domain sockets.
 //! It knows
 //! nothing of TARDIS. System-call mode answers its system calls from the
 //! simulation, and its threads are simulated tasks.
@@ -203,6 +204,31 @@ test "rust: an HTTP server and three clients on hyper, on both of tokio's runtim
     if (skip()) return error.SkipZigTest;
     try tardis.check(testing.allocator, httpCurrent, options);
     try tardis.check(testing.allocator, httpTwoWorkers, options);
+}
+
+extern fn rust_unix_pair() c_int;
+extern fn rust_tokio_unix_pair(workers: usize) c_int;
+
+fn unixPair(env: *Env) !void {
+    _ = env;
+    try testing.expectEqual(@as(c_int, 0), rust_unix_pair());
+}
+
+fn tokioPairCurrent(env: *Env) !void {
+    _ = env;
+    try testing.expectEqual(@as(c_int, 0), rust_tokio_unix_pair(0));
+}
+
+fn tokioPairTwoWorkers(env: *Env) !void {
+    _ = env;
+    try testing.expectEqual(@as(c_int, 0), rust_tokio_unix_pair(2));
+}
+
+test "rust: UnixStream::pair, the standard library's between threads and tokio's between tasks" {
+    if (skip()) return error.SkipZigTest;
+    try tardis.check(testing.allocator, unixPair, options);
+    try tardis.check(testing.allocator, tokioPairCurrent, options);
+    try tardis.check(testing.allocator, tokioPairTwoWorkers, options);
 }
 
 extern fn rust_resolve() c_int;

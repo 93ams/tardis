@@ -119,6 +119,54 @@ pub extern "C" fn rust_files_kept() -> i32 {
     }
 }
 
+/// A pair of connected Unix-domain sockets (`socketpair`): a thread
+/// echoes on one end what the caller writes to the other, more than the
+/// pair holds, and stops when the caller shuts its writing down.
+#[no_mangle]
+pub extern "C" fn rust_unix_pair() -> i32 {
+    use std::os::unix::net::UnixStream;
+    let Ok((mut mine, mut theirs)) = UnixStream::pair() else { return 1 };
+    let echo = std::thread::spawn(move || -> usize {
+        let mut total = 0;
+        let mut buf = [0u8; 1000];
+        loop {
+            match theirs.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if theirs.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                    total += n;
+                }
+            }
+        }
+        total
+    });
+    let Ok(mut reader) = mine.try_clone() else { return 2 };
+    let read = std::thread::spawn(move || -> Option<Vec<u8>> {
+        let mut all = Vec::new();
+        reader.read_to_end(&mut all).ok()?;
+        Some(all)
+    });
+    let sent: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    if mine.write_all(&sent).is_err() {
+        return 3;
+    }
+    if mine.shutdown(std::net::Shutdown::Write).is_err() {
+        return 4;
+    }
+    if echo.join().unwrap_or(0) != sent.len() {
+        return 5;
+    }
+    match read.join() {
+        Ok(Some(all)) if all == sent => {}
+        _ => return 6,
+    }
+    // A read that times out is not answered: `SO_RCVTIMEO` is accepted
+    // and does nothing, so none is asked for here.
+    if mine.peer_addr().map(|a| a.is_unnamed()).unwrap_or(false) { 0 } else { 7 }
+}
+
 /// `try_clone` (a `dup`): one connection read by a thread and written by
 /// another, and one file under two handles that share a position.
 #[no_mangle]
@@ -371,6 +419,63 @@ mod with_tokio {
                 return 102;
             }
             rt.block_on(echo(3))
+        })
+        .join()
+        .unwrap_or(101)
+    }
+
+    /// Two tasks talk over tokio's `UnixStream::pair`: a question and an
+    /// answer forty times, then more than the pair holds, one way.
+    async fn pair_talk() -> i32 {
+        let Ok((mut a, mut b)) = tokio::net::UnixStream::pair() else { return 1 };
+        let other = tokio::spawn(async move {
+            let mut buf = [0u8; 32];
+            for i in 0..40u8 {
+                b.read_exact(&mut buf).await.ok()?;
+                if buf != [i; 32] {
+                    return None;
+                }
+                b.write_all(&[i.wrapping_mul(3); 8]).await.ok()?;
+            }
+            let mut all = Vec::new();
+            b.read_to_end(&mut all).await.ok()?;
+            Some(all.len())
+        });
+        for i in 0..40u8 {
+            if a.write_all(&[i; 32]).await.is_err() {
+                return 2;
+            }
+            let mut back = [0u8; 8];
+            if a.read_exact(&mut back).await.is_err() || back != [i.wrapping_mul(3); 8] {
+                return 3;
+            }
+            if i % 8 == 0 {
+                tokio::time::sleep(Duration::from_millis(3)).await;
+            }
+        }
+        if a.write_all(&vec![9u8; 250_000]).await.is_err() {
+            return 4;
+        }
+        if a.shutdown().await.is_err() {
+            return 5;
+        }
+        match other.await {
+            Ok(Some(250_000)) => 0,
+            _ => 6,
+        }
+    }
+
+    /// `pair_talk` on tokio's single-threaded runtime (`workers` 0) or
+    /// its work-stealing one.
+    #[no_mangle]
+    pub extern "C" fn rust_tokio_unix_pair(workers: usize) -> i32 {
+        std::thread::spawn(move || {
+            let mut builder = if workers == 0 { tokio::runtime::Builder::new_current_thread() } else { tokio::runtime::Builder::new_multi_thread() };
+            if workers > 0 {
+                builder.worker_threads(workers);
+            }
+            let Ok(rt) = builder.enable_all().rng_seed(seed()).build() else { return 100 };
+            rt.block_on(pair_talk())
         })
         .join()
         .unwrap_or(101)

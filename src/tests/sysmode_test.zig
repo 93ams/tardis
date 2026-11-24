@@ -1949,9 +1949,13 @@ fn descriptorsAndCrash(env: *Env) !void {
     const p = try pipe2(0);
     const ev = try ok(sys(.eventfd2, 1, 0, 0, 0));
     const ep = try ok(sys(.epoll_create1, 0, 0, 0, 0));
+    const pair = try socketPair(0);
+    _ = try ok(sys(.write, pair[0], @intFromPtr("lost"), 4, 0));
     try env.crashAndReboot(.power_loss);
     // The process is gone, and its descriptors with it.
     var buf: [8]u8 = undefined;
+    try testing.expectEqual(errOf(.BADF), sys(.read, pair[1], @intFromPtr(&buf), 8, 0));
+    try testing.expectEqual(errOf(.BADF), sys(.write, pair[0], @intFromPtr(&buf), 8, 0));
     try testing.expectEqual(errOf(.BADF), sys(.read, fdu(p[0]), @intFromPtr(&buf), 8, 0));
     try testing.expectEqual(errOf(.BADF), sys(.write, fdu(p[1]), @intFromPtr(&buf), 8, 0));
     try testing.expectEqual(errOf(.BADF), sys(.read, ev, @intFromPtr(&buf), 8, 0));
@@ -1960,11 +1964,263 @@ fn descriptorsAndCrash(env: *Env) !void {
     const q = try pipe2(0);
     _ = try ok(sys(.write, fdu(q[1]), @intFromPtr("z"), 1, 0));
     try testing.expectEqual(@as(usize, 1), try ok(sys(.read, fdu(q[0]), @intFromPtr(&buf), 8, 0)));
+    // A new pair starts empty: nothing of the old one is in it.
+    const fresh = try socketPair(o_nonblock);
+    try testing.expectEqual(@as(isize, eagain), sys(.read, fresh[1], @intFromPtr(&buf), 8, 0));
 }
 
 test "system-call mode: pipes, eventfds and epoll sets do not outlive a crash" {
     if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
     try tardis.check(gpa, descriptorsAndCrash, .{ .iterations = 10, .mode = .syscalls });
+}
+
+// --- a pair of sockets (revision 118, `sysfd.zig`) -----------------------------------
+
+const pollhup = 0x10;
+const pollrdhup = 0x2000;
+
+fn socketPair(flags: usize) ![2]usize {
+    var fds: [2]i32 = undefined;
+    _ = try ok(sys(.socketpair, 1, 1 | flags, 0, @intFromPtr(&fds))); // AF_UNIX, SOCK_STREAM
+    return .{ fdu(fds[0]), fdu(fds[1]) };
+}
+
+/// What `poll` says of `fd` now, of everything it could say.
+fn pollNow(fd: usize) !i16 {
+    var p: PollFd = .{ .fd = @intCast(fd), .events = pollin | pollout | pollrdhup, .revents = 0 };
+    _ = try ok(sys(.poll, @intFromPtr(&p), 1, 0, 0));
+    return p.revents;
+}
+
+fn socketPairs(env: *Env) !void {
+    const pair = try socketPair(0);
+    const a = pair[0];
+    const b = pair[1];
+    var buf: [4096]u8 = undefined;
+
+    // Each end reads what the other wrote, and neither its own.
+    _ = try ok(sys(.write, a, @intFromPtr("to b"), 4, 0));
+    _ = try ok(sys6(.sendto, b, @intFromPtr("to a!"), 5, 0x4000, 0, 0)); // MSG_NOSIGNAL
+    try testing.expectEqual(@as(usize, 5), try ok(sys(.read, a, @intFromPtr(&buf), buf.len, 0)));
+    try testing.expectEqualStrings("to a!", buf[0..5]);
+    // A look leaves the bytes; a read takes them.
+    try testing.expectEqual(@as(usize, 2), try ok(sys6(.recvfrom, b, @intFromPtr(&buf), 2, 2, 0, 0))); // MSG_PEEK
+    try testing.expectEqualStrings("to", buf[0..2]);
+    var pending: i32 = 0;
+    _ = try ok(sys(.ioctl, b, 0x541B, @intFromPtr(&pending), 0)); // FIONREAD
+    try testing.expectEqual(@as(i32, 4), pending);
+    var name: [16]u8 = @splat(0xAA);
+    var name_len: u32 = name.len;
+    try testing.expectEqual(@as(usize, 4), try ok(sys6(.recvfrom, b, @intFromPtr(&buf), buf.len, 0, @intFromPtr(&name), @intFromPtr(&name_len))));
+    try testing.expectEqualStrings("to b", buf[0..4]);
+    try testing.expectEqual(@as(u32, 0), name_len);
+
+    // It is a socket of the Unix domain, a stream, with no name.
+    var st: [144]u8 = undefined;
+    _ = try ok(sys(.fstat, a, @intFromPtr(&st), 0, 0));
+    try testing.expectEqual(@as(u32, 0o140000), std.mem.readInt(u32, st[24..28], .little) & 0o170000);
+    var value: i32 = -1;
+    var value_len: u32 = 4;
+    _ = try ok(sys6(.getsockopt, a, 1, 3, @intFromPtr(&value), @intFromPtr(&value_len), 0)); // SO_TYPE
+    try testing.expectEqual(@as(i32, 1), value);
+    _ = try ok(sys6(.getsockopt, a, 1, 4, @intFromPtr(&value), @intFromPtr(&value_len), 0)); // SO_ERROR
+    try testing.expectEqual(@as(i32, 0), value);
+    name_len = name.len;
+    _ = try ok(sys(.getpeername, a, @intFromPtr(&name), @intFromPtr(&name_len), 0));
+    try testing.expectEqual(@as(u32, 2), name_len);
+    try testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, name[0..2], .little));
+    try testing.expectEqual(errOf(.SPIPE), sys(.lseek, a, 0, 0, 0));
+    // A pipe is not a socket.
+    const p = try pipe2(0);
+    try testing.expectEqual(errOf(.NOTSOCK), sys(.shutdown, fdu(p[0]), 1, 0, 0));
+    _ = try ok(sys(.close, fdu(p[0]), 0, 0, 0));
+    _ = try ok(sys(.close, fdu(p[1]), 0, 0, 0));
+
+    // Nothing to read: a reader waits until the other end writes, and a
+    // call that was told not to wait says so.
+    try testing.expectEqual(@as(isize, eagain), sys6(.recvfrom, a, @intFromPtr(&buf), buf.len, 0x40 | 0x4000, 0, 0)); // MSG_DONTWAIT
+    try testing.expectEqual(@as(i16, pollout), try pollNow(a));
+    var other = try env.io.concurrent(writesLater, .{b});
+    const before = try monotonicNs();
+    try testing.expectEqual(@as(usize, 4), try ok(sys(.read, a, @intFromPtr(&buf), buf.len, 0)));
+    try testing.expectEqualStrings("late", buf[0..4]);
+    try testing.expect(try monotonicNs() - before >= 3 * std.time.ns_per_ms);
+    other.await(env.io);
+
+    // Non-blocking and full: a write takes what there is room for (no
+    // all-or-nothing rule, unlike a pipe's), then says it would wait. The
+    // end is writable again when the reader has made room.
+    _ = try ok(sys(.fcntl, a, 4, o_rdwr | o_nonblock, 0));
+    var block: [4096]u8 = undefined;
+    for (&block, 0..) |*x, i| x.* = @truncate(i *% 37);
+    var filled: usize = 0;
+    while (true) {
+        const rc = sys(.write, a, @intFromPtr(&block), 4000, 0);
+        if (rc == eagain) break;
+        filled += try ok(rc);
+    }
+    try testing.expectEqual(@as(usize, 65536), filled);
+    try testing.expectEqual(@as(i16, 0), try pollNow(a));
+    // That is at a quarter in use, as on Linux, and not a byte before.
+    var read_back: usize = 0;
+    const quarter = 65536 / 4;
+    while (read_back < filled) {
+        const stop: usize = if (read_back < filled - quarter - 1) filled - quarter - 1 else if (read_back == filled - quarter - 1) filled - quarter else filled;
+        const n = try ok(sys(.read, b, @intFromPtr(&buf), @min(buf.len, stop - read_back), 0));
+        for (buf[0..n], read_back..) |x, i| try testing.expectEqual(block[i % 4000], x);
+        read_back += n;
+        if (read_back == filled - quarter - 1) try testing.expectEqual(@as(i16, 0), try pollNow(a));
+        if (read_back == filled - quarter) try testing.expectEqual(@as(i16, pollout), try pollNow(a));
+    }
+
+    // One end stops writing: the other reads what was sent and then the
+    // end, and can still answer.
+    _ = try ok(sys(.write, a, @intFromPtr("last"), 4, 0));
+    _ = try ok(sys(.shutdown, a, 1, 0, 0)); // SHUT_WR
+    try testing.expectEqual(@as(isize, epipe), sys(.write, a, @intFromPtr("x"), 1, 0));
+    try testing.expectEqual(@as(i16, pollin | pollout | pollrdhup), try pollNow(b));
+    try testing.expectEqual(@as(usize, 4), try ok(sys(.read, b, @intFromPtr(&buf), buf.len, 0)));
+    try testing.expectEqual(@as(usize, 0), try ok(sys(.read, b, @intFromPtr(&buf), buf.len, 0)));
+    _ = try ok(sys(.write, b, @intFromPtr("answer"), 6, 0));
+    try testing.expectEqual(@as(usize, 6), try ok(sys(.read, a, @intFromPtr(&buf), buf.len, 0)));
+
+    // One end closes: the other reads the end and cannot write, and is
+    // told so by `poll`.
+    _ = try ok(sys(.close, b, 0, 0, 0));
+    const revents = try pollNow(a);
+    try testing.expect(revents & pollhup != 0 and revents & pollin != 0);
+    try testing.expectEqual(@as(usize, 0), try ok(sys(.read, a, @intFromPtr(&buf), buf.len, 0)));
+    try testing.expectEqual(@as(isize, epipe), sys(.write, a, @intFromPtr("x"), 1, 0));
+    _ = try ok(sys(.close, a, 0, 0, 0));
+    try testing.expectEqual(errOf(.BADF), sys(.read, a, @intFromPtr(&buf), 1, 0));
+
+    // A duplicate keeps its end open: the other end sees no close until
+    // the last is gone.
+    const again = try socketPair(o_nonblock);
+    const dup = try ok(sys(.dup, again[0], 0, 0, 0));
+    _ = try ok(sys(.close, again[0], 0, 0, 0));
+    try testing.expectEqual(@as(isize, eagain), sys(.read, again[1], @intFromPtr(&buf), buf.len, 0));
+    _ = try ok(sys(.write, dup, @intFromPtr("dup"), 3, 0));
+    try testing.expectEqual(@as(usize, 3), try ok(sys(.read, again[1], @intFromPtr(&buf), buf.len, 0)));
+    _ = try ok(sys(.close, dup, 0, 0, 0));
+    try testing.expectEqual(@as(usize, 0), try ok(sys(.read, again[1], @intFromPtr(&buf), buf.len, 0)));
+    _ = try ok(sys(.close, again[1], 0, 0, 0));
+
+    // One end stops reading: what was already sent is read, then the end;
+    // the other end cannot write, and this one still can.
+    const third = try socketPair(0);
+    const iov = [_]Iovec2{ .{ .base = @intFromPtr("ke"), .len = 2 }, .{ .base = @intFromPtr("pt"), .len = 2 } };
+    try testing.expectEqual(@as(usize, 4), try ok(sys(.writev, third[1], @intFromPtr(&iov), 2, 0)));
+    _ = try ok(sys(.shutdown, third[0], 0, 0, 0)); // SHUT_RD
+    var parts: [2][3]u8 = undefined;
+    const into = [_]Iovec2{ .{ .base = @intFromPtr(&parts[0]), .len = 3 }, .{ .base = @intFromPtr(&parts[1]), .len = 3 } };
+    try testing.expectEqual(@as(usize, 4), try ok(sys(.readv, third[0], @intFromPtr(&into), 2, 0)));
+    try testing.expectEqualStrings("kep", &parts[0]);
+    try testing.expectEqual(@as(u8, 't'), parts[1][0]);
+    try testing.expectEqual(@as(usize, 0), try ok(sys(.read, third[0], @intFromPtr(&buf), buf.len, 0)));
+    try testing.expectEqual(@as(isize, epipe), sys(.write, third[1], @intFromPtr("x"), 1, 0));
+    _ = try ok(sys(.write, third[0], @intFromPtr("ok"), 2, 0));
+    try testing.expectEqual(@as(usize, 2), try ok(sys(.read, third[1], @intFromPtr(&buf), buf.len, 0)));
+    // Both ways at once, from the other end.
+    _ = try ok(sys(.shutdown, third[1], 2, 0, 0)); // SHUT_RDWR
+    try testing.expectEqual(@as(isize, epipe), sys(.write, third[0], @intFromPtr("x"), 1, 0));
+    try testing.expectEqual(@as(usize, 0), try ok(sys(.read, third[1], @intFromPtr(&buf), buf.len, 0)));
+    try testing.expect(try pollNow(third[0]) & pollhup != 0);
+    try testing.expectEqual(errOf(.INVAL), sys(.shutdown, third[0], 3, 0, 0));
+    _ = try ok(sys(.close, third[0], 0, 0, 0));
+    _ = try ok(sys(.close, third[1], 0, 0, 0));
+
+    // The Internet family has no pairs, on Linux either.
+    var fds: [2]i32 = undefined;
+    try testing.expectEqual(errOf(.OPNOTSUPP), sys(.socketpair, 2, 1, 0, @intFromPtr(&fds)));
+}
+
+test "system-call mode: a pair of sockets carries bytes both ways, and each end sees the other shut down and close" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, socketPairs, .{ .iterations = 20, .mode = .syscalls });
+}
+
+/// Echoes what it reads on `fd` until the other end stops writing.
+fn pairEcho(fd: usize) void {
+    var buf: [512]u8 = undefined;
+    while (true) {
+        const n = sys(.read, fd, @intFromPtr(&buf), buf.len, 0);
+        if (n <= 0) break;
+        var sent: usize = 0;
+        while (sent < @as(usize, @intCast(n))) {
+            const rc = sys(.write, fd, @intFromPtr(&buf) + sent, @as(usize, @intCast(n)) - sent, 0);
+            if (rc <= 0) return;
+            sent += @intCast(rc);
+        }
+    }
+    _ = sys(.shutdown, fd, 1, 0, 0);
+}
+
+/// An event loop's side of a pair: edge-triggered, non-blocking, with
+/// more to send than the pair holds.
+fn pairInEpoll(env: *Env) !void {
+    const pair = try socketPair(o_nonblock);
+    const mine = pair[0];
+    _ = try ok(sys(.fcntl, pair[1], 4, o_rdwr, 0));
+    var echo = try env.io.concurrent(pairEcho, .{pair[1]});
+    const ep = try ok(sys(.epoll_create1, 0, 0, 0, 0));
+    try testing.expectEqual(@as(isize, 0), epollAdd(ep, 1, mine, epollin | epollout | pollrdhup | epollet, 7));
+
+    // Not on the task's stack: it is smaller than this.
+    const memory = try std.heap.page_allocator.alloc(u8, 400_000);
+    defer std.heap.page_allocator.free(memory);
+    const out = memory[0..200_000];
+    const back = memory[200_000..];
+    for (out, 0..) |*x, i| x.* = @truncate(i *% 131 +% i / 251);
+    var sent: usize = 0;
+    var got: usize = 0;
+    var ended = false;
+    var events: [4]EpollEvent = undefined;
+    var rounds: usize = 0;
+    while (!ended) : (rounds += 1) {
+        try testing.expect(rounds < 10_000);
+        const n = try epollWait(ep, &events, -1);
+        try testing.expectEqual(@as(usize, 1), n);
+        try testing.expectEqual(@as(u64, 7), events[0].data);
+        // Until each would wait: an edge is not given twice.
+        while (sent < out.len) {
+            const rc = sys(.write, mine, @intFromPtr(out.ptr) + sent, out.len - sent, 0);
+            if (rc == eagain) break;
+            sent += try ok(rc);
+            if (sent == out.len) _ = try ok(sys(.shutdown, mine, 1, 0, 0));
+        }
+        while (true) {
+            const rc = sys(.read, mine, @intFromPtr(back.ptr) + got, back.len - got, 0);
+            if (rc == eagain) break;
+            if (try ok(rc) == 0) {
+                ended = true;
+                break;
+            }
+            got += @intCast(rc);
+        }
+    }
+    try testing.expectEqual(out.len, got);
+    try testing.expectEqualSlices(u8, out, back);
+    echo.await(env.io);
+    _ = try ok(sys(.close, mine, 0, 0, 0));
+    _ = try ok(sys(.close, pair[1], 0, 0, 0));
+    _ = try ok(sys(.close, ep, 0, 0, 0));
+}
+
+test "system-call mode: an edge-triggered epoll loop sends more through a pair of sockets than it holds and reads it all back" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, pairInEpoll, .{ .iterations = 30, .mode = .syscalls });
+}
+
+fn pairsOfDatagrams(env: *Env) !void {
+    _ = env;
+    var fds: [2]i32 = undefined;
+    _ = sys(.socketpair, 1, 2, 0, @intFromPtr(&fds)); // SOCK_DGRAM: not emulated
+}
+
+test "system-call mode: a pair of datagram sockets is still a stray call" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try testing.expectError(error.StraySyscall, tardis.check(gpa, pairsOfDatagrams, .{ .iterations = 1, .mode = .syscalls, .report = false, .shrink = false }));
 }
 
 // --- threads (revision 97, `systhread.zig`) -----------------------------------------

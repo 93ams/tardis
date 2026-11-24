@@ -20,12 +20,26 @@
 //!   signals are not modelled).
 //! - `eventfd`, `eventfd2` (`EFD_SEMAPHORE`, `EFD_NONBLOCK`,
 //!   `EFD_CLOEXEC`).
+//! - `socketpair` of the Unix domain, `SOCK_STREAM` (`SOCK_NONBLOCK`,
+//!   `SOCK_CLOEXEC`): two descriptors, each of which reads what was
+//!   written to the other. It is two pipes, one each way, of 64 KiB
+//!   (Linux's holds about 208 KiB), with no all-or-nothing rule. On it,
+//!   beside what is listed below: `recvfrom` (`MSG_DONTWAIT`, `MSG_PEEK`),
+//!   `sendto` (`MSG_DONTWAIT`, `MSG_NOSIGNAL`), `shutdown`, `getsockname`
+//!   and `getpeername` (unnamed), `setsockopt` (accepted, changes
+//!   nothing) and `getsockopt` for `SO_ERROR`, `SO_TYPE`, `SO_DOMAIN`,
+//!   `SO_SNDBUF`, `SO_RCVBUF`. Divergences: closing an end with unread
+//!   bytes does not give the other end `ECONNRESET`; a timeout set with
+//!   `SO_RCVTIMEO` or `SO_SNDTIMEO` never expires; no `SIGPIPE` is
+//!   raised; and a task that writes more than 64 KiB before anyone reads
+//!   waits here where on Linux it would wait only past about 208 KiB.
 //! - `epoll_create`, `epoll_create1`, `epoll_ctl`, `epoll_wait`,
-//!   `epoll_pwait`, `epoll_pwait2`, over sockets, pipes and eventfds,
+//!   `epoll_pwait`, `epoll_pwait2`, over sockets, pipes, pairs and eventfds,
 //!   level-triggered, edge-triggered (`EPOLLET`) and `EPOLLONESHOT`.
 //! - On these descriptors: `read`, `write`, `readv`, `writev`, `close`,
 //!   `fstat` (the kind only), `fcntl` for the flags, `ioctl` `FIONBIO`
-//!   and, for a pipe, `FIONREAD`.
+//!   and, for a pipe or a pair, `FIONREAD`. On a pipe, an eventfd or
+//!   an epoll set the calls a pair has beside these fail with `ENOTSOCK`.
 //! - `dup` and `fcntl` `F_DUPFD`, `F_DUPFD_CLOEXEC` of one of these (mio
 //!   and so tokio duplicate their epoll descriptor): a second descriptor
 //!   for the same pipe end, counter or epoll set, which lives until the
@@ -49,7 +63,10 @@
 //! Every call here is a point where the scheduler may switch tasks, as
 //! every simulated operation is.
 //!
-//! Not emulated (stray): an epoll descriptor inside an epoll set or a
+//! Not emulated (stray): a pair of datagram or `SOCK_SEQPACKET` sockets;
+//! `sendmsg` and `recvmsg` on a pair, so no descriptor or credential is
+//! passed through one, and `SO_PEERCRED`; an epoll descriptor inside an
+//! epoll set or a
 //! `poll`; a regular file in an epoll set fails with `EPERM`, as on Linux;
 //! `O_DIRECT` pipes; `splice`, `tee`, `F_SETPIPE_SZ`; `dup2` and `dup3`
 //! (the program chooses the number), and `dup` of a socket or a file.
@@ -69,7 +86,7 @@ const E = linux.E;
 /// The first descriptor.
 pub const fd_base: i32 = 0x1000_0000;
 const slots_max = 128;
-const pipes_max = 32;
+const pipes_max = 64;
 const epolls_max = 8;
 const interest_max = 64;
 
@@ -77,7 +94,7 @@ pub const pipe_bytes = 65536;
 /// POSIX `PIPE_BUF`: a write of up to this many bytes is not split.
 const pipe_atomic_bytes = 4096;
 
-const Kind = enum { free, pipe_read, pipe_write, eventfd, epoll };
+const Kind = enum { free, pipe_read, pipe_write, pair, eventfd, epoll };
 
 const Slot = struct {
     kind: Kind = .free,
@@ -86,8 +103,11 @@ const Slot = struct {
     nonblock: bool = false,
     /// `EFD_SEMAPHORE`: a read takes 1.
     semaphore: bool = false,
-    /// Index into `pipes`, `counters` or `epolls`.
+    /// Index into `pipes`, `counters` or `epolls`. For one of a pair of
+    /// sockets, the pipe it reads.
     object: u8 = 0,
+    /// For one of a pair of sockets: the pipe it writes.
+    out: u8 = 0,
     /// The open file description: shared by a descriptor and its
     /// duplicates, which share `O_NONBLOCK` too.
     description: u32 = 0,
@@ -102,6 +122,9 @@ const Pipe = struct {
     len: u32 = 0,
     readers: u8 = 0,
     writers: u8 = 0,
+    /// `shutdown` on a pair of sockets, by either end: nothing more is
+    /// written to it, and a read of it when empty returns 0.
+    shut: bool = false,
 };
 
 /// An eventfd's counter, and how many descriptors it has.
@@ -214,6 +237,14 @@ fn release(index: usize) void {
             p.writers -= 1;
             if (p.readers == 0 and p.writers == 0) p.* = .{};
         },
+        .pair => {
+            const in = &pipes[slot.object];
+            in.readers -= 1;
+            if (in.readers == 0 and in.writers == 0) in.* = .{};
+            const out = &pipes[slot.out];
+            out.writers -= 1;
+            if (out.readers == 0 and out.writers == 0) out.* = .{};
+        },
         .eventfd => {
             const c = &counters[slot.object];
             c.holders -= 1;
@@ -252,7 +283,12 @@ pub fn forget(fd: i32) void {
 fn touchedPipe(index: usize) void {
     if (epoll_count == 0) return;
     for (&slots, 0..) |*slot, i| {
-        if ((slot.kind == .pipe_read or slot.kind == .pipe_write) and slot.object == index) touched(fdOf(i));
+        const on_it = switch (slot.kind) {
+            .pipe_read, .pipe_write => slot.object == index,
+            .pair => slot.object == index or slot.out == index,
+            else => false,
+        };
+        if (on_it) touched(fdOf(i));
     }
 }
 
@@ -305,6 +341,7 @@ pub fn emulate(s: *Sim, number: u64, a: *const [6]u64) ?u64 {
         290 => return eventfd(s, a[0], @truncate(a[1])),
         213 => return if (@as(i32, @bitCast(@as(u32, @truncate(a[0])))) <= 0) fail(.INVAL) else epollCreate(s, 0),
         291 => return epollCreate(s, @truncate(a[0])),
+        53 => return socketpair(s, @truncate(a[0]), @truncate(a[1]), @truncate(a[2]), a[3]),
         else => {},
     }
     const fd: i32 = @bitCast(@as(u32, @truncate(a[0])));
@@ -326,6 +363,7 @@ pub fn emulate(s: *Sim, number: u64, a: *const [6]u64) ?u64 {
         },
         0 => read(s, slot, userBytes(a[1], a[2]) orelse return fail(.FAULT)),
         1 => write(s, slot, userBytes(a[1], a[2]) orelse return fail(.FAULT)),
+        44, 45, 48, 51, 52, 54, 55 => if (slot.kind == .pair) onSocket(s, slot, number, a) else fail(.NOTSOCK),
         19 => vectors(s, slot, a[1], a[2], .read),
         20 => vectors(s, slot, a[1], a[2], .write),
         3 => blk: {
@@ -358,12 +396,18 @@ fn pipeBytes(index: usize) ?[]u8 {
     return pipe_buffers.?[index * pipe_bytes ..][0..pipe_bytes];
 }
 
+/// The first pipe not in use, from `from` on.
+fn freePipe(from: usize) ?usize {
+    for (pipes[from..], from..) |*p, i| {
+        if (!p.used) return i;
+    }
+    return null;
+}
+
 fn pipe(s: *Sim, out_ptr: u64, flags: u32) ?u64 {
     if (flags & ~@as(u32, o_nonblock | o_cloexec) != 0) return null; // `O_DIRECT`: packets
     if (out_ptr == 0) return fail(.FAULT);
-    const index = for (&pipes, 0..) |*p, i| {
-        if (!p.used) break i;
-    } else return fail(.MFILE);
+    const index = freePipe(0) orelse return fail(.MFILE);
     _ = pipeBytes(index) orelse return fail(.NFILE);
     const r = take(s, .pipe_read) orelse return fail(.MFILE);
     const w = take(s, .pipe_write) orelse {
@@ -380,14 +424,21 @@ fn pipe(s: *Sim, out_ptr: u64, flags: u32) ?u64 {
     return 0;
 }
 
-fn pipeRead(s: *Sim, slot: *Slot, buf: []u8) u64 {
+const ReadHow = struct {
+    /// `MSG_DONTWAIT`: this call does not wait, whatever the descriptor's flag.
+    dontwait: bool = false,
+    /// `MSG_PEEK`: the bytes stay.
+    peek: bool = false,
+};
+
+fn pipeRead(s: *Sim, slot: *Slot, buf: []u8, how: ReadHow) u64 {
     if (buf.len == 0) return 0;
     const index = slot.object;
     const gen = slot.gen;
     const p = &pipes[index];
     while (p.len == 0) {
-        if (p.writers == 0) return 0;
-        if (slot.nonblock) return fail(.AGAIN);
+        if (p.writers == 0 or p.shut) return 0;
+        if (slot.nonblock or how.dontwait) return fail(.AGAIN);
         if (!wait(s)) return fail(.INTR);
         // Closed by another task while this one waited.
         if (slot.gen != gen) return fail(.BADF);
@@ -397,6 +448,7 @@ fn pipeRead(s: *Sim, slot: *Slot, buf: []u8) u64 {
     const first = @min(n, pipe_bytes - p.head);
     @memcpy(buf[0..first], bytes[p.head..][0..first]);
     @memcpy(buf[first..n], bytes[0 .. n - first]);
+    if (how.peek) return n;
     p.head = (p.head + n) % pipe_bytes;
     p.len -= n;
     touchedPipe(index);
@@ -404,20 +456,21 @@ fn pipeRead(s: *Sim, slot: *Slot, buf: []u8) u64 {
     return n;
 }
 
-fn pipeWrite(s: *Sim, slot: *Slot, buf: []const u8) u64 {
+/// Writes to the pipe `index`: the slot's own, or for one of a pair of
+/// sockets the one it writes. `atomic`: a pipe's rule for a small write.
+fn pipeWrite(s: *Sim, slot: *Slot, index: usize, buf: []const u8, atomic: bool, dontwait: bool) u64 {
     if (buf.len == 0) return 0;
-    const index = slot.object;
     const gen = slot.gen;
     const p = &pipes[index];
     const bytes = pipeBytes(index).?;
     var done: usize = 0;
     while (done < buf.len) {
-        if (p.readers == 0) return if (done > 0) done else fail(.PIPE);
+        if (p.readers == 0 or p.shut) return if (done > 0) done else fail(.PIPE);
         const room = pipe_bytes - p.len;
         // A small write is not split: it waits for room for all of it.
-        const need: usize = if (buf.len <= pipe_atomic_bytes) buf.len else 1;
+        const need: usize = if (atomic and buf.len <= pipe_atomic_bytes) buf.len else 1;
         if (room < need) {
-            if (slot.nonblock) return if (done > 0) done else fail(.AGAIN);
+            if (slot.nonblock or dontwait) return if (done > 0) done else fail(.AGAIN);
             if (!wait(s)) return if (done > 0) done else fail(.INTR);
             if (slot.gen != gen) return if (done > 0) done else fail(.BADF);
             continue;
@@ -433,6 +486,110 @@ fn pipeWrite(s: *Sim, slot: *Slot, buf: []const u8) u64 {
         s.wakeNetwork();
     }
     return done;
+}
+
+// --- a pair of sockets ----------------------------------------------------------
+
+const af_unix = 1;
+const af_inet = 2;
+const af_inet6 = 10;
+const af_netlink = 16;
+const sock_stream = 1;
+const msg_peek = 0x2;
+const msg_dontwait = 0x40;
+const msg_nosignal = 0x4000;
+
+fn socketpair(s: *Sim, domain: u32, type_and_flags: u32, protocol: u32, out_ptr: u64) ?u64 {
+    switch (domain) {
+        af_unix => {},
+        // As Linux: these families have no pairs. (The last two are not
+        // here at all: `sysnet.socket`.)
+        af_inet => return fail(.OPNOTSUPP),
+        af_inet6, af_netlink => return fail(.AFNOSUPPORT),
+        else => return null,
+    }
+    if (type_and_flags & ~@as(u32, o_nonblock | o_cloexec) != sock_stream) return null; // datagrams, packets
+    if (protocol != 0 and protocol != af_unix) return fail(.PROTONOSUPPORT);
+    if (out_ptr == 0) return fail(.FAULT);
+    const first = freePipe(0) orelse return fail(.MFILE);
+    const second = freePipe(first + 1) orelse return fail(.MFILE);
+    _ = pipeBytes(second) orelse return fail(.NFILE);
+    const a = take(s, .pair) orelse return fail(.MFILE);
+    const b = take(s, .pair) orelse {
+        slots[a] = .{};
+        return fail(.MFILE);
+    };
+    pipes[first] = .{ .used = true, .readers = 1, .writers = 1 };
+    pipes[second] = .{ .used = true, .readers = 1, .writers = 1 };
+    slots[a].object = @intCast(first);
+    slots[a].out = @intCast(second);
+    slots[b].object = @intCast(second);
+    slots[b].out = @intCast(first);
+    for ([2]usize{ a, b }) |i| slots[i].nonblock = type_and_flags & o_nonblock != 0;
+    const out: *align(1) [2]i32 = @ptrFromInt(out_ptr);
+    out.* = .{ fdOf(a), fdOf(b) };
+    return 0;
+}
+
+/// The calls only a socket has, on one of a pair.
+fn onSocket(s: *Sim, slot: *Slot, number: u64, a: *const [6]u64) ?u64 {
+    switch (number) {
+        44 => { // sendto
+            const flags: u32 = @truncate(a[3]);
+            if (flags & ~@as(u32, msg_dontwait | msg_nosignal) != 0) return null; // out-of-band, more
+            if (a[4] != 0) return fail(.ISCONN);
+            const buf = userBytes(a[1], a[2]) orelse return fail(.FAULT);
+            return pipeWrite(s, slot, slot.out, buf, false, flags & msg_dontwait != 0);
+        },
+        45 => { // recvfrom
+            const flags: u32 = @truncate(a[3]);
+            if (flags & ~@as(u32, msg_dontwait | msg_peek | msg_nosignal) != 0) return null; // wait for all, truncate
+            const buf = userBytes(a[1], a[2]) orelse return fail(.FAULT);
+            const rc = pipeRead(s, slot, buf, .{ .dontwait = flags & msg_dontwait != 0, .peek = flags & msg_peek != 0 });
+            // The sender has no name.
+            if (@as(i64, @bitCast(rc)) >= 0 and a[4] != 0 and a[5] != 0) @as(*align(1) u32, @ptrFromInt(a[5])).* = 0;
+            return rc;
+        },
+        48 => { // shutdown: 0 the reading, 1 the writing, 2 both
+            if (a[1] > 2) return fail(.INVAL);
+            if (a[1] != 1) pipes[slot.object].shut = true;
+            if (a[1] != 0) pipes[slot.out].shut = true;
+            touchedPipe(slot.object);
+            touchedPipe(slot.out);
+            s.wakeNetwork();
+            return 0;
+        },
+        51, 52 => { // getsockname, getpeername: a family and no name
+            if (a[1] == 0 or a[2] == 0) return fail(.FAULT);
+            const len: *align(1) u32 = @ptrFromInt(a[2]);
+            if (@as(i32, @bitCast(len.*)) < 0) return fail(.INVAL);
+            const family = std.mem.toBytes(@as(u16, af_unix));
+            const n = @min(len.*, family.len);
+            @memcpy(@as([*]u8, @ptrFromInt(a[1]))[0..n], family[0..n]);
+            len.* = family.len;
+            return 0;
+        },
+        54 => return 0, // setsockopt: accepted, changes nothing
+        55 => { // getsockopt
+            if (a[1] != 1) return fail(.OPNOTSUPP); // not SOL_SOCKET
+            const value: i32 = switch (a[2]) {
+                4 => 0, // SO_ERROR
+                3 => sock_stream, // SO_TYPE
+                39 => af_unix, // SO_DOMAIN
+                7, 8 => pipe_bytes, // SO_SNDBUF, SO_RCVBUF
+                else => return null,
+            };
+            if (a[3] == 0 or a[4] == 0) return fail(.FAULT);
+            const len: *align(1) u32 = @ptrFromInt(a[4]);
+            if (@as(i32, @bitCast(len.*)) < 0) return fail(.INVAL);
+            const bytes = std.mem.toBytes(value);
+            const n = @min(len.*, bytes.len);
+            @memcpy(@as([*]u8, @ptrFromInt(a[3]))[0..n], bytes[0..n]);
+            len.* = n;
+            return 0;
+        },
+        else => unreachable,
+    }
 }
 
 // --- eventfd --------------------------------------------------------------------
@@ -491,7 +648,8 @@ fn eventWrite(s: *Sim, slot: *Slot, buf: []const u8) u64 {
 
 fn read(s: *Sim, slot: *Slot, buf: []u8) u64 {
     return switch (slot.kind) {
-        .pipe_read => pipeRead(s, slot, buf),
+        .pipe_read => pipeRead(s, slot, buf, .{}),
+        .pair => pipeRead(s, slot, buf, .{}),
         .eventfd => eventRead(s, slot, buf),
         .pipe_write => fail(.BADF),
         .epoll => fail(.INVAL),
@@ -501,7 +659,8 @@ fn read(s: *Sim, slot: *Slot, buf: []u8) u64 {
 
 fn write(s: *Sim, slot: *Slot, buf: []const u8) u64 {
     return switch (slot.kind) {
-        .pipe_write => pipeWrite(s, slot, buf),
+        .pipe_write => pipeWrite(s, slot, slot.object, buf, true, false),
+        .pair => pipeWrite(s, slot, slot.out, buf, false, false),
         .eventfd => eventWrite(s, slot, buf),
         .pipe_read => fail(.BADF),
         .epoll => fail(.INVAL),
@@ -560,6 +719,7 @@ fn fstat(slot: *const Slot, out_ptr: u64) u64 {
     out.* = @splat(0);
     const mode: u32 = switch (slot.kind) {
         .pipe_read, .pipe_write => 0o010600, // S_IFIFO
+        .pair => 0o140777, // S_IFSOCK
         else => 0o600, // an anonymous inode
     };
     std.mem.writeInt(u32, out[24..28], mode, .little);
@@ -575,11 +735,16 @@ fn duplicate(s: *Sim, slot: *Slot) u64 {
     slots[i].nonblock = from.nonblock;
     slots[i].semaphore = from.semaphore;
     slots[i].object = from.object;
+    slots[i].out = from.out;
     slots[i].description = from.description;
     switch (from.kind) {
         .free => unreachable,
         .pipe_read => pipes[from.object].readers += 1,
         .pipe_write => pipes[from.object].writers += 1,
+        .pair => {
+            pipes[from.object].readers += 1;
+            pipes[from.out].writers += 1;
+        },
         .eventfd => counters[from.object].holders += 1,
         .epoll => epolls[from.object].holders += 1,
     }
@@ -624,7 +789,7 @@ fn ioctl(slot: *Slot, request: u32, arg: u64) ?u64 {
             return 0;
         },
         0x541B => { // FIONREAD
-            if (slot.kind != .pipe_read and slot.kind != .pipe_write) return fail(.NOTTY);
+            if (slot.kind != .pipe_read and slot.kind != .pipe_write and slot.kind != .pair) return fail(.NOTTY);
             if (arg == 0) return fail(.FAULT);
             @as(*align(1) i32, @ptrFromInt(arg)).* = @intCast(pipes[slot.object].len);
             return 0;
@@ -643,6 +808,7 @@ pub const poll_hup = 0x10;
 pub const poll_nval = 0x20;
 const rdnorm = 0x40;
 const wrnorm = 0x100;
+const poll_rdhup = 0x2000;
 
 /// The events one of these descriptors has, as `poll` names them.
 pub fn pollMask(fd: i32) u16 {
@@ -659,6 +825,19 @@ pub fn pollMask(fd: i32) u16 {
             const p = &pipes[slot.object];
             // No reader: an error, and writable (the write fails at once).
             if (p.readers == 0) m |= poll_err | poll_out | wrnorm else if (pipe_bytes - p.len >= pipe_atomic_bytes) m |= poll_out | wrnorm;
+        },
+        .pair => {
+            const in = &pipes[slot.object];
+            const out = &pipes[slot.out];
+            const in_over = in.writers == 0 or in.shut;
+            const out_over = out.readers == 0 or out.shut;
+            // The end of what there is to read is readable, as Linux's.
+            if (in.len > 0 or in_over) m |= poll_in | rdnorm;
+            if (in_over) m |= poll_rdhup;
+            if (in_over and out_over) m |= poll_hup;
+            // Writable while no more than a quarter is in use, as
+            // Linux's, or when a write would fail at once.
+            if (out_over or out.len * 4 <= pipe_bytes) m |= poll_out | wrnorm;
         },
         .eventfd => {
             const value = counters[slot.object].value;

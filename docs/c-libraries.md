@@ -253,9 +253,15 @@ blocking TCP echo, a connection and a file shared through `try_clone`,
 and a TCP echo on tokio's single-threaded runtime and
 on its work-stealing one with two and four workers, and with the
 number it picks itself (one, or six when the test's `processors`
-option says six); an HTTP/1.1 server and three clients on hyper; and
-`localhost` looked up through the C library.
+option says six); an HTTP/1.1 server and three clients on hyper;
+`localhost` looked up through the C library; and `UnixStream::pair`,
+the standard library's between threads and tokio's between tasks.
 On musl and on glibc.
+
+A pair of connected sockets (`socketpair`, Unix domain, stream) is
+answered. A named Unix-domain socket is not: `socket(AF_UNIX, ...)`
+fails with `EAFNOSUPPORT`. Nothing passes a descriptor from one end of
+a pair to the other (`sendmsg` is not answered).
 
 A program that looks host names up finds the ones the test writes to
 `/etc/hosts` in the simulated filesystem, which starts empty; there is
