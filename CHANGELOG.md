@@ -27,6 +27,8 @@ Tested on Linux (WSL2, static musl, Debug): all 41 test binaries pass, the libra
 
 **Review.** A fresh reviewer confirmed the hash is the same, by Wyhash's source and by a comparison of the two for every label length to 600 and every split of every length to 199, on five seeds; and found the ring unchanged and the build step right. One fault, fixed: the profile's command ran the example the profiler cannot run (it was left out by an edit of the program), so `--without` was added. Smaller, fixed: the trace's share overstated the work saved (some is counted to the functions it was inlined into), the time was within the noise, and "the table above" named the wrong table. Listed and not done: the decision key's first two rounds depend only on the stream and the task and could be kept per task; the network's wait scans all 64 socket slots.
 
+Tested on Linux (WSL2, static musl): all 40 test binaries pass, the library suite 307 passed and 2 skipped, with and without the stray-call trap; the profile's command, as documented, runs and counts the same 5.81 billion instructions. Windows: the four build modes and `-Dsec` pass (Debug on a second run, after Zig's `unable to load: Unexpected`, and on top of revision 118).
+
 ## Revision 116 (core: a web service in Rust, a host name looked up, and state a library sets up once)
 
 Two more things a real service does were tried in system-call mode. The first passed as it was. The second failed on both C libraries, for different reasons, and what it needed is this revision.
