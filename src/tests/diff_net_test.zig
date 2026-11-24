@@ -35,9 +35,14 @@ const Outcome = struct {
     call: []const u8 = "ok",
     /// How a later read on the client ends, where a scenario makes one.
     after: []const u8 = "none",
+    /// What single calls answered, in order, where a scenario makes them.
+    steps: [steps_len][]const u8 = @splat("-"),
 
     fn eql(a: Outcome, b: Outcome) bool {
-        return a.client.eql(b.client) and a.server.eql(b.server) and std.mem.eql(u8, a.call, b.call) and std.mem.eql(u8, a.after, b.after);
+        return a.client.eql(b.client) and a.server.eql(b.server) and std.mem.eql(u8, a.call, b.call) and std.mem.eql(u8, a.after, b.after) and
+            for (a.steps, b.steps) |x, y| {
+                if (!std.mem.eql(u8, x, y)) break false;
+            } else true;
     }
 };
 
@@ -96,6 +101,13 @@ const Scenario = enum {
     /// The server accepts and closes at once; the client reads to the end
     /// and then writes `writes_after_close` times, a pause before each.
     write_after_close,
+    /// The server sends 3 bytes and closes with the client's bytes unread
+    /// (a reset); later the client reads three times and writes twice,
+    /// one call each.
+    reset_then_calls,
+    /// As `reset_then_calls`, but a write meets the reset first: write,
+    /// read, read, write.
+    reset_write_first,
     /// Three datagrams of 5, 1,200 and 1 bytes, echoed back.
     dgram_boundaries,
     /// A datagram of 100 bytes received into a buffer of 10.
@@ -135,6 +147,32 @@ fn sendLarge(io: Io, stream: Stream, len: usize) []const u8 {
 
 const connections = 3;
 const writes_after_close = 4;
+const steps_len = 5;
+
+/// One byte by one read call. A buffered reader would take all the bytes
+/// there are, and a close after it would be a FIN, not a reset.
+fn readOneByte(io: Io, stream: Stream) u8 {
+    var one: [1]u8 = .{0};
+    var vec = [_][]u8{&one};
+    if (io.operate(.{ .net_read = .{ .socket_handle = stream.socket.handle, .data = &vec } })) |r| {
+        _ = r.net_read catch {};
+    } else |_| {}
+    return one[0];
+}
+
+/// One read call: "data" (its bytes counted in `seen`), "eof" or the error.
+fn readOnce(io: Io, stream: Stream, seen: *Seen) []const u8 {
+    var buf: [64]u8 = undefined;
+    var vec = [_][]u8{&buf};
+    // `Stream.read` does not compile in this std (it destructures a
+    // struct): the operation it wraps.
+    const r = io.operate(.{ .net_read = .{ .socket_handle = stream.socket.handle, .data = &vec } }) catch |e| return @errorName(e);
+    const n = (r.net_read catch |e| return @errorName(e)).data_len;
+    if (n == 0) return "eof";
+    for (buf[0..n], seen.len..) |b, at| seen.sum += weigh(b, at);
+    seen.len += n;
+    return "data";
+}
 
 const Server = struct {
     io: Io,
@@ -154,14 +192,14 @@ const Server = struct {
                 _ = send(s.io, stream, "reply");
             },
             .close_without_data, .write_after_close => {},
+            .reset_then_calls, .reset_write_first => {
+                _ = readOneByte(s.io, stream);
+                s.seen.end = send(s.io, stream, "abc");
+            },
             .close_with_unread => {
                 // One byte, so the client's data has arrived; the rest is
                 // left unread when the stream closes.
-                var one: [1]u8 = undefined;
-                var rbuf: [8]u8 = undefined;
-                var r = stream.reader(s.io, &rbuf);
-                r.interface.readSliceAll(&one) catch {};
-                s.seen = .{ .len = 1, .sum = one[0], .end = "closed early" };
+                s.seen = .{ .len = 1, .sum = readOneByte(s.io, stream), .end = "closed early" };
             },
             .large_transfer => {
                 s.seen = drain(s.io, stream);
@@ -351,6 +389,24 @@ fn play(io: Io, scenario: Scenario, listen_at: IpAddress, reach: ?IpAddress) !Ou
             out.client = drain(io, stream);
         },
         .close_without_data => out.client = drain(io, stream),
+        .reset_then_calls => {
+            out.call = send(io, stream, "12345678");
+            // The server's bytes and its reset arrive meanwhile.
+            try io.sleep(.fromMilliseconds(10), .awake);
+            for (out.steps[0..3]) |*step| step.* = readOnce(io, stream, &out.client);
+            for (out.steps[3..]) |*step| {
+                step.* = send(io, stream, "x");
+                try io.sleep(.fromMilliseconds(5), .awake);
+            }
+        },
+        .reset_write_first => {
+            out.call = send(io, stream, "12345678");
+            try io.sleep(.fromMilliseconds(10), .awake);
+            out.steps[0] = send(io, stream, "x");
+            out.steps[1] = readOnce(io, stream, &out.client);
+            out.steps[2] = readOnce(io, stream, &out.client);
+            out.steps[3] = send(io, stream, "x");
+        },
         .write_after_close => {
             // Read to the end first, so the peer's close has arrived; then
             // write. What the writes answer, in order: `client.len` writes
@@ -453,6 +509,14 @@ fn body(env: *Env) !void {
         // does not map (`Unexpected`). The writes that succeed first
         // still agree.
         if (builtin.os.tag == .windows and scenario == .write_after_close and std.mem.eql(u8, real[i].call, "Unexpected") and real[i].client.len == got.client.len) continue;
+        // Known and accepted: Windows drops what arrived before a reset
+        // and reports the reset to every later call, where Linux and the
+        // model give the bytes, the reset once, then the end.
+        if (builtin.os.tag == .windows and (scenario == .reset_then_calls or scenario == .reset_write_first) and
+            real[i].server.eql(got.server) and std.mem.eql(u8, real[i].call, got.call) and
+            for (real[i].steps) |step| {
+                if (!std.mem.eql(u8, step, "ConnectionResetByPeer") and !std.mem.eql(u8, step, "-")) break false;
+            } else true) continue;
         // Known and accepted: Windows reports the ICMP port-unreachable
         // of an earlier datagram on an unconnected socket's next receive
         // (WSAECONNRESET, `PortUnreachable`); Linux, like the model,
@@ -461,8 +525,8 @@ fn body(env: *Env) !void {
             real[i].server.eql(got.server) and std.mem.eql(u8, real[i].call, got.call)) continue;
         mismatches += 1;
         if (mismatches <= 8) std.debug.print(
-            "diff_net: {t}: simulated call {s}, client {d} bytes sum {d} end {s}, server {d} bytes end {s}, after {s}; real call {s}, client {d} bytes sum {d} end {s}, server {d} bytes end {s}, after {s}\n",
-            .{ scenario, got.call, got.client.len, got.client.sum, got.client.end, got.server.len, got.server.end, got.after, real[i].call, real[i].client.len, real[i].client.sum, real[i].client.end, real[i].server.len, real[i].server.end, real[i].after },
+            "diff_net: {t}: simulated call {s}, client {d} bytes sum {d} end {s}, server {d} bytes end {s}, after {s}, steps {s} {s} {s} {s} {s}; real call {s}, client {d} bytes sum {d} end {s}, server {d} bytes end {s}, after {s}, steps {s} {s} {s} {s} {s}\n",
+            .{ scenario, got.call, got.client.len, got.client.sum, got.client.end, got.server.len, got.server.end, got.after, got.steps[0], got.steps[1], got.steps[2], got.steps[3], got.steps[4], real[i].call, real[i].client.len, real[i].client.sum, real[i].client.end, real[i].server.len, real[i].server.end, real[i].after, real[i].steps[0], real[i].steps[1], real[i].steps[2], real[i].steps[3], real[i].steps[4] },
         );
     }
 }

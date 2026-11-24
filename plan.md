@@ -713,6 +713,8 @@ Not verified, and the limits: threads switch only at system calls, so a thread s
 
 Still not verified after revision 99: glibc; C++; a Rust program that is an executable and not a library linked into the test; tokio's blocking pool, signals and child processes; `dup` of a socket (`TcpStream::try_clone`) or a file, `dup2` and `dup3`, which are stray. A caught signal that a thread sends itself ran its handler outside the simulation, unreported; since revision 105 it fails the run. The libc clock test is behind `-Dsqlite`: the default suite links no libc, so it has no test of this.
 
+**Revision 115: a reset is reported once.** Compared with Linux, the model reported a reset to every later call and lost the bytes that had arrived before it; Linux reads them, reports the reset once, then ends the stream and breaks writes. Fixed. One scenario of the comparison had never done what it said: its server read every byte, so its close was clean.
+
 **Revision 113: a write to a connection the peer closed.** Compared with the real loopback, the model failed the writes that follow a peer's reset as reset, where Linux, having seen the peer's FIN first, fails them as a broken pipe and lets the read end the stream. Fixed; a datagram to a closed port agrees.
 
 **Revision 111: programs that start other programs.** A test registers what each command does, and a spawn runs it as a simulated process, with pipes that hold 64 KiB and block as real ones do. Waiting for a child that waits for its input, or before reading more output than a pipe holds, is found as the deadlock it is.

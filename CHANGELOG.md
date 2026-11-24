@@ -5,6 +5,20 @@ numbers (§) are `plan2.md`'s unless an entry names `plan.md`. Revision 1
 was the first draft of `plan2.md`; the core's earlier history is in
 `plan.md` §9 and §14.
 
+## Revision 115 (core: a reset is reported once)
+
+`plan3.md` A4. The two gaps the review of revision 113 named, measured and closed. A new scenario of the network's differential test, `reset_then_calls`: the server sends 3 bytes and closes with the client's bytes unread, which resets the connection; later the client reads three times and writes twice, one call each. Linux answers: the 3 bytes, `ECONNRESET`, the end of the stream, then `EPIPE` (std: `error.SocketUnconnected`) for both writes. The model answered `error.ConnectionResetByPeer` to all five calls, the bytes never read. Linux reports a socket's error once (`sock_error` clears it) and copies what is in the receive queue before it looks at the error; the model now does both (`src/model/net.zig`, with a unit test): bytes that arrived before a reset or a timeout are read first, the error is reported to the first read or write that meets it, and after that a read ends the stream and a write fails as a broken pipe. A second scenario, `reset_write_first`, has a write meet the reset first: Linux answers `ECONNRESET`, the 3 bytes, the end, `EPIPE`, and so does the model now. System-call mode reported a reset once already, with its own record, but answered the end of the stream to a read after it, dropping the bytes still waiting; it now asks the model, and a new system-call test runs the write-first sequence.
+
+The scenario of revision 63 that was to show a close with unread data, `close_with_unread`, never had any: its server read one byte through a buffered reader, which took all eight, so the close was a FIN and both sides saw the stream end. It now reads one byte by one call, and the client sees the reset, on Linux and in the model.
+
+On Windows both new scenarios differ, accepted by name (the rest of the outcome still compared): Windows drops the bytes that came before a reset and reports the reset to every later call.
+
+**Review.** A fresh reviewer confirmed the rule against Linux's source and the measurements, and found four faults, all fixed with a test: a segment due after a reset was still delivered, so with bytes now read before the error, a read could return bytes after the reset had been reported (a socket accepts nothing once it is reset); in system-call mode, a send after a reported timeout answered `ECONNRESET` (a broken pipe is now `EPIPE` there); system-call mode's dropped bytes, above; and a connection whose retransmit timeout had fired came back to life when its link healed (Linux closes it for good; the model now keeps the timeout). Smaller, fixed: the trace called every broken pipe "reset after fin", and the Windows exception compared nothing else. Not changed: in system-call mode `poll` shows a timed-out stream as neither an error nor hung up; only a reset is.
+
+Found on the way, in std rather than here: `Io.net.Stream.read` does not compile (it destructures `ReadResult`, a struct); the test calls the operation it wraps.
+
+Tested on Linux (WSL2, static musl): all 40 test binaries pass, the library suite 304 passed and 2 skipped, with and without the stray-call trap; the differential test agrees on all fourteen scenarios. Windows: the four build modes and `-Dsec` pass (Debug: 435 of 492 passed, 57 skipped, none failed).
+
 ## Revision 114 (core: a test says how many processors the program is told of)
 
 Revision 112 made the processor count one on every machine, and gave as its first limit that a program could not be run as if on eight. A runtime that sizes itself by the count (a thread pool, tokio's workers) was therefore always tested at its smallest, with one worker, where work is never stolen and two workers never meet.

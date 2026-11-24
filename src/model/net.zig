@@ -119,6 +119,9 @@ pub const Socket = struct {
     shut_recv: bool,
     fault: Fault,
     fault_at: u64,
+    /// The fault was reported to a read or a write. Linux reports
+    /// `sk_err` once; after it, reads end and writes break.
+    fault_reported: bool,
     /// Non-zero while a sent segment is held by a cut link: the connection
     /// fails with `ConnectionTimedOut` at this time unless the link heals.
     rto_at: u64,
@@ -303,6 +306,7 @@ pub const Net = struct {
             s.shut_send = false;
             s.shut_recv = false;
             s.fault = .none;
+            s.fault_reported = false;
             s.fault_at = 0;
             s.rto_at = 0;
             return @intCast(i);
@@ -465,6 +469,9 @@ pub const Net = struct {
         while (s.seg_len > 0) {
             const seg = &s.segs[s.seg_head];
             if (seg.held or seg.deliver_at > now_ns) break;
+            // A segment due after the socket's reset is never accepted:
+            // the socket is closed by then (Linux: TCP_CLOSE).
+            if (s.fault != .none and seg.deliver_at > s.fault_at) break;
             if (seg.fin) s.eof = true;
             s.rx_ready += seg.len;
             s.seg_head = @intCast((s.seg_head + 1) % s.segs.len);
@@ -521,8 +528,14 @@ pub const Net = struct {
         if (activeFault(s, now_ns)) |f| {
             // After the peer's FIN, what arrived stays readable, then the
             // end, whatever the error: Linux checks `SOCK_DONE` before
-            // `sk_err`. Only a write sees the error.
-            if (!s.eof) return .{ .fault = f };
+            // `sk_err`. Only a write sees the error. Without the FIN, bytes
+            // that arrived before the error are read first (Linux copies
+            // the receive queue before it looks at `sk_err`), then the
+            // error, once (`faultReported`), then the end.
+            if (!s.eof and s.rx_ready == 0) {
+                if (s.fault_reported) return .eof;
+                return .{ .fault = f };
+            }
         }
         if (s.shut_recv) return .eof;
         if (s.rx_ready > 0) {
@@ -560,6 +573,8 @@ pub const Net = struct {
             // CLOSE_WAIT only: with our own FIN sent too (LAST_ACK) Linux
             // records `ECONNRESET`.
             if (f == .reset and s.eof and !s.shut_send) return .broken_pipe;
+            // Reported once already: the socket is closed (`EPIPE`).
+            if (s.fault_reported) return .broken_pipe;
             return .{ .fault = f };
         }
         if (s.shut_send) return .shut_down;
@@ -617,6 +632,11 @@ pub const Net = struct {
     /// them.
     pub fn resetFromPeer(net: *Net, slot: u16, at: u64) void {
         net.setFault(slot, .reset, @max(at, net.sockets[slot].last_deliver_at));
+    }
+
+    /// The caller reported `slot`'s fault to the program.
+    pub fn faultReported(net: *Net, slot: u16) void {
+        net.sockets[slot].fault_reported = true;
     }
 
     /// Marks `slot` as failing with `fault` from `at` on.
@@ -724,6 +744,10 @@ pub const Net = struct {
             // The sender's retransmissions succeed again, or start failing.
             const p = net.peerOf(@intCast(i)) orelse continue;
             if (up) {
+                // A retransmit timeout that already fired closed the
+                // connection for good (Linux: `tcp_write_err`).
+                const rto = net.sockets[p].rto_at;
+                if (rto != 0 and rto <= now_ns) net.setFault(p, .timed_out, rto);
                 net.sockets[p].rto_at = 0;
             } else if (s.seg_len > 0 and net.sockets[p].rto_at == 0) {
                 net.sockets[p].rto_at = now_ns + o.retransmit_timeout_ns;
@@ -971,11 +995,73 @@ test "a reset after the peer's FIN: reads end, writes break (Linux CLOSE_WAIT)" 
     net.setFault(c3, .reset, 320);
     try testing.expectEqual(SendCheck{ .fault = .reset }, net.checkSend(c3, 400));
     try testing.expect(net.recv(c3, &vec, 4, 400) == .eof);
-    // Without the FIN first, a reset is a reset.
+    // Without the FIN first, a reset is a reset: once.
     const c2 = try net.establish(0, 50001, l);
     net.setFault(c2, .reset, 10);
     try testing.expectEqual(SendCheck{ .fault = .reset }, net.checkSend(c2, 20));
     try testing.expectEqual(RecvResult{ .fault = .reset }, net.recv(c2, &vec, 4, 20));
+    net.faultReported(c2);
+    try testing.expect(net.recv(c2, &vec, 4, 20) == .eof);
+    try testing.expectEqual(SendCheck.broken_pipe, net.checkSend(c2, 20));
+}
+
+test "a reset: nothing that would arrive after it is read" {
+    var net = try testNet(2);
+    defer net.deinit();
+    var d = decide.Decider.init(3);
+    const o: Options = .{ .latency_min_ns = 10, .latency_max_ns = 10 };
+    const l = try net.listen(1, 80, 4);
+    const c = try net.establish(0, 50000, l);
+    const sv = net.popBacklog(l).?;
+    net.push(sv, "abc");
+    net.commit(sv, 3, false, 95, &d, o); // due at 105
+    net.resetConnection(c, 100, &d, o);
+    var buf: [4]u8 = undefined;
+    var vec = [_][]u8{&buf};
+    try testing.expectEqual(RecvResult{ .fault = .reset }, net.recv(c, &vec, 4, 101));
+    net.faultReported(c);
+    try testing.expect(net.recv(c, &vec, 4, 1000) == .eof);
+    try testing.expect(net.recv(c, &vec, 4, 1000) == .eof);
+}
+
+test "a retransmit timeout that fired stays when the link heals" {
+    var net = try testNet(2);
+    defer net.deinit();
+    var d = decide.Decider.init(3);
+    const o: Options = .{ .latency_min_ns = 10, .latency_max_ns = 10, .retransmit_timeout_ns = 1000 };
+    const l = try net.listen(1, 80, 4);
+    const c = try net.establish(0, 50000, l);
+    _ = net.popBacklog(l).?;
+    net.setLink(0, 1, false, 0, &d, o);
+    net.push(c, "x");
+    net.commit(c, 1, false, 100, &d, o);
+    var buf: [4]u8 = undefined;
+    var vec = [_][]u8{&buf};
+    try testing.expectEqual(RecvResult{ .fault = .timed_out }, net.recv(c, &vec, 4, 1100));
+    net.faultReported(c);
+    net.setLink(0, 1, true, 2000, &d, o);
+    try testing.expect(net.recv(c, &vec, 4, 3000) == .eof);
+    try testing.expectEqual(SendCheck.broken_pipe, net.checkSend(c, 3000));
+}
+
+test "a reset: the bytes that came before it are read first" {
+    var net = try testNet(2);
+    defer net.deinit();
+    var d = decide.Decider.init(3);
+    const o: Options = .{ .latency_min_ns = 10, .latency_max_ns = 10 };
+    const l = try net.listen(1, 80, 4);
+    const c = try net.establish(0, 50000, l);
+    const sv = net.popBacklog(l).?;
+    net.push(c, "req");
+    net.commit(c, 3, false, 0, &d, o);
+    net.push(sv, "abc");
+    net.commit(sv, 3, false, 50, &d, o);
+    net.close(sv, 100, &d, o); // the request unread: a reset
+    var buf: [4]u8 = undefined;
+    var vec = [_][]u8{&buf};
+    try testing.expectEqual(RecvResult{ .data = 3 }, net.recv(c, &vec, 4, 1000));
+    try testing.expectEqualStrings("abc", buf[0..3]);
+    try testing.expectEqual(RecvResult{ .fault = .reset }, net.recv(c, &vec, 4, 1000));
 }
 
 test "a reset from the peer arrives after the FIN it sent first" {

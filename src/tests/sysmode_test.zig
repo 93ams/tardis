@@ -1250,6 +1250,46 @@ test "system-call mode: a write to a connection the peer closed breaks the pipe,
     try tardis.check(gpa, closeWaitReset, .{ .iterations = 50, .mode = .syscalls, .faults = .{ .net_reset_ppm = 1_000_000 } });
 }
 
+fn sendAndResetServer(listener: usize) void {
+    const conn = sys(.accept, listener, 0, 0, 0);
+    if (conn < 0) return;
+    // One byte of the client's eight: the close is a reset.
+    var one: [1]u8 = undefined;
+    _ = sys(.read, @intCast(conn), @intFromPtr(&one), 1, 0);
+    _ = sys6(.sendto, @intCast(conn), @intFromPtr("abc"), 3, 0x4000, 0, 0);
+    _ = sys(.close, @intCast(conn), 0, 0, 0);
+}
+
+/// A reset with bytes waiting: a write meets it first, then the bytes are
+/// read, then the end, and writes break, as Linux was measured to do in
+/// the differential test (`reset_write_first`).
+fn resetWithBytesWaiting(env: *Env) !void {
+    const listener = try ok(sys(.socket, 2, 1, 0, 0));
+    defer _ = sys(.close, listener, 0, 0, 0);
+    const at = sockaddr(.{ 127, 0, 0, 1 }, 7101);
+    _ = try ok(sys(.bind, listener, @intFromPtr(&at), @sizeOf(SockaddrIn), 0));
+    _ = try ok(sys(.listen, listener, 8, 0, 0));
+    var server = try env.io.concurrent(sendAndResetServer, .{listener});
+    const client = try ok(sys(.socket, 2, 1, 0, 0));
+    defer _ = sys(.close, client, 0, 0, 0);
+    _ = try ok(sys(.connect, client, @intFromPtr(&at), @sizeOf(SockaddrIn), 0));
+    _ = try ok(sys6(.sendto, client, @intFromPtr("12345678"), 8, 0x4000, 0, 0));
+    server.await(env.io);
+    const req: Timespec = .{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+    _ = sys(.nanosleep, @intFromPtr(&req), 0, 0, 0);
+    var buf: [8]u8 = undefined;
+    try testing.expectEqual(errOf(.CONNRESET), sys6(.sendto, client, @intFromPtr("x"), 1, 0x4000, 0, 0));
+    try testing.expectEqual(@as(isize, 3), sys(.read, client, @intFromPtr(&buf), buf.len, 0));
+    try testing.expectEqualStrings("abc", buf[0..3]);
+    try testing.expectEqual(@as(isize, 0), sys(.read, client, @intFromPtr(&buf), buf.len, 0));
+    try testing.expectEqual(errOf(.PIPE), sys6(.sendto, client, @intFromPtr("x"), 1, 0x4000, 0, 0));
+}
+
+test "system-call mode: a reset with bytes waiting: the bytes, then the end" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, resetWithBytesWaiting, .{ .iterations = 50, .mode = .syscalls, .faults = .{ .net_reset_ppm = 0 } });
+}
+
 test "system-call mode: datagrams and socket errors, by system calls" {
     if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
     try tardis.check(gpa, datagrams, .{ .iterations = 50, .mode = .syscalls, .faults = .{ .datagram_loss_ppm = 0, .datagram_duplicate_ppm = 0 } });

@@ -3803,6 +3803,14 @@ pub fn streamReset(s: *Sim, handle: ionet.Socket.Handle) bool {
     return s.net.isReset(slot, s.now_ns);
 }
 
+/// System-call mode reported the stream's reset to the program itself
+/// (a send's check, `SO_ERROR`): the model then ends reads and breaks
+/// writes, as after any other report.
+pub fn streamFaultReported(s: *Sim, handle: ionet.Socket.Handle) void {
+    const slot = s.streamSlot(handle) orelse return;
+    s.net.faultReported(slot);
+}
+
 /// The error Linux reports for a reset stream: `EPIPE` when the peer's FIN
 /// came first (the socket was in CLOSE_WAIT), else `ECONNRESET`.
 pub fn streamResetIsPipe(s: *Sim, handle: ionet.Socket.Handle) bool {
@@ -4126,6 +4134,7 @@ fn netReadStep(s: *Sim, op: Io.Operation.NetRead) ?Io.Operation.NetRead.Result {
         },
         .fault => |f| {
             s.record(.net_fault, slot, @backingInt(f), 1, @tagName(f));
+            s.net.faultReported(slot);
             return netFaultError(E, f);
         },
         .would_block => return null,
@@ -4145,12 +4154,13 @@ fn netWriteStep(s: *Sim, op: Io.Operation.NetWrite) ?Io.Operation.NetWrite.Resul
     switch (s.net.checkSend(slot, s.now_ns)) {
         .fault => |f| {
             s.record(.net_fault, slot, @backingInt(f), 2, @tagName(f));
+            s.net.faultReported(slot);
             return netFaultError(E, f);
         },
         .shut_down => return error.SocketUnconnected,
         // Linux's `EPIPE`, which std reports as an unconnected socket.
         .broken_pipe => {
-            s.record(.net_fault, slot, @backingInt(net_mod.Fault.reset), 2, "reset after fin");
+            s.record(.net_fault, slot, @backingInt(net_mod.Fault.reset), 2, "broken pipe");
             return error.SocketUnconnected;
         },
         .peer_gone => {

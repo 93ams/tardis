@@ -606,9 +606,10 @@ fn receive(s: *Sim, slot: *Slot, buf_ptr: u64, len: u64, flags: u32, from_ptr: u
     const io = s.io();
     switch (slot.kind) {
         .stream => {
-            // Linux returns at once for an empty buffer on a stream, and
-            // reads the end of a stream whose reset was reported.
-            if (buf.len == 0 or slot.reset_reported) return 0;
+            // Linux returns at once for an empty buffer on a stream. After
+            // a reported reset the model gives what arrived before it, then
+            // the end.
+            if (buf.len == 0) return 0;
             if (nonblock and !s.streamReadable(slot.handle)) return fail(.AGAIN);
             var data = [_][]u8{buf};
             const r = io.operate(.{ .net_read = .{ .socket_handle = slot.handle, .data = &data } }) catch return fail(.INTR);
@@ -697,6 +698,7 @@ fn send(s: *Sim, slot: *Slot, buf_ptr: u64, len: u64, flags: u32, to_ptr: u64, t
             // A reset not yet reported comes first (`sk_err`), once.
             if (!slot.reset_reported and s.streamReset(slot.handle)) {
                 slot.reset_reported = true;
+                s.streamFaultReported(slot.handle);
                 return fail(resetErrno(s, slot));
             }
             if (slot.shut_send or slot.reset_reported) return fail(.PIPE);
@@ -711,10 +713,14 @@ fn send(s: *Sim, slot: *Slot, buf_ptr: u64, len: u64, flags: u32, to_ptr: u64, t
                 const r = io.operate(.{ .net_write = .{ .socket_handle = slot.handle, .data = &data } }) catch
                     return if (sent > 0) sent else fail(.INTR);
                 const n = r.net_write catch |err| {
-                    // On a connected stream, an unconnected socket is a
-                    // reset that came after the peer's FIN (the model's
-                    // broken pipe): reported as the reset, once.
-                    if (err == error.ConnectionResetByPeer or err == error.SocketUnconnected) {
+                    // On a connected stream, an unconnected socket is the
+                    // model's broken pipe: a reset after the peer's FIN, or
+                    // a reset or timeout already reported. `EPIPE`.
+                    if (err == error.SocketUnconnected) {
+                        slot.reset_reported = true;
+                        return if (sent > 0) sent else fail(.PIPE);
+                    }
+                    if (err == error.ConnectionResetByPeer) {
                         slot.reset_reported = true;
                         return if (sent > 0) sent else fail(resetErrno(s, slot));
                     }
@@ -950,6 +956,7 @@ fn getsockopt(s: *Sim, slot: *Slot, level: u64, name: u64, value_ptr: u64, len_p
         // A reset not yet reported is reported here, once.
         if (slot.kind == .stream and !slot.reset_reported and s.streamReset(slot.handle)) {
             slot.reset_reported = true;
+            s.streamFaultReported(slot.handle);
             break :blk @backingInt(resetErrno(s, slot));
         }
         const e = slot.pending orelse break :blk 0;
