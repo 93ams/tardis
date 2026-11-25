@@ -283,14 +283,64 @@ threadlocal var unwinder_warm = false;
 /// first time (the list of the program's modules, read with
 /// `dl_iterate_phdr`, which reads the vDSO's headers; its cache) is there
 /// before a run traps the vDSO and the system calls. Called before a run
-/// that traps.
+/// that traps. The names come too (`warmSymbols`).
 pub fn warmUnwinder() void {
     if (!supported or unwinder_warm) return;
     unwinder_warm = true;
     if (!std.debug.sys_can_stack_trace or !std.options.allow_stack_tracing) return;
     var buf: [2]usize = undefined;
     _ = std.debug.captureCurrentStackTrace(.{}, &buf);
+    warmSymbols();
 }
+
+var symbols_warm: std.atomic.Value(bool) = .init(false);
+
+/// Loads the debug information of the program and of each library it
+/// loaded (std reads the file, keeps it mapped, and indexes its DWARF), so
+/// that a stack printed inside a run, a panic's or a test's, has names and
+/// lines, and so does the report of a stray call after the run. Inside a
+/// run std cannot load it in system-call mode: the program's file is
+/// opened by the path it was started with, which the simulated file
+/// system does not have (or, linked with libc, found first by `readlink`
+/// of `/proc/self/exe`, a stray call). std keeps that failure for the
+/// rest of the process, so the stacks printed after it, outside a run as
+/// well, were `???`. Once per process, before its first run that traps;
+/// the flag is set when it is done, so a second thread starting a run
+/// meanwhile loads too (std's lock makes that wait, and finds it done).
+fn warmSymbols() void {
+    if (!@hasDecl(std.debug.SelfInfo, "getSymbols")) return;
+    if (symbols_warm.load(.acquire)) return;
+    defer symbols_warm.store(true, .release);
+    const info = std.debug.getSelfDebugInfo() catch return;
+    var modules: Modules = .{};
+    std.posix.dl_iterate_phdr(&modules, error{Full}, Modules.callback) catch {};
+    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena.deinit();
+    for (modules.code[0..modules.len]) |address| {
+        var symbols: std.ArrayList(std.debug.Symbol) = .empty;
+        info.getSymbols(std.Options.debug_io, arena.allocator(), arena.allocator(), address, false, &symbols) catch {};
+    }
+}
+
+/// An address in the code of each module with a file (the program and its
+/// libraries; not the vDSO, which has none).
+const Modules = struct {
+    code: [64]usize = undefined,
+    len: usize = 0,
+
+    fn callback(info: *std.posix.dl_phdr_info, size: usize, m: *Modules) error{Full}!void {
+        _ = size;
+        if (m.len == m.code.len) return error.Full;
+        const vdso: usize = if (builtin.link_libc) std.c.getauxval(std.elf.AT.SYSINFO_EHDR) else linux.getauxval(std.elf.AT.SYSINFO_EHDR);
+        if (info.addr == vdso) return;
+        for (info.phdr[0..info.phnum]) |phdr| {
+            if (phdr.type != .LOAD or !phdr.flags.X or phdr.memsz == 0) continue;
+            m.code[m.len] = info.addr + phdr.vaddr;
+            m.len += 1;
+            return;
+        }
+    }
+};
 
 /// Where the last run's first stray call was made from, as `end` gave it
 /// (for a test of the report).

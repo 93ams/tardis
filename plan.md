@@ -756,6 +756,10 @@ Still not verified after revision 99: glibc; C++; a Rust program that is an exec
 **Revision 119: the next two costs.** The two items revision 117 listed: the network's scans stop at the highest socket slot in use, and each task keeps the half of its decision keys that never changes. 10.5% fewer instructions on the bug benchmark, every key and trace hash unchanged.
 **Revision 123: a file mapped into memory.** `mmap` of a simulated file, shared or private, is answered in system-call mode with a memory file per mapped file (`src/sim/sysemu.zig`), kept coherent with reads, writes, truncations and syncs by system call and with `msync`, and with what each kind of crash keeps. SQLite in WAL mode now runs, and keeps its acknowledged commit through a power loss with `synchronous=FULL`. Not modelled: the kernel's own writeback of dirty pages; `env.dir` access to a mapped file.
 
+**Revision 128: names in a stack printed inside a run.** In system-call mode std's debug information is loaded before the first run that traps (`src/sim/syscalls.zig`), so a panic's stack inside a run, and the stray-call report after it, have names and lines where they had `???`. About 0.1 s once per process.
+
+**Revision 129: the path of an open file.** `readlink` and `readlinkat` are answered in system-call mode (`src/sim/sysemu.zig`): `/proc/self/fd/N` of a simulated descriptor gives its path from the node's root, which std's `realPathFile` reads; another path gives the target of a simulated symbolic link. Not done: the links of pipes and sockets, and the old path of a file deleted while open.
+
 
 **Revision 100: the last untried rows of the `fsync` rule on ext4.** Four more cases on the real filesystem: the one unsafe doubt (a write within a tick of the clock) could not be produced there, so the model takes the cautious side of it, and the two places where ext4 keeps more than the model (new blocks allotted at the sync) are left as they are and explained. A rename over a file with a full journal no longer hides the file's change from its own `fsync`.
 

@@ -55,7 +55,9 @@ test "the acknowledged commit survives a power loss" {
 - **Paths.** A relative path, and an absolute one, are in the node's
   simulated filesystem, which starts empty in every run. `/proc`, `/sys`
   and `/dev` do not exist there, except `/dev/urandom`, whose bytes come
-  from the run's seed.
+  from the run's seed, and the links `/proc/self/fd/N` of simulated
+  descriptors, which name their files (`realpath` of an open file reads
+  them).
 - **Stack.** A task's stack is 256 KiB by default. A C library's parser
   or cache may want more: SQLite is given `fiber_stack_bytes` of 1 MiB.
 - **Both ways in.** The body still has `env.io` and `env.dir`, on the same

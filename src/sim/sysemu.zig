@@ -435,6 +435,8 @@ pub fn emulate(number: u64, a: *const [6]u64) ?u64 {
         257 => open(s, fd, a[1], @truncate(a[2])),
         86 => link(s, at_fdcwd, a[0], at_fdcwd, a[1], 0),
         265 => link(s, fd, a[1], resolve(s, fdOf(a[2])), a[3], @truncate(a[4])),
+        89 => readlink(s, at_fdcwd, a[0], a[1], a[2]),
+        267 => readlink(s, fd, a[1], a[2], a[3]),
         // Calls on a descriptor: only on one of ours.
         0, 1, 3, 5, 8, 16, 17, 18, 19, 20, 32, 72, 74, 75, 77, 91, 93, 217, 295, 296 => {
             if (!simulated(fd)) return null;
@@ -1475,6 +1477,87 @@ fn access(s: *Sim, dirfd: i32, path_ptr: u64) ?u64 {
     // the kernel's has (found by the differential test).
     _ = dir.statFile(s.io(), path, .{}) catch |err| return fail(errnoOf(err));
     return 0;
+}
+
+// --- links read ----------------------------------------------------------------
+
+/// `readlink` and `readlinkat`. Of `/proc/self/fd/N` (or
+/// `/proc/thread-self/fd/N`) for a simulated descriptor: the path of what
+/// it is open on, from the node's root, as Linux gives it; std's
+/// `realPathFile` opens the file and reads this link. Of a simulated
+/// path: the target of the symbolic link there (`EINVAL` for anything
+/// else). As the kernel's: no terminating zero, and cut to the buffer.
+/// Any other `/proc` link, `/proc/self/exe` among them, and the link of a
+/// pipe, a socket or a descriptor of the host, is a stray.
+fn readlink(s: *Sim, dirfd: i32, path_ptr: u64, buf_ptr: u64, len: u64) ?u64 {
+    // The kernel's size is an `int`, checked before the path.
+    const size: i32 = @bitCast(@as(u32, @truncate(len)));
+    if (size <= 0) return fail(.INVAL);
+    const path = cstr(path_ptr) orelse return fail(.FAULT);
+    if (path.len == 0) return fail(.NOENT);
+    var text: [path_bytes_max]u8 = undefined;
+    const answer: []const u8 = if (procFd(path)) |raw| switch (if (raw < 0) DescriptorPath{ .err = .NOENT } else descriptorPath(s, resolve(s, raw), &text)) {
+        .path => |p| p,
+        .err => |e| return fail(e),
+        .foreign => return null,
+    } else blk: {
+        const dir = switch (dirOf(s, dirfd, path)) {
+            .dir => |d| d,
+            .closed => return fail(.BADF),
+            .foreign => return null,
+        };
+        const n = dir.readLink(s.io(), path, &text) catch |err| return fail(errnoOf(err));
+        break :blk text[0..n];
+    };
+    if (buf_ptr == 0) return fail(.FAULT);
+    const k = @min(answer.len, @as(usize, @intCast(size)));
+    @memcpy(@as([*]u8, @ptrFromInt(buf_ptr))[0..k], answer[0..k]);
+    return k;
+}
+
+const path_bytes_max = 4096;
+
+/// The descriptor a `/proc/self/fd/N` path names: digits only, with no
+/// sign and no leading zero, as procfs names them; -1 for another name
+/// in that directory, which is not there (`ENOENT`).
+fn procFd(path: []const u8) ?i32 {
+    const rest = for ([_][]const u8{ "/proc/self/fd/", "/proc/thread-self/fd/" }) |prefix| {
+        if (std.mem.startsWith(u8, path, prefix)) break path[prefix.len..];
+    } else return null;
+    if (rest.len == 0) return null; // the directory itself: not answered
+    if (rest[0] == '0' and rest.len > 1) return -1;
+    for (rest) |c| if (!std.ascii.isDigit(c)) return -1;
+    return std.fmt.parseInt(i32, rest, 10) catch -1;
+}
+
+const DescriptorPath = union(enum) { path: []const u8, err: E, foreign };
+
+/// The path a simulated descriptor is open on, from the node's root,
+/// written from the end of `buf` back. A file with several names gets one
+/// of them; one with none left (deleted while open) gets Linux's
+/// " (deleted)" after the root, as its name is gone with the entry.
+fn descriptorPath(s: *Sim, fd: i32, buf: *[path_bytes_max]u8) DescriptorPath {
+    if (fd == root_fd) return .{ .path = "/" };
+    if (fd == random_fd) return .{ .path = "/dev/urandom" };
+    if (sysfd.isFd(fd) or sysnet.isSocketFd(fd) or !simulated(fd)) return .foreign;
+    const h = handleOf(s, fd) orelse return .{ .err = .NOENT };
+    const v = s.vfs;
+    var at: usize = buf.len;
+    var ino = h.inode;
+    while (ino != vfs_mod.root_inode) {
+        const d = for (v.cur_dentries[0..v.cur_hwm]) |*d| {
+            if (d.used and d.inode == ino) break d;
+        } else return .{ .path = "/ (deleted)" };
+        // Each name with its slash; a longer path (or a cycle) is too long.
+        if (d.name_len + 1 > at) return .{ .err = .NAMETOOLONG };
+        at -= d.name_len;
+        @memcpy(buf[at..][0..d.name_len], d.name[0..d.name_len]);
+        at -= 1;
+        buf[at] = '/';
+        ino = d.parent;
+    }
+    if (at == buf.len) return .{ .path = "/" };
+    return .{ .path = buf[at..] };
 }
 
 /// The working directory is the root of the node's filesystem.

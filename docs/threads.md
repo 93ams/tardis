@@ -96,6 +96,11 @@ from the call itself, so it shows the library function that made it and
 who called that, up to sixteen frames; it is printed only for a call that
 came through the trap (not for a clock read through the vDSO), and only
 where the program has the tables to unwind it (and not when the stray call is `std.debug`'s own, made while it holds its lock).
+The names come from the program's debug information, which is loaded
+before the first run that traps, once per process (about a tenth of a
+second for a large debug binary): in system-call mode the program's file
+cannot be opened inside a run. So a stack printed inside a run, a
+panic's, has them too.
 
 **A call made once per process.** Some code asks the kernel something
 the first time it needs it and keeps the answer for the rest of the

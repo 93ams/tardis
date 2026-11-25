@@ -701,6 +701,111 @@ fn renamesOnHost(env: *Env) !void {
     stray_rc = sys(.rename, @intFromPtr(host_path.ptr), @intFromPtr("/dev/shm/tardis-stray-moved"), 0, 0);
 }
 
+var named: [64]u8 = undefined;
+var named_len: usize = 0;
+
+/// Looks its own name up in the program's debug information, inside the
+/// run, as a panic's trace does.
+noinline fn namesItself(env: *Env) !void {
+    _ = env;
+    named_len = 0;
+    const info = try std.debug.getSelfDebugInfo();
+    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena.deinit();
+    var symbols: std.ArrayList(std.debug.Symbol) = .empty;
+    try info.getSymbols(std.Options.debug_io, arena.allocator(), arena.allocator(), @intFromPtr(&namesItself) + 1, false, &symbols);
+    const name = symbols.items[0].name orelse return error.NoName;
+    named_len = @min(name.len, named.len);
+    @memcpy(named[0..named_len], name[0..named_len]);
+}
+
+test "system-call mode: a stack printed inside a run, and the report's after it, have names" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    if (!std.debug.sys_can_stack_trace or !std.options.allow_stack_tracing) return error.SkipZigTest;
+    if (!@hasDecl(std.debug.SelfInfo, "getSymbols") or builtin.strip_debug_info) return error.SkipZigTest;
+    // Inside the run the program's file cannot be opened: the names were
+    // loaded before it, and nothing the lookup does is a stray.
+    try tardis.check(gpa, namesItself, .{ .iterations = 2, .mode = .syscalls });
+    try testing.expect(std.mem.endsWith(u8, named[0..named_len], "namesItself"));
+}
+
+fn linkOf(path: [*:0]const u8, buf: []u8) isize {
+    return sys(.readlink, @intFromPtr(path), @intFromPtr(buf.ptr), buf.len, 0);
+}
+
+fn expectLink(expected: []const u8, path: [*:0]const u8) !void {
+    var buf: [256]u8 = undefined;
+    const rc = linkOf(path, &buf);
+    if (rc < 0) std.debug.print("readlink {s}: {d}\n", .{ path, rc });
+    try testing.expect(rc >= 0);
+    try testing.expectEqualStrings(expected, buf[0..@intCast(rc)]);
+}
+
+fn fdPath(fd: usize, buf: *[64]u8) [*:0]const u8 {
+    return (std.mem.printSentinel(buf, "/proc/self/fd/{d}", .{fd}, 0) catch unreachable).ptr;
+}
+
+/// `readlink` of `/proc/self/fd/N` and of a symbolic link.
+fn readsLinks(env: *Env) !void {
+    _ = try ok(sys(.mkdir, @intFromPtr("d"), 0o755, 0, 0));
+    const f = try open("d/f", o_creat | o_rdwr);
+    defer close(f);
+    var name: [64]u8 = undefined;
+    try expectLink("/d/f", fdPath(f, &name));
+    try expectLink("/d/f", (try std.mem.printSentinel(&name, "/proc/thread-self/fd/{d}", .{f}, 0)).ptr);
+    // Through a duplicate; of a directory; of the root.
+    const g = try ok(sys(.dup, f, 0, 0, 0));
+    try expectLink("/d/f", fdPath(g, &name));
+    close(g);
+    const d = try open("d", o_rdonly | o_directory);
+    try expectLink("/d", fdPath(d, &name));
+    close(d);
+    const root = try open(".", o_rdonly | o_directory);
+    try expectLink("/", fdPath(root, &name));
+    close(root);
+    // Cut to the buffer, with no zero after it, as the kernel's.
+    var two: [3]u8 = .{ 'x', 'x', 'x' };
+    try testing.expectEqual(@as(isize, 2), linkOf(fdPath(f, &name), two[0..2]));
+    try testing.expectEqualSlices(u8, "/dx", &two);
+    // A file renamed while open is found by its new name; one deleted has
+    // none left.
+    _ = try ok(sys(.rename, @intFromPtr("d/f"), @intFromPtr("d/moved"), 0, 0));
+    try expectLink("/d/moved", fdPath(f, &name));
+    _ = try ok(sys(.unlink, @intFromPtr("d/moved"), 0, 0, 0));
+    try expectLink("/ (deleted)", fdPath(f, &name));
+    // A descriptor that is not open, and the errors of a path.
+    try testing.expectEqual(errOf(.NOENT), linkOf(fdPath(0x4000_0123, &name), &name));
+    const plain = try open("plain", o_creat | o_rdwr);
+    close(plain);
+    try testing.expectEqual(errOf(.INVAL), linkOf("plain", &name));
+    try testing.expectEqual(errOf(.NOENT), linkOf("missing", &name));
+    try testing.expectEqual(errOf(.INVAL), linkOf("plain", name[0..0]));
+    try testing.expectEqual(errOf(.NOENT), linkOf("", &name));
+    // The size is the kernel's `int`.
+    try testing.expectEqual(errOf(.INVAL), sys(.readlink, @intFromPtr("link"), @intFromPtr(&name), 0x8000_0000, 0));
+    try testing.expectEqual(errOf(.INVAL), sys(.readlink, @intFromPtr("link"), @intFromPtr(&name), 1 << 32, 0));
+    // procfs names a descriptor by its digits only.
+    var odd: [64]u8 = undefined;
+    try testing.expectEqual(errOf(.NOENT), linkOf((try std.mem.printSentinel(&odd, "/proc/self/fd/0{d}", .{f}, 0)).ptr, &name));
+    try testing.expectEqual(errOf(.NOENT), linkOf((try std.mem.printSentinel(&odd, "/proc/self/fd/+{d}", .{f}, 0)).ptr, &name));    // A symbolic link, by `readlink` and `readlinkat`.
+    try env.dir.symLink(env.io, "d/target", "link", .{});
+    try expectLink("d/target", "link");
+    var buf: [64]u8 = undefined;
+    const rc = sys(.readlinkat, cwd, @intFromPtr("link"), @intFromPtr(&buf), buf.len);
+    try testing.expectEqualStrings("d/target", buf[0..@intCast(try ok(rc))]);
+    // std's `realPathFile`, which reads the link of the file it opened.
+    const made = try open("d/real", o_creat | o_rdwr);
+    close(made);
+    var real: [64]u8 = undefined;
+    const n = try std.Io.Dir.cwd().realPathFile(std.Options.debug_io, "d/real", &real);
+    try testing.expectEqualStrings("/d/real", real[0..n]);
+}
+
+test "system-call mode: readlink of /proc/self/fd/N gives the simulated path, and of a link its target" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, readsLinks, .{ .iterations = 10, .mode = .syscalls });
+}
+
 fn failsAndStrays(env: *Env) !void {
     _ = env;
     _ = sys(.socket, 17, 3, 0, 0); // AF_PACKET: not emulated
