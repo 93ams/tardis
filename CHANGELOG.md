@@ -5,6 +5,22 @@ numbers (§) are `plan2.md`'s unless an entry names `plan.md`. Revision 1
 was the first draft of `plan2.md`; the core's earlier history is in
 `plan.md` §9 and §14.
 
+## Revision 122 (core: locks on open files, and a second name for a file)
+
+Two things a write-ahead log needs were stray calls in system-call mode: a lock that keeps two writers, or a writer and a checkpointer, out of the same bytes, and a second name for a file. Asked for by a user writing a database.
+
+**Open-file-description locks** (`fcntl` `F_OFD_SETLK`, `F_OFD_SETLKW`, `F_OFD_GETLK`; `src/sim/sysemu.zig`). They belong to the open file, not to the process, so two `open`s of one file by one process do conflict, which is what makes them useful between threads; a `dup` shares its original's. A range locked for writing conflicts with any other over it, one locked for reading only with a write lock. `F_OFD_SETLKW` waits in virtual time until the range is free, and a run in which every task waits fails as a deadlock (Linux would wait forever: it does not look for one among these locks). A lock goes with the last descriptor of its open file and with its node's crash. An open file's own locks are split when part of one is unlocked or changes kind, and joined when they touch, as on Linux, so a log that locks record after record holds one range. `F_OFD_GETLK` says what is in the way, with no process (`l_pid` -1). Ranges from the start, the position or the end, backwards, and to the end, with Linux's `EINVAL` and `EOVERFLOW`.
+
+**`link` and `linkat`**, with `AT_SYMLINK_FOLLOW` and `AT_EMPTY_PATH`, through the simulator's hard link: a crash treats the new name as it treats any other change of names.
+
+**Tested** (`src/tests/sysmode_test.zig`): the conflicts between two opens and between reads and writes; a duplicate's locks; unlocking the middle of a range; a lock that changes kind over part of its range; ranges from the end, from the position and backwards; the errors; a waiter released by a close, after three virtual milliseconds, and by an unlock; a waiter whose own file is closed under it and whose number another open takes, which comes back holding nothing; three hundred records locked one after another and seen as one range; locks kept while a duplicate lives and gone with the last descriptor; a crash; two opens each waiting for the other's byte, which fails the run as a deadlock. Links: a second name that sees later writes and outlives the first, a link from a descriptor, both sides relative to a directory, and what Linux refuses (an existing name, a missing file or directory, a directory, an unknown flag, a file with no name left).
+
+**Review.** A fresh reviewer found four defects, all fixed: a range that starts before the file panicked where Linux says `EINVAL`; a waiter whose file was closed and whose handle another open took would have taken the lock for that other open; a file with no name left could be given one again (`ENOENT` on Linux); and the comment said the limit on ranges was per node where it is per run. It also pointed out that adjacent ranges were not joined, so a log locking record after record would have run out of room after 128; they are joined now. And it listed gaps in the tests, filled.
+
+Tested on Linux (WSL2, static musl, Debug): all 41 test binaries pass, the library suite with 315 passed and 2 skipped; Rust 15 of 15 on musl and on glibc 2.41. Windows, Debug: no test failed, 66 skipped. Not run: the release configurations and `-Dsec`, on either system.
+
+**Limits.** A POSIX record lock (`F_SETLK`) is still granted without being recorded, so it never conflicts with an open-file-description lock, where on Linux the two kinds do. A run holds at most 128 ranges and 64 waiters (`ENOLCK`). `flock` is a stray. `linkat` of `/proc/self/fd/N` (the other way to link an open file) is a stray, as every path under `/proc` is.
+
 ## Revision 121 (core: a stray call's report says where it was made)
 
 A stray system call's report named the call (for about sixty numbers; any other was "a system call", with its number), its count and its first three arguments. It did not say who made it, and in a large program a `sched_getaffinity` or an `ioctl` can come from anywhere: a user found that their stray `sched_getaffinity` came from `std.heap.smp_allocator`, by reading the standard library.

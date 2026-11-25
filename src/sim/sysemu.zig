@@ -20,7 +20,9 @@
 //! `fdatasync`, `ftruncate`, `truncate`, `rename`, `renameat`, `renameat2`,
 //! `unlink`, `unlinkat`, `rmdir`, `mkdir`, `mkdirat`, `stat`, `lstat`,
 //! `fstat`, `newfstatat`, `statx`, `access`, `faccessat`, `faccessat2`,
-//! `getdents64`, `getcwd`, `fcntl` (descriptor flags and record locks),
+//! `link`, `linkat`,
+//! `getdents64`, `getcwd`, `fcntl` (descriptor flags, record locks and
+//! open-file-description locks),
 //! `ioctl` (only to say that a file is not a terminal),
 //! `chmod`, `fchmod`, `fchown`, `getuid` and its three relatives, `clock_gettime`,
 //! `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`,
@@ -31,7 +33,24 @@
 //! directory 0755, owned by user 1000; `fchmod` and `fchown` succeed and
 //! change nothing), record locks (`fcntl` grants every one: POSIX record
 //! locks never conflict inside one process, and the simulation is one
-//! process), `O_NOFOLLOW`, `O_PATH`, `O_DIRECT`, `O_SYNC`. `O_TRUNC`
+//! process), `O_NOFOLLOW`, `O_PATH`, `O_DIRECT`, `O_SYNC`.
+//!
+//! Open-file-description locks (`F_OFD_SETLK`, `F_OFD_SETLKW`,
+//! `F_OFD_GETLK`, revision 122) are modelled: they belong to the open
+//! file, so two `open`s of one file in one process do conflict, and a
+//! `dup` shares its original's. A byte range locked for writing
+//! conflicts with any other lock over it, one locked for reading with a
+//! write lock; `F_OFD_SETLKW` waits, in virtual time, until the range is
+//! free; a lock goes with the last descriptor of its open file, and with
+//! its node's crash. A run in which every task waits for a lock fails as
+//! a deadlock, where Linux would wait forever (it does not detect one
+//! among these locks either). Divergences: a POSIX record lock, which
+//! this grants without recording it, never conflicts with an
+//! open-file-description lock, where on Linux the two kinds do; and a
+//! run has at most `ofd_max` locked ranges over all its nodes, and
+//! `waiters_max` tasks waiting for one (`ENOLCK` past them).
+//!
+//! `O_TRUNC`
 //! without `O_CREAT` is an open and then a truncation, two steps another
 //! task can come between. A sleep that is canceled returns `EINTR` and the
 //! cancellation is spent. `dup`, and `fcntl` with `F_DUPFD` or
@@ -218,6 +237,12 @@ pub fn dropNode(node: ?u16) void {
             if (node == null or h.node == node.?) h.* = .{};
         }
     }
+    for (&ranges) |*r| {
+        if (node == null or r.node == node.?) r.* = .{};
+    }
+    for (&waiters) |*w| {
+        if (node == null or w.node == node.?) w.* = .{};
+    }
 }
 
 /// `dup` of a file or a directory.
@@ -349,6 +374,8 @@ pub fn resetRun() void {
     systhread.reset();
     dups = @splat(.{});
     orphans = @splat(.{});
+    ranges = @splat(.{});
+    waiters = @splat(.{});
 }
 
 /// Entry point for `syscalls.zig`: the value for `rax`, or null for a
@@ -400,6 +427,8 @@ pub fn emulate(number: u64, a: *const [6]u64) ?u64 {
         2 => open(s, at_fdcwd, a[0], @truncate(a[1])),
         85 => open(s, at_fdcwd, a[0], o_creat | o_wronly | o_trunc), // creat
         257 => open(s, fd, a[1], @truncate(a[2])),
+        86 => link(s, at_fdcwd, a[0], at_fdcwd, a[1], 0),
+        265 => link(s, fd, a[1], resolve(s, fdOf(a[2])), a[3], @truncate(a[4])),
         // Calls on a descriptor: only on one of ours.
         0, 1, 3, 5, 8, 16, 17, 18, 19, 20, 32, 72, 74, 75, 77, 91, 93, 217, 295, 296 => {
             if (!simulated(fd)) return null;
@@ -661,6 +690,14 @@ fn close(s: *Sim, raw: i32) u64 {
         }
         unreachable;
     }
+    // Its locks go with it: whoever waits for one of them looks again.
+    // Whoever waits to lock through it stops waiting.
+    var wake = dropLocks(node, value);
+    for (&waiters) |*w| if (w.used and w.node == node and w.value == value) {
+        w.closed = true;
+        wake = true;
+    };
+    if (wake) s.wakeNetwork();
     fileOf(fd).close(s.io());
     return 0;
 }
@@ -829,9 +866,7 @@ fn fcntl(s: *Sim, fd: i32, cmd: u32, arg: u64) ?u64 {
             h.append = arg & o_append != 0;
             return 0;
         },
-        // Open-file-description locks conflict between two descriptions in
-        // one process, which this does not model: not emulated (stray).
-        36, 37, 38 => return null,
+        36, 37, 38 => return ofdLock(s, fd, cmd, arg), // F_OFD_GETLK, F_OFD_SETLK, F_OFD_SETLKW
         5 => { // F_GETLK: nothing would block
             if (arg == 0) return fail(.FAULT);
             @as(*align(1) u16, @ptrFromInt(arg)).* = 2; // l_type = F_UNLCK
@@ -842,7 +877,251 @@ fn fcntl(s: *Sim, fd: i32, cmd: u32, arg: u64) ?u64 {
     }
 }
 
+// --- open-file-description locks --------------------------------------------------
+
+/// `struct flock`.
+const Flock = extern struct {
+    type: i16,
+    whence: i16,
+    start: i64,
+    len: i64,
+    pid: i32,
+};
+
+const f_rdlck = 0;
+const f_wrlck = 1;
+const f_unlck = 2;
+
+/// Locked ranges, over all nodes.
+const ofd_max = 128;
+/// To the end of the file, however long it gets.
+const to_end = std.math.maxInt(u64);
+
+/// A range one open file description holds locked.
+const Range = struct {
+    used: bool = false,
+    node: u16 = 0,
+    /// The handle: its open file description. A `dup` shares it.
+    value: u32 = 0,
+    inode: vfs_mod.InodeId = 0,
+    start: u64 = 0,
+    /// Exclusive; `to_end` for a lock with no end.
+    end: u64 = 0,
+    write: bool = false,
+
+    /// Its open file is still open (closing the last descriptor, or a
+    /// crash, frees it: `dropLocks`, `dropNode`).
+    fn live(r: Range) bool {
+        return r.used;
+    }
+
+    fn overlaps(r: Range, start: u64, end: u64) bool {
+        return r.start < end and start < r.end;
+    }
+};
+
+threadlocal var ranges: [ofd_max]Range = @splat(.{});
+
+/// A task in `F_OFD_SETLKW`: the open file it locks through. A handle
+/// value is reused by the next open once its file is closed, so the
+/// close is noted here, where the waiter finds it.
+const Waiter = struct { used: bool = false, node: u16 = 0, value: u32 = 0, closed: bool = false };
+const waiters_max = 64;
+threadlocal var waiters: [waiters_max]Waiter = @splat(.{});
+
+/// Frees the ranges an open file held; true if there were any.
+fn dropLocks(node: u16, value: u32) bool {
+    var any = false;
+    for (&ranges) |*r| {
+        if (r.live() and r.node == node and r.value == value) {
+            r.* = .{};
+            any = true;
+        }
+    }
+    return any;
+}
+
+/// The first range another open file holds on `inode` that a lock of this
+/// kind over `start`..`end` would conflict with.
+fn conflict(node: u16, value: u32, inode: vfs_mod.InodeId, start: u64, end: u64, exclusive: bool) ?*const Range {
+    for (&ranges) |*r| {
+        if (!r.live() or r.node != node or r.inode != inode or r.value == value) continue;
+        if (!(exclusive or r.write)) continue;
+        if (r.overlaps(start, end)) return r;
+    }
+    return null;
+}
+
+/// `F_OFD_GETLK`, `F_OFD_SETLK`, `F_OFD_SETLKW`.
+fn ofdLock(s: *Sim, fd: i32, cmd: u32, arg: u64) u64 {
+    if (arg == 0) return fail(.FAULT);
+    const fl: *align(1) Flock = @ptrFromInt(arg);
+    // Linux insists on 0: an open file has no process.
+    if (fl.pid != 0) return fail(.INVAL);
+    if (fl.type != f_rdlck and fl.type != f_wrlck and fl.type != f_unlck) return fail(.INVAL);
+    if (cmd == 36 and fl.type == f_unlck) return fail(.INVAL);
+    const h = handleOf(s, fd) orelse return fail(.BADF);
+    const node = s.currentNode();
+    const value = valueOf(fd);
+    const inode = h.inode;
+    // The range, from where `l_whence` says.
+    const base: i64 = switch (fl.whence) {
+        0 => 0, // SEEK_SET
+        1 => @intCast(h.pos), // SEEK_CUR
+        2 => @intCast(s.vfs.inodes[inode].cur_len_bytes), // SEEK_END
+        else => return fail(.INVAL),
+    };
+    // As Linux's `flock_to_posix_lock`: a range that starts before the
+    // file is `EINVAL`, and one whose last byte is past the largest offset
+    // `EOVERFLOW`.
+    const first = std.math.add(i64, base, fl.start) catch return fail(.OVERFLOW);
+    if (first < 0) return fail(.INVAL);
+    var lo: u64 = @intCast(first);
+    var end: u64 = to_end;
+    if (fl.len > 0) {
+        const last = std.math.add(i64, first, fl.len - 1) catch return fail(.OVERFLOW);
+        end = @as(u64, @intCast(last)) + 1;
+    } else if (fl.len < 0) {
+        const from = first + fl.len; // no overflow: `first` is not negative
+        if (from < 0) return fail(.INVAL);
+        lo = @intCast(from);
+        end = @intCast(first);
+    }
+    if (cmd == 36) { // F_OFD_GETLK: what would be in the way, if anything
+        const r = conflict(node, value, inode, lo, end, fl.type == f_wrlck) orelse {
+            fl.type = f_unlck;
+            return 0;
+        };
+        fl.type = if (r.write) f_wrlck else f_rdlck;
+        fl.whence = 0;
+        fl.start = @intCast(r.start);
+        fl.len = if (r.end == to_end) 0 else @intCast(r.end - r.start);
+        fl.pid = -1;
+        return 0;
+    }
+    const exclusive = fl.type == f_wrlck;
+    if (fl.type == f_rdlck and !h.readable) return fail(.BADF);
+    if (exclusive and !h.writable) return fail(.BADF);
+    if (fl.type != f_unlck and conflict(node, value, inode, lo, end, exclusive) != null) {
+        if (cmd == 37) return fail(.AGAIN);
+        const w = for (&waiters) |*w| {
+            if (!w.used) break w;
+        } else return fail(.NOLCK);
+        w.* = .{ .used = true, .node = node, .value = value };
+        defer w.* = .{};
+        while (conflict(node, value, inode, lo, end, exclusive) != null) {
+            s.waitNetwork(null) catch return fail(.INTR);
+            // Its file was closed by another task meanwhile: Linux's call
+            // holds the file it began with, takes the lock on it, and the
+            // lock goes with that file at once. Nothing is held.
+            if (w.closed) return 0;
+        }
+    }
+    return if (setRange(node, value, inode, lo, end, fl.type)) |e| fail(e) else blk: {
+        s.wakeNetwork();
+        break :blk 0;
+    };
+}
+
+/// This open file's locks over `start`..`end` become `kind` (`f_unlck`
+/// removes them), splitting a range it held around them, and joining
+/// the new one with a range of the same kind it touches, as Linux does.
+/// Nothing changes when there is no room for the result (`ENOLCK`).
+fn setRange(node: u16, value: u32, inode: vfs_mod.InodeId, start: u64, end: u64, kind: i16) ?E {
+    var need: usize = if (kind == f_unlck) 0 else 1;
+    var free: usize = 0;
+    for (ranges) |r| {
+        if (!r.live()) {
+            free += 1;
+            continue;
+        }
+        if (r.node != node or r.value != value or r.inode != inode) continue;
+        // One that goes past both ends is left in two pieces; one inside
+        // the range is freed.
+        if (r.start < start and r.end > end) need += 1;
+        if (r.start >= start and r.end <= end) free += 1;
+    }
+    if (need > free) return .NOLCK;
+    var tail: ?Range = null;
+    for (&ranges) |*r| {
+        if (!r.live() or r.node != node or r.value != value or r.inode != inode or !r.overlaps(start, end)) continue;
+        if (r.start < start and r.end > end) {
+            tail = r.*;
+            tail.?.start = end;
+            r.end = start;
+        } else if (r.start < start) {
+            r.end = start;
+        } else if (r.end > end) {
+            r.start = end;
+        } else {
+            r.* = .{};
+        }
+    }
+    if (tail) |t| put(t);
+    if (kind == f_unlck) return null;
+    // Neighbours of the same kind, which now end where it starts or start
+    // where it ends, become part of it.
+    var lo = start;
+    var hi = end;
+    for (&ranges) |*r| {
+        if (!r.live() or r.node != node or r.value != value or r.inode != inode or r.write != (kind == f_wrlck)) continue;
+        if (r.end == start) {
+            lo = r.start;
+            r.* = .{};
+        } else if (r.start == end) {
+            hi = r.end;
+            r.* = .{};
+        }
+    }
+    put(.{ .used = true, .node = node, .value = value, .inode = inode, .start = lo, .end = hi, .write = kind == f_wrlck });
+    return null;
+}
+
+fn put(r: Range) void {
+    for (&ranges) |*slot| if (!slot.live()) {
+        slot.* = r;
+        return;
+    };
+    unreachable; // counted by `setRange`
+}
+
 // --- names -------------------------------------------------------------------
+
+/// `link` and `linkat`: a second name for a file, through the simulator's
+/// hard link, which a crash treats as it treats any change of names.
+/// `AT_SYMLINK_FOLLOW` links what a symbolic link points to;
+/// `AT_EMPTY_PATH` links the file a descriptor is open on.
+fn link(s: *Sim, old_fd: i32, old_ptr: u64, new_fd: i32, new_ptr: u64, flags: u32) ?u64 {
+    const at_symlink_follow = 0x400;
+    if (flags & ~@as(u32, at_symlink_follow | at_empty_path) != 0) return fail(.INVAL);
+    const old = cstr(old_ptr) orelse return fail(.FAULT);
+    const new = cstr(new_ptr) orelse return fail(.FAULT);
+    const new_dir = switch (dirOf(s, new_fd, new)) {
+        .dir => |d| d,
+        .closed => return fail(.BADF),
+        .foreign => return null,
+    };
+    const io = s.io();
+    if (old.len == 0) {
+        if (flags & at_empty_path == 0) return fail(.NOENT);
+        if (old_fd == at_fdcwd or old_fd == root_fd) return fail(.PERM); // a directory
+        if (!simulated(old_fd) or old_fd == random_fd) return null;
+        const h = handleOf(s, old_fd) orelse return fail(.BADF);
+        if (s.vfs.inodes[h.inode].kind == .dir) return fail(.PERM);
+        // A file with no name left stays without one (Linux: unless it
+        // was made with `O_TMPFILE`, which is not emulated).
+        if (s.vfs.inodes[h.inode].cur_links == 0) return fail(.NOENT);
+        fileOf(old_fd).hardLink(io, new_dir, new, .{}) catch |err| return fail(errnoOf(err));
+        return 0;
+    }
+    const old_dir = switch (dirOf(s, old_fd, old)) {
+        .dir => |d| d,
+        .closed => return fail(.BADF),
+        .foreign => return null,
+    };
+    old_dir.hardLink(old, new_dir, new, io, .{ .follow_symlinks = flags & at_symlink_follow != 0 }) catch |err| return fail(errnoOf(err));
+    return 0;
+}
 
 fn rename(s: *Sim, old_fd: i32, old_ptr: u64, new_fd: i32, new_ptr: u64, flags: u32) ?u64 {
     const old = cstr(old_ptr) orelse return fail(.FAULT);

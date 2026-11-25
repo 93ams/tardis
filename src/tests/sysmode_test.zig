@@ -2586,6 +2586,303 @@ test "system-call mode: a message with a descriptor in it, a long datagram in pi
     }
 }
 
+// --- hard links and open-file-description locks (revision 122) -----------------------
+
+fn readWhole(path: [*:0]const u8, buf: []u8) ![]u8 {
+    const fd = try open(path, o_rdonly);
+    defer close(fd);
+    // A read may be short (the simulator says so at times): to the end.
+    var got: usize = 0;
+    while (got < buf.len) {
+        const n = try ok(sys(.read, fd, @intFromPtr(buf.ptr) + got, buf.len - got, 0));
+        if (n == 0) break;
+        got += n;
+    }
+    return buf[0..got];
+}
+
+const at_cwd: usize = @bitCast(@as(isize, -100));
+
+fn hardLinks(env: *Env) !void {
+    _ = env;
+    const f = try open("first", o_creat | o_wronly);
+    try writeAll(f, "linked");
+    // `link`: a second name for the same file.
+    _ = try ok(sys(.link, @intFromPtr("first"), @intFromPtr("second"), 0, 0));
+    try writeAll(f, " twice");
+    var buf: [32]u8 = undefined;
+    try testing.expectEqualStrings("linked twice", try readWhole("second", &buf));
+    // The first name can go; the file stays under the second.
+    _ = try ok(sys(.unlink, @intFromPtr("first"), 0, 0, 0));
+    try testing.expectEqualStrings("linked twice", try readWhole("second", &buf));
+    // `AT_EMPTY_PATH`: the file a descriptor is open on.
+    _ = try ok(sys6(.linkat, f, @intFromPtr(""), at_cwd, @intFromPtr("third"), 0x1000, 0));
+    try testing.expectEqualStrings("linked twice", try readWhole("third", &buf));
+    try testing.expectEqual(errOf(.NOENT), sys6(.linkat, f, @intFromPtr(""), at_cwd, @intFromPtr("fourth"), 0, 0));
+    close(f);
+    // Relative to a directory descriptor.
+    _ = try ok(sys(.mkdir, @intFromPtr("d"), 0o755, 0, 0));
+    const d = try open("d", o_rdonly | o_directory);
+    defer close(d);
+    _ = try ok(sys6(.linkat, at_cwd, @intFromPtr("second"), d, @intFromPtr("inside"), 0, 0));
+    try testing.expectEqualStrings("linked twice", try readWhole("d/inside", &buf));
+    _ = try ok(sys6(.linkat, d, @intFromPtr("inside"), at_cwd, @intFromPtr("back"), 0, 0));
+    try testing.expectEqualStrings("linked twice", try readWhole("back", &buf));
+    // What Linux refuses.
+    try testing.expectEqual(errOf(.EXIST), sys(.link, @intFromPtr("second"), @intFromPtr("third"), 0, 0));
+    try testing.expectEqual(errOf(.NOENT), sys(.link, @intFromPtr("missing"), @intFromPtr("fifth"), 0, 0));
+    try testing.expectEqual(errOf(.NOENT), sys(.link, @intFromPtr("second"), @intFromPtr("nowhere/fifth"), 0, 0));
+    try testing.expectEqual(errOf(.PERM), sys(.link, @intFromPtr("d"), @intFromPtr("dir2"), 0, 0));
+    try testing.expectEqual(errOf(.INVAL), sys6(.linkat, at_cwd, @intFromPtr("second"), at_cwd, @intFromPtr("sixth"), 0x1, 0));
+    // A directory by descriptor; a file whose last name is gone.
+    try testing.expectEqual(errOf(.PERM), sys6(.linkat, d, @intFromPtr(""), at_cwd, @intFromPtr("dir3"), 0x1000, 0));
+    const gone = try open("gone", o_creat | o_wronly);
+    defer close(gone);
+    _ = try ok(sys(.unlink, @intFromPtr("gone"), 0, 0, 0));
+    try testing.expectEqual(errOf(.NOENT), sys6(.linkat, gone, @intFromPtr(""), at_cwd, @intFromPtr("back_again"), 0x1000, 0));
+    try testing.expectEqual(errOf(.NOENT), sys(.access, @intFromPtr("back_again"), 0, 0, 0));
+}
+
+const Flock = extern struct { type: i16, whence: i16 = 0, start: i64, len: i64, pid: i32 = 0 };
+const f_rdlck = 0;
+const f_wrlck = 1;
+const f_unlck = 2;
+const f_ofd_getlk = 36;
+const f_ofd_setlk = 37;
+const f_ofd_setlkw = 38;
+
+fn lockRange(fd: usize, cmd: usize, kind: i16, start: i64, len: i64) isize {
+    var fl: Flock = .{ .type = kind, .start = start, .len = len };
+    return sys(.fcntl, fd, cmd, @intFromPtr(&fl), 0);
+}
+
+fn ofdLocks(env: *Env) !void {
+    _ = env;
+    const a = try open("wal", o_creat | o_rdwr);
+    defer close(a);
+    try writeAll(a, "0123456789abcdefghij");
+    const b = try open("wal", o_rdwr);
+    defer close(b);
+    // One open file locks bytes 0 to 9 for writing; another, opened on
+    // the same file by the same process, is refused any of them.
+    _ = try ok(lockRange(a, f_ofd_setlk, f_wrlck, 0, 10));
+    try testing.expectEqual(errOf(.AGAIN), lockRange(b, f_ofd_setlk, f_rdlck, 5, 1));
+    try testing.expectEqual(errOf(.AGAIN), lockRange(b, f_ofd_setlk, f_wrlck, 9, 0));
+    // What is in the way, and that no process holds it.
+    var fl: Flock = .{ .type = f_rdlck, .start = 5, .len = 1 };
+    _ = try ok(sys(.fcntl, b, f_ofd_getlk, @intFromPtr(&fl), 0));
+    try testing.expectEqual(@as(i16, f_wrlck), fl.type);
+    try testing.expectEqual(@as(i64, 0), fl.start);
+    try testing.expectEqual(@as(i64, 10), fl.len);
+    try testing.expectEqual(@as(i32, -1), fl.pid);
+    fl = .{ .type = f_wrlck, .start = 10, .len = 0 };
+    _ = try ok(sys(.fcntl, b, f_ofd_getlk, @intFromPtr(&fl), 0));
+    try testing.expectEqual(@as(i16, f_unlck), fl.type);
+    // Read locks share; a write lock does not.
+    _ = try ok(lockRange(b, f_ofd_setlk, f_rdlck, 10, 10));
+    _ = try ok(lockRange(a, f_ofd_setlk, f_rdlck, 12, 1));
+    try testing.expectEqual(errOf(.AGAIN), lockRange(a, f_ofd_setlk, f_wrlck, 15, 1));
+    fl = .{ .type = f_wrlck, .start = 15, .len = 1 };
+    _ = try ok(sys(.fcntl, a, f_ofd_getlk, @intFromPtr(&fl), 0));
+    try testing.expectEqual(@as(i16, f_rdlck), fl.type);
+    try testing.expectEqual(@as(i64, 10), fl.start);
+    try testing.expectEqual(@as(i64, 10), fl.len);
+    // A duplicate is the same open file: its own locks are no obstacle.
+    const a2 = try ok(sys(.dup, a, 0, 0, 0));
+    _ = try ok(lockRange(a2, f_ofd_setlk, f_wrlck, 2, 3));
+    // Unlocking the middle of a range leaves both sides locked.
+    _ = try ok(lockRange(a, f_ofd_setlk, f_unlck, 3, 1));
+    _ = try ok(lockRange(b, f_ofd_setlk, f_wrlck, 3, 1));
+    try testing.expectEqual(errOf(.AGAIN), lockRange(b, f_ofd_setlk, f_wrlck, 2, 1));
+    try testing.expectEqual(errOf(.AGAIN), lockRange(b, f_ofd_setlk, f_wrlck, 4, 1));
+    // From the end of the file (20 bytes): byte 0.
+    var from_end: Flock = .{ .type = f_wrlck, .whence = 2, .start = -20, .len = 1 };
+    try testing.expectEqual(errOf(.AGAIN), sys(.fcntl, b, f_ofd_setlk, @intFromPtr(&from_end), 0));
+    // From the position: byte 0 too, after a seek there.
+    _ = try ok(sys(.lseek, b, 0, 0, 0));
+    var from_here: Flock = .{ .type = f_wrlck, .whence = 1, .start = 0, .len = 1 };
+    try testing.expectEqual(errOf(.AGAIN), sys(.fcntl, b, f_ofd_setlk, @intFromPtr(&from_here), 0));
+    // Closing the duplicate keeps them: the open file is still open.
+    close(a2);
+    try testing.expectEqual(errOf(.AGAIN), lockRange(b, f_ofd_setlk, f_wrlck, 2, 1));
+    // Everything this open file holds, at once; then the other may.
+    _ = try ok(lockRange(a, f_ofd_setlk, f_unlck, 0, 0));
+    _ = try ok(lockRange(b, f_ofd_setlk, f_wrlck, 0, 3));
+    // A range given backwards: bytes 10 and 11, under b's read lock.
+    _ = try ok(lockRange(a, f_ofd_setlk, f_rdlck, 12, -2));
+    try testing.expectEqual(errOf(.AGAIN), lockRange(a, f_ofd_setlk, f_wrlck, 12, -2));
+    _ = try ok(lockRange(a, f_ofd_setlk, f_wrlck, 22, -2)); // past the end is fine
+    // A lock that changes kind over part of its range: b's read lock on
+    // 10..19 becomes a write lock on 15, and a's read lock on 10..11 is
+    // no obstacle there.
+    _ = try ok(lockRange(b, f_ofd_setlk, f_wrlck, 15, 1));
+    try testing.expectEqual(errOf(.AGAIN), lockRange(a, f_ofd_setlk, f_rdlck, 15, 1));
+    _ = try ok(lockRange(a, f_ofd_setlk, f_rdlck, 16, 1));
+    // What Linux refuses.
+    fl = .{ .type = f_wrlck, .start = 0, .len = 1, .pid = 7 };
+    try testing.expectEqual(errOf(.INVAL), sys(.fcntl, a, f_ofd_setlk, @intFromPtr(&fl), 0));
+    fl = .{ .type = f_unlck, .start = 0, .len = 1 };
+    try testing.expectEqual(errOf(.INVAL), sys(.fcntl, a, f_ofd_getlk, @intFromPtr(&fl), 0));
+    fl = .{ .type = 9, .start = 0, .len = 1 };
+    try testing.expectEqual(errOf(.INVAL), sys(.fcntl, a, f_ofd_setlk, @intFromPtr(&fl), 0));
+    fl = .{ .type = f_wrlck, .whence = 7, .start = 0, .len = 1 };
+    try testing.expectEqual(errOf(.INVAL), sys(.fcntl, a, f_ofd_setlk, @intFromPtr(&fl), 0));
+    try testing.expectEqual(errOf(.INVAL), lockRange(a, f_ofd_setlk, f_wrlck, -1, 1));
+    try testing.expectEqual(errOf(.INVAL), lockRange(a, f_ofd_setlk, f_wrlck, -10, 5));
+    try testing.expectEqual(errOf(.INVAL), lockRange(a, f_ofd_setlk, f_wrlck, -1, -1));
+    try testing.expectEqual(errOf(.INVAL), lockRange(a, f_ofd_setlk, f_wrlck, 0, -1));
+    // The last byte may be the largest offset, and not past it.
+    const max = std.math.maxInt(i64);
+    try testing.expectEqual(errOf(.OVERFLOW), lockRange(a, f_ofd_setlk, f_wrlck, max, 2));
+    _ = try ok(lockRange(a, f_ofd_setlk, f_wrlck, 1000, max - 1000 + 1));
+    _ = try ok(lockRange(a, f_ofd_setlk, f_unlck, 1000, 0));
+    try testing.expectEqual(errOf(.FAULT), sys(.fcntl, a, f_ofd_setlk, 0, 0));
+    const ro = try open("wal", o_rdonly);
+    defer close(ro);
+    try testing.expectEqual(errOf(.BADF), lockRange(ro, f_ofd_setlk, f_wrlck, 30, 1));
+    _ = try ok(lockRange(ro, f_ofd_setlk, f_rdlck, 30, 1));
+    const wo = try open("wal", o_wronly);
+    defer close(wo);
+    try testing.expectEqual(errOf(.BADF), lockRange(wo, f_ofd_setlk, f_rdlck, 40, 1));
+    // A POSIX record lock is still granted, whatever is locked.
+    _ = try ok(lockRange(wo, 6, f_wrlck, 0, 0)); // F_SETLK
+}
+
+var waiter_result: isize = 1;
+var waiter_at: u64 = 0;
+
+fn lockWaiter(fd: usize) void {
+    waiter_result = lockRange(fd, f_ofd_setlkw, f_wrlck, 0, 1);
+    waiter_at = monotonicNs() catch 0;
+}
+
+fn ofdWaits(env: *Env) !void {
+    const a = try open("wal", o_creat | o_rdwr);
+    const c = try open("wal", o_rdwr);
+    defer close(c);
+    _ = try ok(lockRange(a, f_ofd_setlk, f_wrlck, 0, 1));
+    waiter_result = 1;
+    var waiter = try env.io.concurrent(lockWaiter, .{c});
+    const before = try monotonicNs();
+    const ts: Timespec = .{ .sec = 0, .nsec = 3 * std.time.ns_per_ms };
+    _ = try ok(sys(.nanosleep, @intFromPtr(&ts), 0, 0, 0));
+    try testing.expectEqual(@as(isize, 1), waiter_result); // still waiting
+    // Closing the last descriptor of the open file lets it go.
+    close(a);
+    waiter.await(env.io);
+    try testing.expectEqual(@as(isize, 0), waiter_result);
+    try testing.expect(waiter_at >= before + 3 * std.time.ns_per_ms);
+}
+
+/// Records locked one after another, as a log's writer does: they join
+/// into one range, so there is no end to how many.
+fn ofdRecords(env: *Env) !void {
+    _ = env;
+    const a = try open("wal", o_creat | o_rdwr);
+    const b = try open("wal", o_rdwr);
+    defer close(b);
+    // Through a duplicate, closed first: the locks stay with the open
+    // file until its last descriptor closes.
+    const a2 = try ok(sys(.dup, a, 0, 0, 0));
+    var i: i64 = 0;
+    while (i < 300) : (i += 1) _ = try ok(lockRange(a2, f_ofd_setlk, f_wrlck, i * 10, 10));
+    var fl: Flock = .{ .type = f_rdlck, .start = 1500, .len = 1 };
+    _ = try ok(sys(.fcntl, b, f_ofd_getlk, @intFromPtr(&fl), 0));
+    try testing.expectEqual(@as(i16, f_wrlck), fl.type);
+    try testing.expectEqual(@as(i64, 0), fl.start);
+    try testing.expectEqual(@as(i64, 3000), fl.len);
+    close(a);
+    try testing.expectEqual(errOf(.AGAIN), lockRange(b, f_ofd_setlk, f_rdlck, 2999, 1));
+    close(a2);
+    _ = try ok(lockRange(b, f_ofd_setlk, f_wrlck, 0, 0));
+}
+
+fn unlocksAfter(fd: usize) void {
+    const ts: Timespec = .{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
+    _ = sys(.nanosleep, @intFromPtr(&ts), 0, 0, 0);
+    _ = lockRange(fd, f_ofd_setlk, f_unlck, 0, 0);
+}
+
+fn closesAndReopens(fd: usize) void {
+    const ts: Timespec = .{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
+    _ = sys(.nanosleep, @intFromPtr(&ts), 0, 0, 0);
+    close(fd);
+    // The number, and the handle under it, may be the next open's.
+    reopened = open("other", o_creat | o_rdwr) catch 0;
+}
+
+var reopened: usize = 0;
+
+fn ofdWaitEnds(env: *Env) !void {
+    const a = try open("wal", o_creat | o_rdwr);
+    defer close(a);
+    const c = try open("wal", o_rdwr);
+    defer close(c);
+    // The holder unlocks: the waiter has it.
+    _ = try ok(lockRange(a, f_ofd_setlk, f_wrlck, 0, 1));
+    var unlocker = try env.io.concurrent(unlocksAfter, .{a});
+    try testing.expectEqual(@as(isize, 0), lockRange(c, f_ofd_setlkw, f_wrlck, 0, 1));
+    unlocker.await(env.io);
+    try testing.expectEqual(errOf(.AGAIN), lockRange(a, f_ofd_setlk, f_rdlck, 0, 1));
+    _ = try ok(lockRange(c, f_ofd_setlk, f_unlck, 0, 0));
+    // The waiter's file is closed under it, and another open may take its
+    // number: it comes back with nothing held, by either.
+    _ = try ok(lockRange(a, f_ofd_setlk, f_wrlck, 0, 1));
+    const d = try open("wal", o_rdwr);
+    var closer = try env.io.concurrent(closesAndReopens, .{d});
+    var unlocker2 = try env.io.concurrent(unlocksAfter, .{a});
+    try testing.expectEqual(@as(isize, 0), lockRange(d, f_ofd_setlkw, f_wrlck, 0, 1));
+    closer.await(env.io);
+    unlocker2.await(env.io);
+    _ = try ok(lockRange(a, f_ofd_setlk, f_wrlck, 0, 0));
+    if (reopened != 0) {
+        const e = try open("other", o_rdwr);
+        defer close(e);
+        _ = try ok(lockRange(e, f_ofd_setlk, f_wrlck, 0, 0));
+        close(reopened);
+    }
+}
+
+fn ofdCrash(env: *Env) !void {
+    const a = try open("wal", o_creat | o_rdwr);
+    _ = try ok(lockRange(a, f_ofd_setlk, f_wrlck, 0, 0));
+    try env.crashAndReboot(.process_crash);
+    // The process is gone, and its locks with it.
+    const b = try open("wal", o_creat | o_rdwr);
+    defer close(b);
+    _ = try ok(lockRange(b, f_ofd_setlk, f_wrlck, 0, 0));
+}
+
+fn otherHalf(fd: usize) void {
+    _ = lockRange(fd, f_ofd_setlkw, f_wrlck, 1, 1);
+}
+
+/// Two open files, each waiting for the other's byte.
+fn ofdDeadlock(env: *Env) !void {
+    const a = try open("wal", o_creat | o_rdwr);
+    const b = try open("wal", o_rdwr);
+    _ = try ok(lockRange(a, f_ofd_setlk, f_wrlck, 0, 1));
+    _ = try ok(lockRange(b, f_ofd_setlk, f_wrlck, 1, 1));
+    var other = try env.io.concurrent(otherHalf, .{a});
+    _ = lockRange(b, f_ofd_setlkw, f_wrlck, 0, 1);
+    other.await(env.io);
+}
+
+test "system-call mode: link and linkat give a file a second name" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, hardLinks, .{ .iterations = 20, .mode = .syscalls });
+}
+
+test "system-call mode: open-file-description locks conflict between two opens of a file, wait, and go with the file" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, ofdLocks, .{ .iterations = 20, .mode = .syscalls });
+    try tardis.check(gpa, ofdWaits, .{ .iterations = 50, .mode = .syscalls });
+    try tardis.check(gpa, ofdCrash, .{ .iterations = 10, .mode = .syscalls });
+    try tardis.check(gpa, ofdRecords, .{ .iterations = 5, .mode = .syscalls });
+    try tardis.check(gpa, ofdWaitEnds, .{ .iterations = 50, .mode = .syscalls });
+    try testing.expectError(error.Deadlock, tardis.check(gpa, ofdDeadlock, .{ .iterations = 3, .mode = .syscalls, .report = false, .shrink = false }));
+}
+
 // --- threads (revision 97, `systhread.zig`) -----------------------------------------
 
 /// A thread's work, by system calls only: sleep, count, and say so on a pipe.
