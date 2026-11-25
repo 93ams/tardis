@@ -1,6 +1,7 @@
 # The whole suite on Linux, macOS and Windows (plan.md §10): the same
 # seeds must give the same traces on each, and the golden trace hash
-# recorded on Windows is checked on all three.
+# recorded on Windows is checked on all of them. Linux runs on x86_64 and
+# on arm64; system-call mode is x86_64 only, and its tests skip on arm64.
 name: test
 
 on:
@@ -15,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
