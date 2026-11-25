@@ -234,7 +234,7 @@ C++ program, on musl and on glibc, as part of `zig build test`.
 What to know before relying on it:
 
 - IPv4 sockets are emulated, blocking and non-blocking, with pipes,
-  `eventfd`, `poll` and `epoll`. `select`, `mmap` of a file, `fork`,
+  `eventfd`, `poll` and `epoll`, and a file can be mapped (`mmap`). `select`, `fork`,
   `dup2` and `dup3` are stray calls. Simulated descriptor numbers are large, so a
   library that indexes a table by descriptor (libuv, libevent) will not
   work.

@@ -107,6 +107,12 @@ const Broken = enum { nothing, cannot_open, cannot_read, integrity, row_lost };
 threadlocal var broken: Broken = .nothing;
 
 fn scenario(env: *Env, comptime sync: Sync) !void {
+    return scenarioIn(env, sync, false);
+}
+
+/// In write-ahead-log mode (`wal`), SQLite keeps an index of the log in a
+/// `-shm` file that every connection maps shared (`mmap`, `MAP_SHARED`).
+fn scenarioIn(env: *Env, comptime sync: Sync, comptime wal: bool) !void {
     const pragma = "PRAGMA synchronous=" ++ switch (sync) {
         .off => "OFF",
         .full => "FULL",
@@ -119,6 +125,10 @@ fn scenario(env: *Env, comptime sync: Sync) !void {
         // After the crash the connection's descriptors are closed, as
         // the process's would be: closing it then only frees its memory.
         defer _ = sqlite3_close(db);
+        if (wal) {
+            const mode = try query(db, "PRAGMA journal_mode=WAL");
+            if (!std.mem.eql(u8, mode.text(), "wal")) return error.NotWal;
+        }
         try exec(db, pragma);
         try exec(db, "CREATE TABLE kv(k INTEGER PRIMARY KEY, v TEXT)");
         try exec(db, "INSERT INTO kv VALUES(1, 'one')");
@@ -181,6 +191,15 @@ test "sqlite: with synchronous=OFF an acknowledged commit does not survive a pow
     replay.report = false;
     replay.replay = shrunk.token();
     try testing.expectError(error.AssertionFailed, tardis.check(testing.allocator, syncOff, replay));
+}
+
+fn walFull(env: *Env) !void {
+    return scenarioIn(env, .full, true);
+}
+
+test "sqlite: in WAL mode, with its index mapped shared, synchronous=FULL keeps the acknowledged commit" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try tardis.check(testing.allocator, walFull, options);
 }
 
 test "sqlite: with synchronous=EXTRA the acknowledged commit survives" {

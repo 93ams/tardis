@@ -9,7 +9,7 @@ another library.
 
 The README's ["Choosing a mode"](../README.md#choosing-a-mode) has the
 table of what the mode simulates. Read its list of limits first: if the
-library needs `mmap` of a file, `select` or `fork`, stop there.
+library needs `select` or `fork`, stop there.
 
 ## 1. Build the library into the test
 
@@ -174,9 +174,7 @@ but the run proves nothing, so it fails whatever the body returned.
 
 What to do depends on the call:
 
-- A feature the library can do without: turn it off. SQLite's WAL mode
-  maps a file into memory, which is not emulated; the default rollback
-  journal needs no `mmap`.
+- A feature the library can do without: turn it off.
 - A call that asks about the real machine (a path under `/proc`): it is
   usually made once, on first use, and often has a compile-time or
   run-time switch. The number of processors is answered: one, or
@@ -260,7 +258,9 @@ On musl and on glibc.
 
 A pair of connected sockets (`socketpair`, Unix domain, stream) is
 answered. A named Unix-domain socket is not: `socket(AF_UNIX, ...)`
-fails with `EAFNOSUPPORT`. `sendmsg` and `recvmsg` are answered on
+fails with `EAFNOSUPPORT`. A simulated file can be mapped (`mmap`,
+shared or private; revision 123), which SQLite's WAL mode needs.
+`sendmsg` and `recvmsg` are answered on
 IPv4 sockets and on a pair, without ancillary data: nothing passes a
 descriptor from one end of a pair to the other, and `sendmmsg` and
 `recvmmsg` are not answered.

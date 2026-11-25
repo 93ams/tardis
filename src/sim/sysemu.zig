@@ -57,7 +57,8 @@
 //! `F_DUPFD_CLOEXEC`, give a file or a directory a second descriptor with
 //! the same position and flags (`dups`, below), as they do a socket
 //! (`sysnet.zig`) and a pipe, an eventfd or an epoll set (`sysfd.zig`).
-//! `O_TMPFILE`, `mmap` of a simulated file, `dup2`, `dup3` and `select`
+//! `mmap` of a simulated file, shared or private, is emulated (below,
+//! "file mappings"). `O_TMPFILE`, `dup2`, `dup3` and `select`
 //! are not emulated: they are stray, as is `dup` of the root descriptor
 //! or of the random device, any
 //! path under `/proc`, `/sys` or `/dev` (but `/dev/urandom`, and five
@@ -74,6 +75,7 @@ const Sim = @import("Sim.zig");
 const vfs_mod = @import("../model/vfs.zig");
 const sysnet = @import("sysnet.zig");
 const sysfd = @import("sysfd.zig");
+const syscalls = @import("syscalls.zig");
 const systhread = @import("systhread.zig");
 
 /// Set in every simulated descriptor.
@@ -243,6 +245,7 @@ pub fn dropNode(node: ?u16) void {
     for (&waiters) |*w| {
         if (node == null or w.node == node.?) w.* = .{};
     }
+    dropBackings(node);
 }
 
 /// `dup` of a file or a directory.
@@ -376,6 +379,7 @@ pub fn resetRun() void {
     orphans = @splat(.{});
     ranges = @splat(.{});
     waiters = @splat(.{});
+    dropBackings(null);
 }
 
 /// Entry point for `syscalls.zig`: the value for `rax`, or null for a
@@ -422,6 +426,8 @@ pub fn emulate(number: u64, a: *const [6]u64) ?u64 {
         return sysfd.emulate(s, number, a);
     }
     return switch (number) {
+        9 => mapFile(s, a),
+        26 => msync(s, a[0], a[1], @truncate(a[2])),
         7 => poll(s, a[0], a[1], pollDeadline(s, a[2])),
         271 => ppoll(s, a[0], a[1], a[2]),
         2 => open(s, at_fdcwd, a[0], @truncate(a[1])),
@@ -596,6 +602,7 @@ fn open(s: *Sim, dirfd: i32, path_ptr: u64, flags: u32) ?u64 {
     if (flags & o_append != 0) if (s.vfs.handle(@bitCast(@as(i32, handle)))) |h| {
         h.append = true;
     } else |_| {};
+    if (flags & o_trunc != 0) resizeNode(s);
     return fdFromHandle(handle);
 }
 
@@ -732,6 +739,8 @@ fn read(s: *Sim, fd: i32, buf_ptr: u64, len: u64, offset: ?u64) u64 {
 }
 
 fn readInto(s: *Sim, fd: i32, bufs: []const []u8, offset: ?u64) u64 {
+    // What was stored into a mapping is what a read sees.
+    if (backingFor(s, fd)) |b| _ = syncOut(s, b);
     const io = s.io();
     const f = fileOf(fd);
     if (offset) |at| {
@@ -757,11 +766,18 @@ fn write(s: *Sim, fd: i32, buf_ptr: u64, len: u64, offset: ?u64) u64 {
 fn writeFrom(s: *Sim, fd: i32, bufs: []const []const u8, offset: ?u64) u64 {
     const io = s.io();
     const f = fileOf(fd);
+    // A mapping of the file keeps what was stored into it elsewhere, and
+    // sees the bytes written.
+    if (backingFor(s, fd)) |m| _ = syncOut(s, m);
     if (offset) |at| {
         if (@as(i64, @bitCast(at)) < 0) return fail(.INVAL);
-        return f.writePositional(io, bufs, at) catch |err| return fail(errnoOf(err));
+        const n = f.writePositional(io, bufs, at) catch |err| return fail(errnoOf(err));
+        afterWrite(s, fd, at, n);
+        return n;
     }
-    return f.writeStreaming(io, &.{}, bufs, 1) catch |err| return fail(errnoOf(err));
+    const n = f.writeStreaming(io, &.{}, bufs, 1) catch |err| return fail(errnoOf(err));
+    afterWrite(s, fd, null, n);
+    return n;
 }
 
 /// `readv`, `writev`, `preadv`, `pwritev`: the first `iovecs_max` vectors
@@ -820,6 +836,9 @@ fn fsync(s: *Sim, fd: i32, data_only: bool) u64 {
         return 0;
     }
     if (handleOf(s, fd) == null) return fail(.BADF);
+    // Stored into a mapping is in the file, and the sync keeps it; a
+    // store that could not be written (the disk full) fails the sync.
+    if (backingFor(s, fd)) |b| if (syncOut(s, b)) |e| return fail(e);
     if (data_only) {
         s.fileDataSync(fileOf(fd)) catch |err| return fail(errnoOf(err));
     } else {
@@ -832,7 +851,10 @@ fn ftruncate(s: *Sim, fd: i32, len: u64) u64 {
     const h = handleOf(s, fd) orelse return fail(.BADF);
     if (@as(i64, @bitCast(len)) < 0) return fail(.INVAL);
     if (!h.writable or s.vfs.inodes[h.inode].kind != .file) return fail(.INVAL);
+    if (backingFor(s, fd)) |m| _ = syncOut(s, m);
     fileOf(fd).setLength(s.io(), len) catch |err| return fail(errnoOf(err));
+    // Looked up again: the call may have let another task map the file.
+    resizeNode(s);
     return 0;
 }
 
@@ -843,7 +865,275 @@ fn truncate(s: *Sim, path_ptr: u64, len: u64) ?u64 {
     const io = s.io();
     const f = Sim.rootDir().openFile(io, path, .{ .mode = .write_only, .allow_directory = false }) catch |err| return fail(errnoOf(err));
     defer f.close(io);
+    if (backingFor(s, @bitCast(@as(u32, @bitCast(@as(i32, f.handle))) | fd_bit))) |m| _ = syncOut(s, m);
     f.setLength(io, len) catch |err| return fail(errnoOf(err));
+    resizeNode(s);
+    return 0;
+}
+
+// --- file mappings ------------------------------------------------------------------
+//
+// `mmap` of a simulated file, `MAP_SHARED` or `MAP_PRIVATE`. The kernel
+// has no such file, so the harness makes one it has: a memory file
+// (`memfd_create`) per mapped simulated file, holding its bytes, and maps
+// that where the code asked, with the code's own address, protection,
+// flags and offset. Every mapping of one file is of the one memory file,
+// so a store through one is seen through another at once, and a private
+// mapping sees the file until it writes to a page, as on Linux. The
+// memory file is as long as the simulated file, to whole pages: a page
+// wholly past the end raises `SIGBUS`, as on Linux. A mapped file is
+// kept (`open_count`) while its memory file is, as a mapping keeps an
+// inode on Linux: its number is not given to another file.
+//
+// The simulated file stays the one the simulator writes, syncs and
+// crashes. What was stored into a shared mapping reaches it (`syncOut`)
+// before a read, a write, a truncation or a sync of the file by system
+// call, at `msync` of a range that maps it, and before a crash that only
+// ends the process (`beforeCrash`: the page cache survives it). A power
+// loss loses what no sync wrote, as a power loss loses dirty pages.
+// Bytes written by system call reach the mappings (`syncIn`, wherever the
+// write landed, an appending one at the end), and so does a change of
+// length; bytes stored past the end of the file read as zeros once the
+// file grows over them, as on Linux.
+//
+// Divergences: the test's own reads and writes through `env.dir` and
+// `env.io` of a mapped file are not carried over either way (a write
+// there is undone by the next carrying over: write a mapped file by
+// system call); Linux writes dirty pages back on its own, and here only
+// those calls do, so a power loss keeps no stored byte that no call
+// carried over and synced; what is carried over is written to the model
+// directly, with no trace event and no fault injected (the `fsync` after
+// it is faulted as usual, and a write that fails there, the disk full,
+// fails that `fsync` or `msync`); `munmap` carries nothing over (the
+// memory file keeps the bytes, and the next of those calls carries
+// them); a mapped file is kept until the run ends or its node crashes,
+// though Linux lets it go at the last `munmap`; mappings the code never
+// unmapped stay in the process when its run ends. At most
+// `backings_max` mapped files at once and `mappings_max` mappings
+// remembered for `msync`. `mremap`, `madvise` and `mprotect` of a mapping
+// are the kernel's, on the memory file.
+
+const page = vfs_mod.page_bytes;
+const prot_write = 0x2;
+const map_type_mask = 0x3;
+const map_shared = 0x1;
+const map_shared_validate = 0x3;
+
+/// A simulated file that is mapped, and the memory file that holds it.
+const Backing = struct {
+    used: bool = false,
+    node: u16 = 0,
+    inode: vfs_mod.InodeId = 0,
+    memfd: u64 = 0,
+    /// The memory file's length.
+    size: u64 = 0,
+    /// The simulated file's length when the memory file last took it.
+    len: u64 = 0,
+};
+const backings_max = 16;
+threadlocal var backings: [backings_max]Backing = @splat(.{});
+
+/// A shared mapping the code made, for `msync` to find its file by.
+const Mapping = struct { used: bool = false, backing: u8 = 0, addr: u64 = 0, len: u64 = 0 };
+const mappings_max = 64;
+threadlocal var mappings: [mappings_max]Mapping = @splat(.{});
+
+fn real(number: u64, a: u64, b: u64, c: u64, d: u64, e: u64, f: u64) u64 {
+    return syscalls.rawUntrapped(number, a, b, c, d, e, f);
+}
+
+fn failed(rc: u64) bool {
+    return @as(i64, @bitCast(rc)) < 0;
+}
+
+/// The memory files of a node (null: of all), closed. The mappings of a
+/// process that is gone, or of a run that is over, are left: the code
+/// that made them has ended, and an address it may have unmapped and
+/// the allocator reused is not the harness's to unmap.
+fn dropBackings(node: ?u16) void {
+    for (&backings, 0..) |*b, i| {
+        if (!b.used or (node != null and b.node != node.?)) continue;
+        _ = real(3, b.memfd, 0, 0, 0, 0, 0);
+        b.* = .{};
+        for (&mappings) |*m| {
+            if (m.used and m.backing == i) m.* = .{};
+        }
+    }
+}
+
+/// The node's file system a backing's file is on.
+fn vfsOf(s: *Sim, b: *const Backing) *vfs_mod.Vfs {
+    return &s.nodes[b.node].vfs;
+}
+
+fn backingOf(node: u16, inode: vfs_mod.InodeId) ?*Backing {
+    for (&backings) |*b| if (b.used and b.node == node and b.inode == inode) return b;
+    return null;
+}
+
+/// The backing of the file a descriptor is open on, if it is mapped.
+fn backingFor(s: *Sim, fd: i32) ?*Backing {
+    const h = handleOf(s, fd) orelse return null;
+    return backingOf(s.currentNode(), h.inode);
+}
+
+fn wholePages(n: u64) u64 {
+    return std.mem.alignForward(u64, n, page);
+}
+
+/// What was stored into the mappings, written to the simulated file: the
+/// pages that differ, up to the file's length (a store past it is lost,
+/// as on Linux). The error of a write that failed (the disk full), for
+/// `fsync` and `msync` to report.
+fn syncOut(s: *Sim, b: *Backing) ?E {
+    const v = vfsOf(s, b);
+    const len = v.inodes[b.inode].cur_len_bytes;
+    var mem: [page]u8 = undefined;
+    var file: [page]u8 = undefined;
+    var off: u64 = 0;
+    while (off < len and off < b.size) : (off += page) {
+        const n: usize = @intCast(@min(page, len - off, b.size - off));
+        if (failed(real(17, b.memfd, @intFromPtr(&mem), n, off, 0, 0))) return .IO;
+        _ = v.read(b.inode, off, file[0..n]);
+        if (std.mem.eql(u8, mem[0..n], file[0..n])) continue;
+        const wrote = v.write(b.inode, off, mem[0..n]) catch |err| return errnoOf(err);
+        if (wrote < n) return .NOSPC;
+    }
+    return null;
+}
+
+/// The memory file made as long as the simulated file, to whole pages,
+/// with zeros past its end: past the old end too, where a store past the
+/// end may have left bytes that the file, grown over them, reads as zeros.
+fn resize(s: *Sim, b: *Backing) void {
+    const v = vfsOf(s, b);
+    const len = v.inodes[b.inode].cur_len_bytes;
+    const zeros: [page]u8 = @splat(0);
+    if (len > b.len and b.len < b.size) {
+        _ = real(18, b.memfd, @intFromPtr(&zeros), @min(b.size, len) - b.len, b.len, 0, 0);
+    }
+    const size = wholePages(len);
+    if (size != b.size) {
+        _ = real(77, b.memfd, size, 0, 0, 0, 0); // ftruncate
+        b.size = size;
+    }
+    if (len < size) _ = real(18, b.memfd, @intFromPtr(&zeros), size - len, len, 0, 0);
+    b.len = len;
+}
+
+/// Bytes `off`..`off + n` of the simulated file, copied into the memory
+/// file, after its length is brought up to date.
+fn syncIn(s: *Sim, b: *Backing, off: u64, n: u64) void {
+    resize(s, b);
+    const v = vfsOf(s, b);
+    var buf: [page]u8 = undefined;
+    var at = off;
+    const end = @min(off +| n, v.inodes[b.inode].cur_len_bytes);
+    while (at < end) {
+        const k: usize = @intCast(@min(page, end - at));
+        const got = v.read(b.inode, at, buf[0..k]);
+        if (got == 0) break;
+        _ = real(18, b.memfd, @intFromPtr(&buf), got, at, 0, 0); // pwrite64
+        at += got;
+    }
+}
+
+/// After a write of `n` bytes through descriptor `fd` (at `offset`, or at
+/// its position): the mappings see them where they landed. The backing
+/// is looked up now, after the write, which may have let another task
+/// map the file meanwhile.
+fn afterWrite(s: *Sim, fd: i32, offset: ?u64, n: u64) void {
+    const h = handleOf(s, fd) orelse return;
+    const b = backingOf(s.currentNode(), h.inode) orelse return;
+    // An appending descriptor writes at the end whatever the offset, and
+    // a streaming write leaves the position just past what it wrote.
+    const end: u64 = if (h.append) vfsOf(s, b).inodes[b.inode].cur_len_bytes else if (offset) |at| at + n else h.pos;
+    syncIn(s, b, end -| n, n);
+}
+
+/// After a truncation: every mapped file of the node takes its length
+/// again (the truncated one among them).
+fn resizeNode(s: *Sim) void {
+    const node = s.currentNode();
+    for (&backings) |*b| if (b.used and b.node == node) resize(s, b);
+}
+
+/// A crash is coming. One that only ends the process (`process_crash`)
+/// leaves the page cache, and what was stored into a shared mapping with
+/// it: it reaches the file first. A power loss loses it. Either way the
+/// mappings' hold on their files goes with the process, before the crash
+/// closes the file system's handles.
+pub fn beforeCrash(s: *Sim, node: ?u16, mode: Sim.CrashMode) void {
+    for (&backings) |*b| {
+        if (!b.used or (node != null and b.node != node.?)) continue;
+        if (mode == .process_crash) _ = syncOut(s, b);
+        vfsOf(s, b).inodes[b.inode].open_count -= 1;
+    }
+    dropBackings(node);
+}
+
+/// `mmap` of a simulated file.
+fn mapFile(s: *Sim, a: *const [6]u64) ?u64 {
+    const fd = resolve(s, fdOf(a[4]));
+    if (!simulated(fd) or fd == random_fd) return null;
+    if (fd == root_fd) return fail(.NODEV);
+    const h = handleOf(s, fd) orelse return fail(.BADF);
+    if (s.vfs.inodes[h.inode].kind != .file) return fail(.NODEV);
+    const prot = a[2];
+    const flags = a[3];
+    const shared = flags & map_type_mask == map_shared or flags & map_type_mask == map_shared_validate;
+    // As Linux: the file must be open for reading, and for writing too if
+    // a shared mapping may be written, and not for appending then.
+    if (!h.readable) return fail(.ACCES);
+    if (shared and prot & prot_write != 0 and (!h.writable or h.append)) return fail(.ACCES);
+    const node = s.currentNode();
+    var made = false;
+    const b = backingOf(node, h.inode) orelse blk: {
+        const slot = for (&backings) |*b| {
+            if (!b.used) break b;
+        } else return null;
+        const memfd = real(319, @intFromPtr("tardis-map"), 1, 0, 0, 0, 0); // memfd_create, MFD_CLOEXEC
+        if (failed(memfd)) return memfd;
+        slot.* = .{ .used = true, .node = node, .inode = h.inode, .memfd = memfd };
+        syncIn(s, slot, 0, s.vfs.inodes[h.inode].cur_len_bytes);
+        made = true;
+        break :blk slot;
+    };
+    const rc = real(9, a[0], a[1], prot, flags, b.memfd, a[5]);
+    if (failed(rc)) {
+        if (made) {
+            _ = real(3, b.memfd, 0, 0, 0, 0, 0);
+            b.* = .{};
+        }
+        return rc;
+    }
+    // The file is kept while it is mapped.
+    if (made) s.vfs.inodes[h.inode].open_count += 1;
+    const index: u8 = @intCast((@intFromPtr(b) - @intFromPtr(&backings)) / @sizeOf(Backing));
+    // A new mapping replaces what an old one at its addresses was.
+    for (&mappings) |*m| {
+        if (m.used and m.addr < rc + a[1] and rc < m.addr + m.len) m.* = .{};
+    }
+    if (shared) for (&mappings) |*m| if (!m.used) {
+        m.* = .{ .used = true, .backing = index, .addr = rc, .len = a[1] };
+        break;
+    };
+    return rc;
+}
+
+/// `msync`: the kernel checks the range; what was stored into the files
+/// mapped shared in it then reaches them, and `MS_SYNC` makes it durable.
+fn msync(s: *Sim, addr: u64, len: u64, flags: u32) u64 {
+    const rc = real(26, addr, len, flags, 0, 0, 0);
+    if (failed(rc)) return rc;
+    var done: [backings_max]bool = @splat(false);
+    for (mappings) |m| {
+        if (!m.used or done[m.backing] or !(m.addr < addr + len and addr < m.addr + m.len)) continue;
+        done[m.backing] = true;
+        const b = &backings[m.backing];
+        if (syncOut(s, b)) |e| return fail(e);
+        if (flags & 4 != 0) vfsOf(s, b).dataSync(b.inode); // MS_SYNC
+    }
     return 0;
 }
 

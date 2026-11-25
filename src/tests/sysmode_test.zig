@@ -646,14 +646,17 @@ fn mapsSimulatedFile(env: *Env) !void {
     _ = env;
     const fd = try open("m", o_creat | o_rdwr);
     defer close(fd);
-    // PROT_READ, MAP_PRIVATE: the kernel has no such file to map.
+    // PROT_READ, MAP_PRIVATE: the kernel has no such file, and the
+    // harness maps one it has (file mappings, revision 123).
     const rc: isize = @bitCast(linux.syscall6(.mmap, 0, 4096, 1, 2, fd, 0));
-    try testing.expect(rc < 0);
+    try testing.expect(rc >= 0);
+    _ = sys(.munmap, @intCast(rc), 4096, 0, 0);
 }
 
 /// A duplicate's number is not a file's (bit 30), and is no more the
 /// kernel's to map (found by review, revision 101: it went to the kernel,
-/// which said `EBADF`, and the run passed).
+/// which said `EBADF`, and the run passed). It maps the file it is a
+/// duplicate of.
 fn mapsDuplicate(env: *Env) !void {
     _ = env;
     const fd = try open("m", o_creat | o_rdwr);
@@ -661,7 +664,8 @@ fn mapsDuplicate(env: *Env) !void {
     const d = try ok(sys(.dup, fd, 0, 0, 0));
     defer close(d);
     const rc: isize = @bitCast(linux.syscall6(.mmap, 0, 4096, 1, 2, d, 0));
-    try testing.expect(rc < 0);
+    try testing.expect(rc >= 0);
+    _ = sys(.munmap, @intCast(rc), 4096, 0, 0);
 }
 
 /// The random device and the root descriptor are not duplicated, by `dup`
@@ -828,9 +832,7 @@ test "system-call mode: a call that is not emulated, or on a real descriptor, fa
     try testing.expectError(error.StraySyscall, tardis.check(gpa, opensSocket, options));
     try testing.expectError(error.StraySyscall, tardis.check(gpa, readsRealDescriptor, options));
     try testing.expectError(error.StraySyscall, tardis.check(gpa, opensBesideRealDescriptor, options));
-    try testing.expectError(error.StraySyscall, tardis.check(gpa, mapsSimulatedFile, options));
     try testing.expectError(error.StraySyscall, tardis.check(gpa, otherIoctlOnFile, options));
-    try testing.expectError(error.StraySyscall, tardis.check(gpa, mapsDuplicate, options));
     try testing.expectError(error.StraySyscall, tardis.check(gpa, duplicatesRandomDevice, options));
     try testing.expectError(error.StraySyscall, tardis.check(gpa, duplicatesRoot, options));
     try testing.expectError(error.StraySyscall, tardis.check(gpa, opensHostTree, options));
@@ -2881,6 +2883,255 @@ test "system-call mode: open-file-description locks conflict between two opens o
     try tardis.check(gpa, ofdRecords, .{ .iterations = 5, .mode = .syscalls });
     try tardis.check(gpa, ofdWaitEnds, .{ .iterations = 50, .mode = .syscalls });
     try testing.expectError(error.Deadlock, tardis.check(gpa, ofdDeadlock, .{ .iterations = 3, .mode = .syscalls, .report = false, .shrink = false }));
+}
+
+// --- file mappings ------------------------------------------------------------------
+
+const prot_read = 0x1;
+const prot_write = 0x2;
+const map_shared = 0x1;
+const map_private = 0x2;
+const ms_sync = 0x4;
+
+fn mapOf(fd: usize, len: usize, prot: usize, flags: usize, off: usize) ![*]u8 {
+    const rc = sys6(.mmap, 0, len, prot, flags, fd, off);
+    if (rc < 0) {
+        std.debug.print("mmap failed: {d}\n", .{rc});
+        return error.MapFailed;
+    }
+    return @ptrFromInt(@as(usize, @intCast(rc)));
+}
+
+fn unmap(p: [*]u8, len: usize) void {
+    _ = sys(.munmap, @intFromPtr(p), len, 0, 0);
+}
+
+fn preadAll(fd: usize, buf: []u8, off: usize) !void {
+    var got: usize = 0;
+    while (got < buf.len) {
+        const n = try ok(sys(.pread64, fd, @intFromPtr(buf.ptr) + got, buf.len - got, off + got));
+        if (n == 0) return error.ShortFile;
+        got += n;
+    }
+}
+
+fn pwriteAll(fd: usize, bytes: []const u8, off: usize) !void {
+    var done: usize = 0;
+    while (done < bytes.len) done += try ok(sys(.pwrite64, fd, @intFromPtr(bytes.ptr) + done, bytes.len - done, off + done));
+}
+
+/// A file made durable, name and all, of `len` zero bytes.
+fn durableFile(name: [*:0]const u8, len: usize) !usize {
+    const fd = try open(name, o_creat | o_rdwr);
+    _ = try ok(sys(.ftruncate, fd, len, 0, 0));
+    _ = try ok(sys(.fsync, fd, 0, 0, 0));
+    const dir = try open(".", o_rdonly | o_directory);
+    defer close(dir);
+    _ = try ok(sys(.fsync, dir, 0, 0, 0));
+    return fd;
+}
+
+fn sharedMappings(env: *Env) !void {
+    _ = env;
+    const fd = try durableFile("shm", 8192);
+    defer close(fd);
+    const p = try mapOf(fd, 8192, prot_read | prot_write, map_shared, 0);
+    defer unmap(p, 8192);
+    // A store is what a read of the file sees.
+    @memcpy(p[0..5], "hello");
+    var buf: [5]u8 = undefined;
+    try preadAll(fd, &buf, 0);
+    try testing.expectEqualStrings("hello", &buf);
+    // A write to the file is what the mapping sees, and the store next to
+    // it stays.
+    try pwriteAll(fd, "WORLD", 100);
+    try testing.expectEqualStrings("WORLD", p[100..105]);
+    try testing.expectEqualStrings("hello", p[0..5]);
+    // A second mapping of the second page is the same memory.
+    const q = try mapOf(fd, 4096, prot_read | prot_write, map_shared, 4096);
+    defer unmap(q, 4096);
+    @memcpy(p[4096..4099], "abc");
+    try testing.expectEqualStrings("abc", q[0..3]);
+    @memcpy(q[10..13], "xyz");
+    try testing.expectEqualStrings("xyz", p[4106..4109]);
+    // A private mapping sees the file, and keeps its own stores.
+    const r = try mapOf(fd, 4096, prot_read | prot_write, map_private, 0);
+    defer unmap(r, 4096);
+    try testing.expectEqualStrings("hello", r[0..5]);
+    @memcpy(r[0..5], "priv!");
+    try preadAll(fd, &buf, 0);
+    try testing.expectEqualStrings("hello", &buf);
+    try testing.expectEqualStrings("hello", p[0..5]);
+    // A read through `read` after a store, at the position.
+    @memcpy(p[200..204], "read");
+    _ = try ok(sys(.lseek, fd, 200, 0, 0));
+    var four: [4]u8 = undefined;
+    var got: usize = 0;
+    while (got < 4) got += try ok(sys(.read, fd, @intFromPtr(&four) + got, 4 - got, 0));
+    try testing.expectEqualStrings("read", &four);
+    // The file grows under a mapping that was longer than it: the new
+    // page is there, zero, and a store into it reaches the file.
+    const small = try durableFile("grows", 4096);
+    defer close(small);
+    const g = try mapOf(small, 8192, prot_read | prot_write, map_shared, 0);
+    defer unmap(g, 8192);
+    _ = try ok(sys(.ftruncate, small, 8192, 0, 0));
+    try testing.expectEqual(@as(u8, 0), g[5000]);
+    @memcpy(g[5000..5003], "new");
+    var three: [3]u8 = undefined;
+    try preadAll(small, &three, 5000);
+    try testing.expectEqualStrings("new", &three);
+    // Bytes of a shrunk file are gone from the mapping's last page.
+    @memcpy(g[1000..1004], "keep");
+    _ = try ok(sys(.ftruncate, small, 1002, 0, 0));
+    try testing.expectEqualStrings("ke", g[1000..1002]);
+    try testing.expectEqual(@as(u8, 0), g[1002]);
+    // What Linux refuses.
+    const ro = try open("shm", o_rdonly);
+    defer close(ro);
+    try testing.expectEqual(errOf(.ACCES), sys6(.mmap, 0, 4096, prot_read | prot_write, map_shared, ro, 0));
+    const rp = try mapOf(ro, 4096, prot_read | prot_write, map_private, 0); // private may be written
+    unmap(rp, 4096);
+    const wo = try open("shm", o_wronly);
+    defer close(wo);
+    try testing.expectEqual(errOf(.ACCES), sys6(.mmap, 0, 4096, prot_read, map_shared, wo, 0));
+    const ap = try open("shm", o_rdwr | o_append);
+    defer close(ap);
+    try testing.expectEqual(errOf(.ACCES), sys6(.mmap, 0, 4096, prot_read | prot_write, map_shared, ap, 0));
+    _ = try ok(sys(.mkdir, @intFromPtr("dir"), 0o755, 0, 0));
+    const d = try open("dir", o_rdonly | o_directory);
+    defer close(d);
+    try testing.expectEqual(errOf(.NODEV), sys6(.mmap, 0, 4096, prot_read, map_shared, d, 0));
+    try testing.expectEqual(errOf(.INVAL), sys6(.mmap, 0, 4096, prot_read, map_shared, fd, 100)); // not a page
+}
+
+fn mappingsAndCrashes(env: *Env) !void {
+    const fd = try durableFile("wal-index", 4096);
+    var p = try mapOf(fd, 4096, prot_read | prot_write, map_shared, 0);
+    // Synced by `msync`: kept through a power loss.
+    @memcpy(p[0..6], "synced");
+    _ = try ok(sys(.msync, @intFromPtr(p), 4096, ms_sync, 0));
+    // Stored and never carried over: lost with the power.
+    @memcpy(p[100..104], "lost");
+    try env.crashAndReboot(.power_loss);
+    var buf: [6]u8 = undefined;
+    var f = try open("wal-index", o_rdwr);
+    try preadAll(f, &buf, 0);
+    try testing.expectEqualStrings("synced", &buf);
+    var four: [4]u8 = undefined;
+    try preadAll(f, &four, 100);
+    try testing.expectEqualSlices(u8, &@as([4]u8, @splat(0)), &four);
+    // A process that dies leaves the page cache: a store survives it,
+    // though nothing synced it.
+    p = try mapOf(f, 4096, prot_read | prot_write, map_shared, 0);
+    @memcpy(p[200..204], "kept");
+    try env.crashAndReboot(.process_crash);
+    f = try open("wal-index", o_rdwr);
+    defer close(f);
+    try preadAll(f, &four, 200);
+    try testing.expectEqualStrings("kept", &four);
+    // And `fsync` of the file carries a store over and keeps it.
+    p = try mapOf(f, 4096, prot_read | prot_write, map_shared, 0);
+    @memcpy(p[300..305], "fsync");
+    _ = try ok(sys(.fsync, f, 0, 0, 0));
+    try env.crashAndReboot(.power_loss);
+    const g = try open("wal-index", o_rdonly);
+    defer close(g);
+    var five: [5]u8 = undefined;
+    try preadAll(g, &five, 300);
+    try testing.expectEqualStrings("fsync", &five);
+}
+
+/// What the review of the first version found (revision 123).
+fn mappingEdges(env: *Env) !void {
+    _ = env;
+    // A write through an appending descriptor lands at the end, whatever
+    // offset `pwrite` was given, and the mapping sees it there.
+    const fd = try durableFile("edges", 4096);
+    defer close(fd);
+    const p = try mapOf(fd, 8192, prot_read | prot_write, map_shared, 0);
+    defer unmap(p, 8192);
+    const ap = try open("edges", o_wronly | o_append);
+    defer close(ap);
+    try pwriteAll(ap, "tail", 0);
+    try testing.expectEqualStrings("tail", p[4096..4100]);
+    var four: [4]u8 = undefined;
+    try preadAll(fd, &four, 4096);
+    try testing.expectEqualStrings("tail", &four);
+    // Bytes stored past the end read as zeros once the file grows over
+    // them (the file is 4100 bytes; its last page goes on to 8192).
+    @memcpy(p[5000..5004], "gone");
+    _ = try ok(sys(.ftruncate, fd, 6000, 0, 0));
+    try testing.expectEqualSlices(u8, &@as([4]u8, @splat(0)), p[5000..5004]);
+    try preadAll(fd, &four, 5000);
+    try testing.expectEqualSlices(u8, &@as([4]u8, @splat(0)), &four);
+    // A file that was mapped, unmapped, closed and deleted: a new file
+    // made after it starts empty, with nothing of the old one's.
+    const old = try durableFile("old", 4096);
+    const q = try mapOf(old, 4096, prot_read | prot_write, map_shared, 0);
+    @memcpy(q[0..3], "old");
+    unmap(q, 4096);
+    close(old);
+    _ = try ok(sys(.unlink, @intFromPtr("old"), 0, 0, 0));
+    const fresh = try open("fresh", o_creat | o_rdwr);
+    defer close(fresh);
+    try pwriteAll(fresh, "new", 0);
+    var three: [3]u8 = undefined;
+    try preadAll(fresh, &three, 0);
+    try testing.expectEqualStrings("new", &three);
+}
+
+/// `msync` of one mapping keeps that file's stores, not another's.
+fn msyncOneFile(env: *Env) !void {
+    const a = try durableFile("a", 4096);
+    const b = try durableFile("b", 4096);
+    const pa = try mapOf(a, 4096, prot_read | prot_write, map_shared, 0);
+    const pb = try mapOf(b, 4096, prot_read | prot_write, map_shared, 0);
+    @memcpy(pa[0..4], "aaaa");
+    @memcpy(pb[0..4], "bbbb");
+    _ = try ok(sys(.msync, @intFromPtr(pa), 4096, ms_sync, 0));
+    try env.crashAndReboot(.power_loss);
+    const a2 = try open("a", o_rdonly);
+    defer close(a2);
+    const b2 = try open("b", o_rdonly);
+    defer close(b2);
+    var four: [4]u8 = undefined;
+    try preadAll(a2, &four, 0);
+    try testing.expectEqualStrings("aaaa", &four);
+    try preadAll(b2, &four, 0);
+    try testing.expectEqualSlices(u8, &@as([4]u8, @splat(0)), &four);
+}
+
+var raced: [*]u8 = undefined;
+
+fn mapsWhileWritten(fd: usize) void {
+    raced = mapOf(fd, 4096, prot_read | prot_write, map_shared, 0) catch unreachable;
+}
+
+/// A file mapped by one task while another writes it: whichever comes
+/// first, the mapping and the file agree afterwards.
+fn mapRacesWrite(env: *Env) !void {
+    const fd = try durableFile("race", 4096);
+    defer close(fd);
+    var mapper = try env.io.concurrent(mapsWhileWritten, .{fd});
+    try pwriteAll(fd, "written", 10);
+    mapper.await(env.io);
+    defer unmap(raced, 4096);
+    try testing.expectEqualStrings("written", raced[10..17]);
+    var seven: [7]u8 = undefined;
+    try preadAll(fd, &seven, 10);
+    try testing.expectEqualStrings("written", &seven);
+}
+
+test "system-call mode: a shared mapping of a file is the file, to reads, writes, other mappings and crashes" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, sharedMappings, .{ .iterations = 20, .mode = .syscalls });
+    try tardis.check(gpa, mapsSimulatedFile, .{ .iterations = 2, .mode = .syscalls });
+    try tardis.check(gpa, mapsDuplicate, .{ .iterations = 2, .mode = .syscalls });
+    try tardis.check(gpa, mappingEdges, .{ .iterations = 20, .mode = .syscalls });
+    try tardis.check(gpa, mapRacesWrite, .{ .iterations = 100, .mode = .syscalls });
+    try tardis.check(gpa, msyncOneFile, .{ .iterations = 10, .mode = .syscalls, .faults = .{ .torn_writes = false, .metadata_loss = false } });
+    try tardis.check(gpa, mappingsAndCrashes, .{ .iterations = 20, .mode = .syscalls, .faults = .{ .torn_writes = false, .metadata_loss = false } });
 }
 
 // --- threads (revision 97, `systhread.zig`) -----------------------------------------

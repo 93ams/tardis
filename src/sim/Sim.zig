@@ -1977,6 +1977,7 @@ pub fn crashAndReboot(s: *Sim, mode: CrashMode) void {
     if (s.current != 0 and s.current != s.control) {
         @panic("tardis: crashAndReboot must be called from the test body, not from a spawned task");
     }
+    sysemu.beforeCrash(s, null, mode);
     for (s.nodes, 0..) |*n, i| s.crashVfs(&n.vfs, @intCast(i), mode);
     s.dropTasks(null);
     s.net.reset();
@@ -2047,6 +2048,7 @@ pub fn crashNode(s: *Sim, node: NodeId, mode: CrashMode) void {
     if (!body and s.tasks[s.current].node == node) {
         @panic("tardis: crashNode called from a task on the node being crashed");
     }
+    sysemu.beforeCrash(s, node, mode);
     s.crashVfs(&s.nodes[node].vfs, node, mode);
     s.dropTasks(node);
     for (&s.procs) |*p| {

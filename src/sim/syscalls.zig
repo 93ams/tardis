@@ -298,6 +298,16 @@ pub fn lastStrayTrace() []const usize {
     return stray_trace[0..stray_trace_len];
 }
 
+/// A system call the harness makes for itself from wherever it is, the
+/// code under test's fiber included: let through the trap.
+pub fn rawUntrapped(number: u64, a: u64, b: u64, c: u64, d: u64, e: u64, f: u64) u64 {
+    if (!supported) unreachable;
+    const saved = selector;
+    @atomicStore(u8, &selector, allow, .seq_cst);
+    defer @atomicStore(u8, &selector, saved, .seq_cst);
+    return raw6(number, a, b, c, d, e, f);
+}
+
 /// A call the emulator answers with an error and counts as a stray: the
 /// run fails with `StraySyscall`. For one that returning null would hand
 /// to the kernel (`emulatorFirst`).
