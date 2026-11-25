@@ -5,6 +5,22 @@ numbers (§) are `plan2.md`'s unless an entry names `plan.md`. Revision 1
 was the first draft of `plan2.md`; the core's earlier history is in
 `plan.md` §9 and §14.
 
+## Revision 121 (core: a stray call's report says where it was made)
+
+A stray system call's report named the call (for about sixty numbers; any other was "a system call", with its number), its count and its first three arguments. It did not say who made it, and in a large program a `sched_getaffinity` or an `ioctl` can come from anywhere: a user found that their stray `sched_getaffinity` came from `std.heap.smp_allocator`, by reading the standard library.
+
+**What it says now.** Every x86_64 call number the kernel names has its name, from the standard library's table (`src/sim/syscalls.zig`). And the report prints the stack the first stray call was made on, unwound from the signal frame: the function that made the call, then its callers, up to sixteen frames, with file, line and function as a panic's trace has them. It is unwound at the first stray call of a run only, from the unwind tables in memory; names are looked up when the report is printed. It is printed in the default mode with the trap and in system-call mode, including for a call made by a thread the code under test started.
+
+**Documented** (`docs/threads.md`): the new form of the report, and that `std.heap.smp_allocator` and `std.testing.allocator` ask for the processor count once per process, so under the trap only the run that asks first fails.
+
+**Tested.** `src/tests/syscall_test.zig`: the names of three numbers (one with no name), and a stray `getrandom` whose stack holds a return address inside the function that made it and, next, one inside that function's caller. Looked at by hand: the printed report for that call, for a stray `socketpair` in system-call mode, and for a stray `io_uring_setup` made by a thread started with `std.Thread.spawn` (from the system call up to `clone`).
+
+Tested on Linux (WSL2, static musl, Debug): all 41 test binaries pass, the library suite with 313 passed and 2 skipped; Rust 15 of 15 on musl and on glibc 2.41. Windows, Debug: no test failed, 62 skipped. Not run: the release configurations and `-Dsec`, on either system.
+
+**Review.** A fresh reviewer found two defects in the first version, both fixed. A stray call made by `std.debug` itself while it holds its lock (a panic's trace, which reads the program's file to find names, and those reads are strays) would have unwound the stack, which takes the same lock, and the thread would have waited forever: now the stack is left out when that lock is held, and a test holds it and makes a stray call. And in system-call mode the unwinder's first use lists the program's modules, which reads the vDSO's headers after the run has trapped the vDSO, so the run would have reported the vDSO lifted: now it unwinds once before the first run that traps. It also found that the test could pass or fail for the wrong reason in a release build (a caller inlined, the first matching address taken): it now looks for the two functions as adjacent frames, and the caller is `noinline`; and that a stack cut at sixteen frames was printed as whole.
+
+**Limits.** No stack for a clock read through the vDSO, nor for a call that the emulator counts as stray itself (`noteStray`). Code with no unwinding information (no `.eh_frame` and no frame pointers) gives a short stack or none. Only the first stray call of a run has one, and none when `std.debug` held its lock at that call.
+
 ## Revision 120 (core: messages sent and received in pieces)
 
 `sendmsg` and `recvmsg` were stray calls in system-call mode. They are how much networking code does all of its socket I/O: Boost.Asio reads and writes its sockets with nothing else, libuv sends and receives its datagrams with them, and so does any program that sends a header and a body without copying them together, or that wants to know whether a datagram was cut. They are now answered on IPv4 stream and datagram sockets and on a pair of sockets (revision 118), without ancillary data.

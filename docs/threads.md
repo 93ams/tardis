@@ -76,13 +76,35 @@ simulation is intercepted. A call that the simulator and the test harness
 do not make themselves is counted as stray. The call is then made as
 usual, so the program goes on. When the run ends it fails with
 `error.StraySyscall`, whatever else it did, and the report names the
-first stray call and how many there were, in this form:
+first stray call, how many there were, the first one's arguments, and
+where it was made from, in this form:
 
 ```
-tardis: the code under test made 1 real system call(s), the first one
+tardis: the code under test tried 1 real system call(s), the first one
 getrandom (number 318): it left the simulation, so the run does not
 depend on its seed alone
+tardis: its first three arguments were 0x7cb90d977d00, 0x4, 0x0
+tardis: it was made from:
+.../lib/std/os/linux.zig:2195:20: 0x119df3e in getrandom (std.zig)
+src/tests/syscall_test.zig:72:31: 0x129740e in strayFromHere (root.zig)
+src/tests/syscall_test.zig:77:18: 0x12972d5 in strayCaller (root.zig)
+...
 ```
+
+The name is the kernel's for any x86_64 call number. The stack is unwound
+from the call itself, so it shows the library function that made it and
+who called that, up to sixteen frames; it is printed only for a call that
+came through the trap (not for a clock read through the vDSO), and only
+where the program has the tables to unwind it (and not when the stray call is `std.debug`'s own, made while it holds its lock).
+
+**A call made once per process.** Some code asks the kernel something
+the first time it needs it and keeps the answer for the rest of the
+process. `std.heap.smp_allocator` and `std.testing.allocator` both ask
+for the processor count (`sched_getaffinity`, number 204), the first
+time two threads contend for them. Under the trap the run that happens to
+ask first fails, and no later one does. In system-call mode the call is
+answered from the simulation (`Options.processors`), but the answer is
+still kept from whichever run asked first.
 
 What it catches:
 

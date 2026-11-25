@@ -65,6 +65,55 @@ fn simulated(env: *Env) !void {
     try io.sleep(.fromMilliseconds(1), .awake);
 }
 
+/// Makes one stray call, from a function a test can find in the report's
+/// stack.
+noinline fn strayFromHere() void {
+    var bytes: [4]u8 = undefined;
+    _ = std.os.linux.getrandom(&bytes, bytes.len, 0);
+}
+
+noinline fn strayCaller(env: *Env) !void {
+    _ = env;
+    strayFromHere();
+}
+
+/// A stray call made while `std.debug` holds its lock, as a panic's trace
+/// does while it reads the program's file: no stack, and no hang.
+fn strayWhileDebugLocked(env: *Env) !void {
+    _ = env;
+    const info = std.debug.getSelfDebugInfo() catch return;
+    const io = std.Options.debug_io;
+    info.rwlock.lockUncancelable(io);
+    defer info.rwlock.unlock(io);
+    strayFromHere();
+}
+
+fn within(address: usize, f: usize) bool {
+    return address > f and address < f + 512;
+}
+
+test "trap_syscalls: the report names every call, and says where the first stray one was made" {
+    if (!tardis.trap_syscalls_supported) return error.SkipZigTest;
+    const syscalls = @import("../sim/syscalls.zig");
+    try testing.expectEqualStrings("sched_getaffinity", syscalls.name(204));
+    try testing.expectEqualStrings("io_uring_setup", syscalls.name(425));
+    try testing.expectEqualStrings("a system call", syscalls.name(100_000));
+    try testing.expectError(error.StraySyscall, tardis.check(gpa, strayCaller, .{ .iterations = 1, .trap_syscalls = true, .report = false, .shrink = false }));
+    // The stack holds a return address inside the function that made the
+    // call, and the next one out is inside its caller.
+    const trace = syscalls.lastStrayTrace();
+    if (!std.debug.sys_can_stack_trace or !std.options.allow_stack_tracing) return;
+    var found = false;
+    for (trace[0..trace.len -| 1], trace[1..]) |inner, outer| {
+        if (within(inner, @intFromPtr(&strayFromHere)) and within(outer, @intFromPtr(&strayCaller))) found = true;
+    }
+    try testing.expect(found);
+    if (@hasField(std.debug.SelfInfo, "rwlock")) {
+        try testing.expectError(error.StraySyscall, tardis.check(gpa, strayWhileDebugLocked, .{ .iterations = 1, .trap_syscalls = true, .report = false, .shrink = false }));
+        try testing.expectEqual(@as(usize, 0), syscalls.lastStrayTrace().len);
+    }
+}
+
 test "trap_syscalls: asking the kernel for random bytes fails the run; simulated I/O does not" {
     if (!tardis.trap_syscalls_supported) return error.SkipZigTest;
     try testing.expectError(error.StraySyscall, tardis.check(gpa, realRandom, .{ .iterations = 3, .trap_syscalls = true, .report = false, .shrink = false }));

@@ -53,6 +53,15 @@ threadlocal var stray_args: ?[3]u64 = null;
 /// needs to say which file a library went looking for.
 threadlocal var stray_path: [96]u8 = undefined;
 threadlocal var stray_path_len: usize = 0;
+/// Where the first stray call was made from: the return addresses of the
+/// stack it was made on, the innermost first, unwound from the signal
+/// frame. Empty when it did not come by the trap, or when the stack could
+/// not be unwound.
+threadlocal var stray_trace: [trace_max]usize = undefined;
+threadlocal var stray_trace_len: usize = 0;
+/// The stack went on past `trace_max` frames, or might have.
+threadlocal var stray_trace_cut = false;
+const trace_max = 16;
 
 /// The argument of a call that is a path, for the calls that take one.
 fn pathArgument(number: u64, a0: u64, a1: u64) u64 {
@@ -208,6 +217,7 @@ fn onSigsys(_: i32, _: ?*anyopaque, context: ?*anyopaque) callconv(.c) void {
             stray_first = number;
             stray_args = .{ a, gregs[@backingInt(Reg.rsi)], gregs[@backingInt(Reg.rdx)] };
             notePath(number, a, gregs[@backingInt(Reg.rsi)]);
+            noteCaller(context.?);
         }
         stray_count +|= 1;
         // With the emulator on, the code under test believes it has no
@@ -241,6 +251,51 @@ fn onSigsys(_: i32, _: ?*anyopaque, context: ?*anyopaque) callconv(.c) void {
         gregs[@backingInt(Reg.r9)],
     );
     selector = block;
+}
+
+/// Keeps where the first stray call came from, unwinding the stack from
+/// the signal frame with the unwind tables in memory (`.eh_frame_hdr`):
+/// for the first stray call of a run only. The names are looked up later,
+/// when the report is printed.
+fn noteCaller(context: *anyopaque) void {
+    stray_trace_len = 0;
+    stray_trace_cut = false;
+    if (!std.debug.sys_can_stack_trace or !std.options.allow_stack_tracing) return;
+    // The stray call may have been made by `std.debug` itself, with its
+    // lock held: a panic's trace reads the program's file to find names,
+    // and those reads are strays. Unwinding takes the same lock, and on
+    // this thread it would wait forever. Then there is no stack.
+    if (@hasField(std.debug.SelfInfo, "rwlock")) {
+        const info = std.debug.getSelfDebugInfo() catch return;
+        const io = std.Options.debug_io;
+        if (!info.rwlock.tryLock(io)) return;
+        info.rwlock.unlock(io);
+    }
+    const native = std.debug.cpu_context.fromPosixSignalContext(context) orelse return;
+    const trace = std.debug.captureCurrentStackTrace(.{ .context = &native }, &stray_trace);
+    stray_trace_len = trace.return_addresses.len;
+    stray_trace_cut = trace.skipped != .none;
+}
+
+threadlocal var unwinder_warm = false;
+
+/// Unwinds once, outside any run, so that what the unwinder sets up the
+/// first time (the list of the program's modules, read with
+/// `dl_iterate_phdr`, which reads the vDSO's headers; its cache) is there
+/// before a run traps the vDSO and the system calls. Called before a run
+/// that traps.
+pub fn warmUnwinder() void {
+    if (!supported or unwinder_warm) return;
+    unwinder_warm = true;
+    if (!std.debug.sys_can_stack_trace or !std.options.allow_stack_tracing) return;
+    var buf: [2]usize = undefined;
+    _ = std.debug.captureCurrentStackTrace(.{}, &buf);
+}
+
+/// Where the last run's first stray call was made from, as `end` gave it
+/// (for a test of the report).
+pub fn lastStrayTrace() []const usize {
+    return stray_trace[0..stray_trace_len];
 }
 
 /// A call the emulator answers with an error and counts as a stray: the
@@ -460,6 +515,8 @@ pub fn begin(emulate: ?Emulator) bool {
     stray_first = 0;
     stray_args = null;
     stray_path_len = 0;
+    stray_trace_len = 0;
+    stray_trace_cut = false;
     stray_refused = 0;
     emulator = emulate;
     active = true;
@@ -471,8 +528,10 @@ pub fn begin(emulate: ?Emulator) bool {
 /// would have started a thread or a process and were not made.
 /// `path`: what the first one named, if it names a file (cut at 96
 /// bytes; valid until the thread's next run). `args`: the first one's
-/// first three arguments, when it came by the trap.
-pub const Stray = struct { number: u64, count: u32, refused: u32, path: []const u8 = "", args: ?[3]u64 = null };
+/// first three arguments, when it came by the trap. `trace`: where it was
+/// made from, innermost first (valid until the thread's next run), and
+/// `trace_cut` if it went on further.
+pub const Stray = struct { number: u64, count: u32, refused: u32, path: []const u8 = "", args: ?[3]u64 = null, trace: []const usize = &.{}, trace_cut: bool = false };
 
 /// The run ended: the first system call that left the simulation, if any.
 pub fn end() ?Stray {
@@ -481,7 +540,7 @@ pub fn end() ?Stray {
     active = false;
     emulator = null;
     if (stray_count == 0) return null;
-    return .{ .number = stray_first, .count = stray_count, .refused = stray_refused, .path = stray_path[0..stray_path_len], .args = stray_args };
+    return .{ .number = stray_first, .count = stray_count, .refused = stray_refused, .path = stray_path[0..stray_path_len], .args = stray_args, .trace = stray_trace[0..stray_trace_len], .trace_cut = stray_trace_cut };
 }
 
 /// A vDSO function the code under test called (`vdso.zig`): answered as
@@ -540,68 +599,9 @@ pub inline fn fiberEntry() void {
     if (supported and active) @atomicStore(u8, &selector, block, .seq_cst);
 }
 
-/// The call's name on x86_64 Linux, for the ones a test is likely to hit.
+/// The call's name on x86_64 Linux: every number the kernel has a name
+/// for, from the standard library's table.
 pub fn name(number: u64) []const u8 {
-    return switch (number) {
-        0 => "read",
-        1 => "write",
-        2 => "open",
-        3 => "close",
-        4 => "stat",
-        5 => "fstat",
-        7 => "poll",
-        8 => "lseek",
-        9 => "mmap",
-        16 => "ioctl",
-        19 => "readv",
-        20 => "writev",
-        21 => "access",
-        22 => "pipe",
-        23 => "select",
-        213 => "epoll_create",
-        232 => "epoll_wait",
-        233 => "epoll_ctl",
-        270 => "pselect6",
-        281 => "epoll_pwait",
-        284 => "eventfd",
-        290 => "eventfd2",
-        291 => "epoll_create1",
-        425 => "io_uring_setup",
-        441 => "epoll_pwait2",
-        32 => "dup",
-        63 => "uname",
-        72 => "fcntl",
-        73 => "flock",
-        79 => "getcwd",
-        82 => "rename",
-        87 => "unlink",
-        217 => "getdents64",
-        293 => "pipe2",
-        17 => "pread64",
-        18 => "pwrite64",
-        35 => "nanosleep",
-        41 => "socket",
-        42 => "connect",
-        46 => "sendmsg",
-        47 => "recvmsg",
-        53 => "socketpair",
-        24 => "sched_yield",
-        56 => "clone",
-        218 => "set_tid_address",
-        273 => "set_robust_list",
-        334 => "rseq",
-        57 => "fork",
-        58 => "vfork",
-        435 => "clone3",
-        59 => "execve",
-        96 => "gettimeofday",
-        201 => "time",
-        228 => "clock_gettime",
-        230 => "clock_nanosleep",
-        257 => "openat",
-        262 => "newfstatat",
-        318 => "getrandom",
-        332 => "statx",
-        else => "a system call",
-    };
+    const e = std.enums.fromInt(linux.syscalls.X64, number) orelse return "a system call";
+    return @tagName(e);
 }

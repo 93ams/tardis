@@ -1192,6 +1192,8 @@ fn runOnce(s: *Sim, comptime body: fn (*Env) anyerror!void, seed: u64, persona: 
     var env = Env.init(s, iteration);
     env.seed = seed;
     // The counter first and last: arming it is a system call.
+    // Before the vDSO is trapped: the unwinder's first use reads it.
+    if (s.config.trap_syscalls) syscalls.warmUnwinder();
     const virtual_counter = s.config.virtual_tsc and tsc.begin(&s.now_ns);
     const emulator: ?syscalls.Emulator = if (syscalls.supported and s.config.emulate_syscalls) &sysemu.emulate else null;
     // In system-call mode the vDSO's clocks are answered too (`vdso.zig`).
@@ -1228,6 +1230,10 @@ fn runOnce(s: *Sim, comptime body: fn (*Env) anyerror!void, seed: u64, persona: 
         if (s.config.report) std.debug.print("tardis: the code under test tried {d} real system call(s), the first one {s} (number {d}): it left the simulation, so the run does not depend on its seed alone\n", .{ call.count, syscalls.name(call.number), call.number });
         if (s.config.report and call.path.len > 0) std.debug.print("tardis: that call named \"{s}\"\n", .{call.path});
         if (s.config.report) if (call.args) |args| std.debug.print("tardis: its first three arguments were 0x{x}, 0x{x}, 0x{x}\n", .{ args[0], args[1], args[2] });
+        if (s.config.report and call.trace.len > 0) {
+            std.debug.print("tardis: it was made from:\n", .{});
+            std.debug.dumpStackTrace(&.{ .return_addresses = @constCast(call.trace), .skipped = if (call.trace_cut) .unknown else .none });
+        }
         if (s.config.report and call.refused != 0) std.debug.print("tardis: {d} of them would have started a thread or a process, which the simulation cannot hold: refused, not made (docs/threads.md)\n", .{call.refused});
         // A run that left the simulation proves nothing, whether it passed
         // or failed: its outcome does not follow from its seed.
