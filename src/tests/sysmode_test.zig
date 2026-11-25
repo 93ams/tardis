@@ -2223,6 +2223,369 @@ test "system-call mode: a pair of datagram sockets is still a stray call" {
     try testing.expectError(error.StraySyscall, tardis.check(gpa, pairsOfDatagrams, .{ .iterations = 1, .mode = .syscalls, .report = false, .shrink = false }));
 }
 
+// --- sendmsg and recvmsg (revision 120) -------------------------------------------
+
+const Msghdr = extern struct {
+    name: usize = 0,
+    namelen: u32 = 0,
+    iov: usize = 0,
+    iovlen: usize = 0,
+    control: usize = 0,
+    controllen: usize = 0,
+    flags: u32 = 0xdead,
+};
+const msg_trunc_flag = 0x20;
+
+fn vec(bytes: []const u8) Iovec2 {
+    return .{ .base = @intFromPtr(bytes.ptr), .len = bytes.len };
+}
+
+/// Reads four bytes with `recvmsg` and answers them with `sendmsg`, the
+/// answer in three pieces.
+fn messageEchoServer(listener: usize) void {
+    messageEchoOnce(listener) catch |err| std.debug.panic("message echo server: {s}", .{@errorName(err)});
+}
+
+fn messageEchoOnce(listener: usize) !void {
+    const conn = try ok(sys(.accept, listener, 0, 0, 0));
+    defer _ = sys(.close, conn, 0, 0, 0);
+    var buf: [8]u8 = undefined;
+    var got: usize = 0;
+    while (got < 4) {
+        const into = [_]Iovec2{vec(buf[got..])};
+        var msg: Msghdr = .{ .iov = @intFromPtr(&into), .iovlen = 1 };
+        const n = try ok(sys(.recvmsg, conn, @intFromPtr(&msg), 0, 0));
+        if (n == 0) break;
+        got += n;
+    }
+    try testing.expectEqual(@as(usize, 4), got);
+    const out = [_]Iovec2{ vec(buf[0..1]), vec(""), vec(buf[1..3]), vec(buf[3..4]) };
+    const msg: Msghdr = .{ .iov = @intFromPtr(&out), .iovlen = out.len };
+    try testing.expectEqual(@as(usize, 4), try ok(sys(.sendmsg, conn, @intFromPtr(&msg), 0x4000, 0))); // MSG_NOSIGNAL
+}
+
+fn streamMessages(env: *Env) !void {
+    const listener = try ok(sys(.socket, 2, 1, 0, 0));
+    const bound = sockaddr(.{ 0, 0, 0, 0 }, 7100);
+    _ = try ok(sys(.bind, listener, @intFromPtr(&bound), @sizeOf(SockaddrIn), 0));
+    _ = try ok(sys(.listen, listener, 8, 0, 0));
+    var server = try env.io.concurrent(messageEchoServer, .{listener});
+    const client = try ok(sys(.socket, 2, 1, 0, 0));
+    const to = sockaddr(.{ 127, 0, 0, 1 }, 7100);
+    _ = try ok(sys(.connect, client, @intFromPtr(&to), @sizeOf(SockaddrIn), 0));
+
+    // Nothing has come yet, and this one call does not wait for it.
+    var buf: [16]u8 = undefined;
+    var name: SockaddrIn = undefined;
+    var control: [32]u8 = undefined;
+    const into = [_]Iovec2{ vec(buf[0..3]), vec(buf[3..]) };
+    var msg: Msghdr = .{ .name = @intFromPtr(&name), .namelen = @sizeOf(SockaddrIn), .iov = @intFromPtr(&into), .iovlen = 2, .control = @intFromPtr(&control), .controllen = control.len };
+    try testing.expectEqual(errOf(.AGAIN), sys(.recvmsg, client, @intFromPtr(&msg), 0x40, 0)); // MSG_DONTWAIT
+    try testing.expectEqual(@as(u32, 0xdead), msg.flags); // a failed call leaves the header alone
+
+    // A stream takes the address in the header and ignores it, as TCP does.
+    const elsewhere = sockaddr(.{ 127, 0, 0, 1 }, 1);
+    const out = [_]Iovec2{ vec("pi"), vec("n"), vec("g") };
+    const send: Msghdr = .{ .name = @intFromPtr(&elsewhere), .namelen = @sizeOf(SockaddrIn), .iov = @intFromPtr(&out), .iovlen = out.len };
+    try testing.expectEqual(@as(usize, 4), try ok(sys(.sendmsg, client, @intFromPtr(&send), 0, 0)));
+
+    var got: usize = 0;
+    while (got < 4) {
+        const rest = [_]Iovec2{ vec(buf[got..@max(got, 3)]), vec(buf[@max(got, 3)..]) };
+        msg.iov = @intFromPtr(&rest);
+        msg.namelen = @sizeOf(SockaddrIn);
+        msg.controllen = control.len;
+        const n = try ok(sys(.recvmsg, client, @intFromPtr(&msg), 0x4000_0000, 0)); // MSG_CMSG_CLOEXEC
+        if (n == 0) break;
+        got += n;
+        // A stream names no sender; nothing came beside the bytes.
+        try testing.expectEqual(@as(u32, 0), msg.namelen);
+        try testing.expectEqual(@as(usize, 0), msg.controllen);
+        try testing.expectEqual(@as(u32, 0), msg.flags);
+    }
+    try testing.expectEqualStrings("ping", buf[0..got]);
+    server.await(env.io);
+    // The server closed: the end, as a message of no bytes.
+    msg.iov = @intFromPtr(&into);
+    try testing.expectEqual(@as(isize, 0), sys(.recvmsg, client, @intFromPtr(&msg), 0, 0));
+    try testing.expectEqual(@as(u32, 0), msg.flags);
+    // A length below zero for the address is refused before anything.
+    msg.namelen = 0x8000_0000;
+    try testing.expectEqual(errOf(.INVAL), sys(.recvmsg, client, @intFromPtr(&msg), 0, 0));
+    var bad = send;
+    bad.namelen = 0x8000_0000;
+    try testing.expectEqual(errOf(.INVAL), sys(.sendmsg, client, @intFromPtr(&bad), 0, 0));
+    // Ancillary data that is not there.
+    bad = .{ .iov = @intFromPtr(&out), .iovlen = out.len, .controllen = 16 };
+    try testing.expectEqual(errOf(.FAULT), sys(.sendmsg, client, @intFromPtr(&bad), 0, 0));
+    // A stream that is not connected says so to a message of no bytes too.
+    const fresh = try ok(sys(.socket, 2, 1, 0, 0));
+    bad = .{ .control = @intFromPtr(&control) };
+    try testing.expectEqual(errOf(.PIPE), sys(.sendmsg, fresh, @intFromPtr(&bad), 0x4000, 0));
+    bad = .{ .iov = @intFromPtr(&out), .iovlen = out.len };
+    try testing.expectEqual(errOf(.PIPE), sys(.sendmsg, fresh, @intFromPtr(&bad), 0x4000, 0));
+    _ = sys(.close, fresh, 0, 0, 0);
+    try testing.expectEqual(errOf(.INVAL), sys(.writev, client, @intFromPtr(&out), 1025, 0));
+    try testing.expectEqual(errOf(.INVAL), sys(.readv, client, @intFromPtr(&into), 1025, 0));
+
+    // The header's own errors.
+    try testing.expectEqual(errOf(.FAULT), sys(.sendmsg, client, 0, 0, 0));
+    try testing.expectEqual(errOf(.FAULT), sys(.recvmsg, client, 0, 0, 0));
+    const many: Msghdr = .{ .iov = @intFromPtr(&out), .iovlen = 1025 };
+    try testing.expectEqual(errOf(.MSGSIZE), sys(.sendmsg, client, @intFromPtr(&many), 0, 0));
+    try testing.expectEqual(errOf(.MSGSIZE), sys(.recvmsg, client, @intFromPtr(&many), 0, 0));
+    _ = sys(.close, client, 0, 0, 0);
+    _ = sys(.close, listener, 0, 0, 0);
+    try testing.expectEqual(errOf(.BADF), sys(.sendmsg, client, @intFromPtr(&send), 0, 0));
+}
+
+fn datagramMessages(env: *Env) !void {
+    _ = env;
+    const a = try ok(sys(.socket, 2, 2, 0, 0));
+    const b = try ok(sys(.socket, 2, 2, 0, 0));
+    defer _ = sys(.close, a, 0, 0, 0);
+    defer _ = sys(.close, b, 0, 0, 0);
+    const at = sockaddr(.{ 127, 0, 0, 1 }, 9200);
+    _ = try ok(sys(.bind, b, @intFromPtr(&at), @sizeOf(SockaddrIn), 0));
+
+    // Three pieces are one datagram, to the address in the header.
+    const out = [_]Iovec2{ vec("hel"), vec(""), vec("lo, "), vec("world") };
+    var send: Msghdr = .{ .name = @intFromPtr(&at), .namelen = @sizeOf(SockaddrIn), .iov = @intFromPtr(&out), .iovlen = out.len };
+    try testing.expectEqual(@as(usize, 12), try ok(sys(.sendmsg, a, @intFromPtr(&send), 0, 0)));
+    var mine: SockaddrIn = undefined;
+    var mine_len: u32 = @sizeOf(SockaddrIn);
+    _ = try ok(sys(.getsockname, a, @intFromPtr(&mine), @intFromPtr(&mine_len), 0));
+
+    // It arrives spread over the reader's pieces, with its sender.
+    var buf: [32]u8 = @splat('.');
+    var from: SockaddrIn = undefined;
+    var control: [32]u8 = undefined;
+    const into = [_]Iovec2{ vec(buf[0..2]), vec(buf[2..2]), vec(buf[2..9]), vec(buf[9..]) };
+    var msg: Msghdr = .{ .name = @intFromPtr(&from), .namelen = @sizeOf(SockaddrIn), .iov = @intFromPtr(&into), .iovlen = into.len, .control = @intFromPtr(&control), .controllen = control.len };
+    try testing.expectEqual(@as(usize, 12), try ok(sys(.recvmsg, b, @intFromPtr(&msg), 0, 0)));
+    try testing.expectEqualStrings("hello, world.", buf[0..13]);
+    try testing.expectEqual(@as(u32, @sizeOf(SockaddrIn)), msg.namelen);
+    try testing.expectEqual(mine.port_be, from.port_be);
+    try testing.expectEqual([4]u8{ 127, 0, 0, 1 }, from.addr);
+    try testing.expectEqual(@as(u32, 0), msg.flags);
+    try testing.expectEqual(@as(usize, 0), msg.controllen);
+
+    // Nothing more: one call that does not wait says so.
+    try testing.expectEqual(errOf(.AGAIN), sys(.recvmsg, b, @intFromPtr(&msg), 0x40, 0));
+
+    // One that does not fit is cut, the rest is lost, and the header says
+    // so: over several pieces, and over one.
+    _ = try ok(sys(.sendmsg, a, @intFromPtr(&send), 0, 0));
+    _ = try ok(sys(.sendmsg, a, @intFromPtr(&send), 0, 0));
+    buf = @splat('.');
+    const short = [_]Iovec2{ vec(buf[0..3]), vec(buf[3..7]) };
+    msg = .{ .iov = @intFromPtr(&short), .iovlen = 2 };
+    try testing.expectEqual(@as(usize, 7), try ok(sys(.recvmsg, b, @intFromPtr(&msg), 0, 0)));
+    try testing.expectEqualStrings("hello, .", buf[0..8]);
+    try testing.expectEqual(@as(u32, msg_trunc_flag), msg.flags);
+    msg = .{ .iov = @intFromPtr(&short), .iovlen = 1 };
+    try testing.expectEqual(@as(usize, 3), try ok(sys(.recvmsg, b, @intFromPtr(&msg), 0, 0)));
+    try testing.expectEqual(@as(u32, msg_trunc_flag), msg.flags);
+
+    // A message of no pieces is an empty datagram, which is received as
+    // one; a `writev` of nothing sends nothing.
+    send.iovlen = 0;
+    try testing.expectEqual(@as(usize, 0), try ok(sys(.sendmsg, a, @intFromPtr(&send), 0, 0)));
+    try testing.expectEqual(@as(usize, 0), try ok(sys(.writev, a, @intFromPtr(&out), 0, 0)));
+    msg = .{ .name = @intFromPtr(&from), .namelen = @sizeOf(SockaddrIn), .iov = @intFromPtr(&into), .iovlen = into.len };
+    try testing.expectEqual(@as(usize, 0), try ok(sys(.recvmsg, b, @intFromPtr(&msg), 0, 0)));
+    try testing.expectEqual(@as(u32, 0), msg.flags);
+    try testing.expectEqual(mine.port_be, from.port_be);
+    try testing.expectEqual(errOf(.AGAIN), sys(.recvmsg, b, @intFromPtr(&msg), 0x40, 0));
+    // A reader with no room takes a datagram all the same, and loses it.
+    send.iovlen = out.len;
+    _ = try ok(sys(.sendmsg, a, @intFromPtr(&send), 0, 0));
+    msg = .{};
+    try testing.expectEqual(@as(usize, 0), try ok(sys(.recvmsg, b, @intFromPtr(&msg), 0, 0)));
+    try testing.expectEqual(@as(u32, msg_trunc_flag), msg.flags);
+    try testing.expectEqual(errOf(.AGAIN), sys(.recvmsg, b, @intFromPtr(&msg), 0x40, 0));
+
+    // A connected socket needs no address, and `writev` and `readv` deal
+    // in whole datagrams too.
+    _ = try ok(sys(.connect, a, @intFromPtr(&at), @sizeOf(SockaddrIn), 0));
+    send = .{ .iov = @intFromPtr(&out), .iovlen = out.len };
+    try testing.expectEqual(@as(usize, 12), try ok(sys(.sendmsg, a, @intFromPtr(&send), 0x40, 0)));
+    try testing.expectEqual(@as(usize, 12), try ok(sys(.writev, a, @intFromPtr(&out), out.len, 0)));
+    buf = @splat('.');
+    try testing.expectEqual(@as(usize, 12), try ok(sys(.readv, b, @intFromPtr(&into), into.len, 0)));
+    try testing.expectEqualStrings("hello, world.", buf[0..13]);
+    buf = @splat('.');
+    try testing.expectEqual(@as(usize, 7), try ok(sys(.readv, b, @intFromPtr(&short), 2, 0)));
+    try testing.expectEqualStrings("hello, .", buf[0..8]);
+    try testing.expectEqual(errOf(.AGAIN), sys6(.recvfrom, b, @intFromPtr(&buf), buf.len, 0x40, 0, 0));
+
+    // Without a place for the sender, its length is left as it was.
+    _ = try ok(sys(.sendmsg, a, @intFromPtr(&send), 0, 0));
+    msg = .{ .namelen = 99, .iov = @intFromPtr(&into), .iovlen = into.len };
+    try testing.expectEqual(@as(usize, 12), try ok(sys(.recvmsg, b, @intFromPtr(&msg), 0, 0)));
+    try testing.expectEqual(@as(u32, 99), msg.namelen);
+    // A place and no length, or a length and no place, is no address: the
+    // connected peer gets it.
+    send = .{ .name = @intFromPtr(&at), .iov = @intFromPtr(&out), .iovlen = out.len };
+    _ = try ok(sys(.sendmsg, a, @intFromPtr(&send), 0, 0));
+    send = .{ .namelen = @sizeOf(SockaddrIn), .iov = @intFromPtr(&out), .iovlen = out.len };
+    _ = try ok(sys(.sendmsg, a, @intFromPtr(&send), 0, 0));
+    try testing.expectEqual(@as(usize, 12), try ok(sys(.readv, b, @intFromPtr(&into), into.len, 0)));
+    try testing.expectEqual(@as(usize, 12), try ok(sys(.readv, b, @intFromPtr(&into), into.len, 0)));
+    // Exactly as much in pieces as is put together (4096 bytes).
+    const half: [2048]u8 = @splat('h');
+    const halves = [_]Iovec2{ vec(&half), vec(&half) };
+    send = .{ .iov = @intFromPtr(&halves), .iovlen = 2 };
+    try testing.expectEqual(@as(usize, 4096), try ok(sys(.sendmsg, a, @intFromPtr(&send), 0, 0)));
+    var big: [5000]u8 = undefined;
+    const two = [_]Iovec2{ vec(big[0..1]), vec(big[1..]) };
+    msg = .{ .iov = @intFromPtr(&two), .iovlen = 2 };
+    try testing.expectEqual(@as(usize, 4096), try ok(sys(.recvmsg, b, @intFromPtr(&msg), 0, 0)));
+    try testing.expectEqual(@as(u32, 0), msg.flags);
+    for (big[0..4096]) |x| try testing.expectEqual(@as(u8, 'h'), x);
+    // A piece with nowhere to go: nothing waits, so it would wait; with a
+    // datagram there, the datagram is taken and the call faults.
+    const nowhere = [_]Iovec2{ vec(big[0..1]), .{ .base = 0, .len = 8 } };
+    msg = .{ .iov = @intFromPtr(&nowhere), .iovlen = 2 };
+    try testing.expectEqual(errOf(.AGAIN), sys(.recvmsg, b, @intFromPtr(&msg), 0x40, 0));
+    _ = try ok(sys(.sendmsg, a, @intFromPtr(&send), 0, 0));
+    try testing.expectEqual(errOf(.FAULT), sys(.recvmsg, b, @intFromPtr(&msg), 0, 0));
+    try testing.expectEqual(errOf(.AGAIN), sys(.recvmsg, b, @intFromPtr(&msg), 0x40, 0));
+    send = .{ .iov = @intFromPtr(&nowhere), .iovlen = 2 };
+    try testing.expectEqual(errOf(.FAULT), sys(.sendmsg, a, @intFromPtr(&send), 0, 0));
+
+    // An address of another family is refused as `sendto` refuses it.
+    var unix: SockaddrIn = at;
+    unix.family = 1;
+    send = .{ .name = @intFromPtr(&unix), .namelen = @sizeOf(SockaddrIn), .iov = @intFromPtr(&out), .iovlen = out.len };
+    try testing.expectEqual(errOf(.AFNOSUPPORT), sys(.sendmsg, a, @intFromPtr(&send), 0, 0));
+}
+
+fn pairMessages(env: *Env) !void {
+    _ = env;
+    const pair = try socketPair(0);
+    defer _ = sys(.close, pair[0], 0, 0, 0);
+    defer _ = sys(.close, pair[1], 0, 0, 0);
+    var buf: [16]u8 = @splat('.');
+    var name: SockaddrIn = undefined;
+    var control: [32]u8 = undefined;
+    const into = [_]Iovec2{ vec(buf[0..2]), vec(buf[2..]) };
+    var msg: Msghdr = .{ .name = @intFromPtr(&name), .namelen = @sizeOf(SockaddrIn), .iov = @intFromPtr(&into), .iovlen = 2, .control = @intFromPtr(&control), .controllen = control.len };
+    try testing.expectEqual(errOf(.AGAIN), sys(.recvmsg, pair[1], @intFromPtr(&msg), 0x40, 0));
+    const out = [_]Iovec2{ vec("qu"), vec("est"), vec("ion") };
+    var send: Msghdr = .{ .iov = @intFromPtr(&out), .iovlen = out.len };
+    try testing.expectEqual(@as(usize, 8), try ok(sys(.sendmsg, pair[0], @intFromPtr(&send), 0x4000 | 0x40, 0)));
+    try testing.expectEqual(@as(usize, 8), try ok(sys(.recvmsg, pair[1], @intFromPtr(&msg), 0x4000_0000, 0)));
+    try testing.expectEqualStrings("question.", buf[0..9]);
+    try testing.expectEqual(@as(u32, 0), msg.namelen);
+    try testing.expectEqual(@as(usize, 0), msg.controllen);
+    try testing.expectEqual(@as(u32, 0), msg.flags);
+    // A pair is connected: a message cannot name another destination.
+    send.name = @intFromPtr(&name);
+    send.namelen = @sizeOf(SockaddrIn);
+    try testing.expectEqual(errOf(.ISCONN), sys(.sendmsg, pair[0], @intFromPtr(&send), 0, 0));
+    // A full pair takes what fits of a message that does not wait.
+    const block: [4000]u8 = @splat('x');
+    const blocks = [_]Iovec2{ vec(&block), vec(&block) };
+    send = .{ .iov = @intFromPtr(&blocks), .iovlen = 2 };
+    var filled: usize = 0;
+    while (true) {
+        const rc = sys(.sendmsg, pair[0], @intFromPtr(&send), 0x40, 0);
+        if (rc == errOf(.AGAIN)) break;
+        const n = try ok(rc);
+        filled += n;
+        if (n < 8000) break;
+    }
+    try testing.expectEqual(@as(usize, 65536), filled);
+    try testing.expectEqual(errOf(.AGAIN), sys(.sendmsg, pair[0], @intFromPtr(&send), 0x40, 0));
+    // The end, after a shutdown, as a message of no bytes; and no more out.
+    _ = try ok(sys(.shutdown, pair[1], 2, 0, 0));
+    try testing.expectEqual(@as(isize, 0), sys(.recvmsg, pair[0], @intFromPtr(&msg), 0, 0));
+    try testing.expectEqual(errOf(.PIPE), sys(.sendmsg, pair[0], @intFromPtr(&send), 0x4000, 0));
+    try testing.expectEqual(errOf(.FAULT), sys(.sendmsg, pair[0], 0, 0, 0));
+    try testing.expectEqual(errOf(.FAULT), sys(.recvmsg, pair[0], 0, 0, 0));
+    // A pipe is no socket.
+    var fds: [2]i32 = undefined;
+    _ = try ok(sys(.pipe2, @intFromPtr(&fds), 0, 0, 0));
+    try testing.expectEqual(errOf(.NOTSOCK), sys(.sendmsg, fdu(fds[1]), @intFromPtr(&send), 0, 0));
+    try testing.expectEqual(errOf(.NOTSOCK), sys(.recvmsg, fdu(fds[0]), @intFromPtr(&msg), 0, 0));
+    _ = sys(.close, fdu(fds[0]), 0, 0, 0);
+    _ = sys(.close, fdu(fds[1]), 0, 0, 0);
+}
+
+test "system-call mode: sendmsg and recvmsg, on a stream, on datagrams and on a pair" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, streamMessages, .{ .iterations = 100, .mode = .syscalls });
+    try tardis.check(gpa, datagramMessages, .{ .iterations = 50, .mode = .syscalls, .faults = .{ .datagram_loss_ppm = 0, .datagram_duplicate_ppm = 0 } });
+    try tardis.check(gpa, pairMessages, .{ .iterations = 20, .mode = .syscalls });
+}
+
+/// A descriptor to pass (`SCM_RIGHTS`), through a pair and through a socket.
+fn passesDescriptor(fd: usize) void {
+    const Control = extern struct { len: usize = 20, level: i32 = 1, kind: i32 = 1, fd: i32 = 0 };
+    const control: Control = .{};
+    const out = [_]Iovec2{vec("x")};
+    const msg: Msghdr = .{ .iov = @intFromPtr(&out), .iovlen = 1, .control = @intFromPtr(&control), .controllen = 20 };
+    _ = sys(.sendmsg, fd, @intFromPtr(&msg), 0, 0);
+}
+
+fn passesThroughPair(env: *Env) !void {
+    _ = env;
+    passesDescriptor((try socketPair(0))[0]);
+}
+
+fn passesThroughSocket(env: *Env) !void {
+    _ = env;
+    passesDescriptor(try ok(sys(.socket, 2, 2, 0, 0)));
+}
+
+/// A datagram of 4098 bytes in two pieces: more than is put together.
+fn longGatheredDatagram(env: *Env) !void {
+    _ = env;
+    const a = try ok(sys(.socket, 2, 2, 0, 0));
+    const at = sockaddr(.{ 127, 0, 0, 1 }, 9300);
+    const block: [2049]u8 = @splat('x');
+    const out = [_]Iovec2{ vec(&block), vec(&block) };
+    const msg: Msghdr = .{ .name = @intFromPtr(&at), .namelen = @sizeOf(SockaddrIn), .iov = @intFromPtr(&out), .iovlen = 2 };
+    _ = sys(.sendmsg, a, @intFromPtr(&msg), 0, 0);
+}
+
+fn peeksAtSocketMessage(env: *Env) !void {
+    _ = env;
+    const a = try ok(sys(.socket, 2, 2, 0, 0));
+    const at = sockaddr(.{ 127, 0, 0, 1 }, 9301);
+    _ = try ok(sys(.bind, a, @intFromPtr(&at), @sizeOf(SockaddrIn), 0));
+    var buf: [4]u8 = undefined;
+    const into = [_]Iovec2{vec(&buf)};
+    var msg: Msghdr = .{ .iov = @intFromPtr(&into), .iovlen = 1 };
+    _ = sys(.recvmsg, a, @intFromPtr(&msg), 2 | 0x40, 0); // MSG_PEEK
+}
+
+fn sendsMore(env: *Env) !void {
+    _ = env;
+    const a = try ok(sys(.socket, 2, 2, 0, 0));
+    const at = sockaddr(.{ 127, 0, 0, 1 }, 9302);
+    const out = [_]Iovec2{vec("x")};
+    const msg: Msghdr = .{ .name = @intFromPtr(&at), .namelen = @sizeOf(SockaddrIn), .iov = @intFromPtr(&out), .iovlen = 1 };
+    _ = sys(.sendmsg, a, @intFromPtr(&msg), 0x8000, 0); // MSG_MORE
+}
+
+fn peeksAtMessage(env: *Env) !void {
+    _ = env;
+    const pair = try socketPair(0);
+    var buf: [4]u8 = undefined;
+    const into = [_]Iovec2{vec(&buf)};
+    var msg: Msghdr = .{ .iov = @intFromPtr(&into), .iovlen = 1 };
+    _ = sys(.recvmsg, pair[0], @intFromPtr(&msg), 2, 0); // MSG_PEEK
+}
+
+test "system-call mode: a message with a descriptor in it, a long datagram in pieces and a look at a message are still stray calls" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    inline for (.{ passesThroughPair, passesThroughSocket, longGatheredDatagram, peeksAtMessage, peeksAtSocketMessage, sendsMore }) |body| {
+        try testing.expectError(error.StraySyscall, tardis.check(gpa, body, .{ .iterations = 1, .mode = .syscalls, .report = false, .shrink = false }));
+    }
+}
+
 // --- threads (revision 97, `systhread.zig`) -----------------------------------------
 
 /// A thread's work, by system calls only: sleep, count, and say so on a pipe.

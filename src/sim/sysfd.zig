@@ -25,7 +25,8 @@
 //!   written to the other. It is two pipes, one each way, of 64 KiB
 //!   (Linux's holds about 208 KiB), with no all-or-nothing rule. On it,
 //!   beside what is listed below: `recvfrom` (`MSG_DONTWAIT`, `MSG_PEEK`),
-//!   `sendto` (`MSG_DONTWAIT`, `MSG_NOSIGNAL`), `shutdown`, `getsockname`
+//!   `sendto` (`MSG_DONTWAIT`, `MSG_NOSIGNAL`), `recvmsg` and `sendmsg`
+//!   (the same flags but `MSG_PEEK`, and no ancillary data), `shutdown`, `getsockname`
 //!   and `getpeername` (unnamed), `setsockopt` (accepted, changes
 //!   nothing) and `getsockopt` for `SO_ERROR`, `SO_TYPE`, `SO_DOMAIN`,
 //!   `SO_SNDBUF`, `SO_RCVBUF`. Divergences: closing an end with unread
@@ -64,9 +65,10 @@
 //! every simulated operation is.
 //!
 //! Not emulated (stray): a pair of datagram or `SOCK_SEQPACKET` sockets;
-//! `sendmsg` and `recvmsg` on a pair, so no descriptor or credential is
-//! passed through one, and `SO_PEERCRED`; an epoll descriptor inside an
-//! epoll set or a
+//! a `sendmsg` on a pair that carries ancillary data, so no descriptor or
+//! credential is passed through one (`sendmsg` and `recvmsg` without it
+//! are `writev` and `readv` with flags, revision 120), and
+//! `SO_PEERCRED`; an epoll descriptor inside an epoll set or a
 //! `poll`; a regular file in an epoll set fails with `EPERM`, as on Linux;
 //! `O_DIRECT` pipes; `splice`, `tee`, `F_SETPIPE_SZ`; `dup2` and `dup3`
 //! (the program chooses the number), and `dup` of a socket or a file.
@@ -361,11 +363,11 @@ pub fn emulate(s: *Sim, number: u64, a: *const [6]u64) ?u64 {
             }
             break :blk epollWait(s, slot, a[1], a[2], deadline);
         },
-        0 => read(s, slot, userBytes(a[1], a[2]) orelse return fail(.FAULT)),
-        1 => write(s, slot, userBytes(a[1], a[2]) orelse return fail(.FAULT)),
-        44, 45, 48, 51, 52, 54, 55 => if (slot.kind == .pair) onSocket(s, slot, number, a) else fail(.NOTSOCK),
-        19 => vectors(s, slot, a[1], a[2], .read),
-        20 => vectors(s, slot, a[1], a[2], .write),
+        0 => read(s, slot, userBytes(a[1], a[2]) orelse return fail(.FAULT), false),
+        1 => write(s, slot, userBytes(a[1], a[2]) orelse return fail(.FAULT), false),
+        44, 45, 46, 47, 48, 51, 52, 54, 55 => if (slot.kind == .pair) onSocket(s, slot, number, a) else fail(.NOTSOCK),
+        19 => vectors(s, slot, a[1], a[2], .read, false),
+        20 => vectors(s, slot, a[1], a[2], .write, false),
         3 => blk: {
             release(@intCast(fd - fd_base));
             s.wakeNetwork();
@@ -550,6 +552,31 @@ fn onSocket(s: *Sim, slot: *Slot, number: u64, a: *const [6]u64) ?u64 {
             if (@as(i64, @bitCast(rc)) >= 0 and a[4] != 0 and a[5] != 0) @as(*align(1) u32, @ptrFromInt(a[5])).* = 0;
             return rc;
         },
+        46 => { // sendmsg: a `writev` with flags
+            if (a[1] == 0) return fail(.FAULT);
+            const msg: *align(1) const sysnet.Msghdr = @ptrFromInt(a[1]);
+            const flags: u32 = @truncate(a[2]);
+            if (msg.name != 0 and @as(i32, @bitCast(msg.namelen)) < 0) return fail(.INVAL);
+            if (msg.controllen != 0) return if (msg.control == 0) fail(.FAULT) else null; // a descriptor or credentials to pass
+            if (flags & ~@as(u32, msg_dontwait | msg_nosignal) != 0) return null;
+            if (msg.name != 0 and msg.namelen != 0) return fail(.ISCONN);
+            if (msg.iovlen > 1024) return fail(.MSGSIZE);
+            return vectors(s, slot, msg.iov, msg.iovlen, .write, flags & msg_dontwait != 0);
+        },
+        47 => { // recvmsg: a `readv` with flags; no name, nothing ancillary
+            if (a[1] == 0) return fail(.FAULT);
+            const msg: *align(1) sysnet.Msghdr = @ptrFromInt(a[1]);
+            const flags: u32 = @truncate(a[2]);
+            if (msg.name != 0 and @as(i32, @bitCast(msg.namelen)) < 0) return fail(.INVAL);
+            if (flags & ~@as(u32, msg_dontwait | msg_nosignal | sysnet.msg_cmsg_cloexec) != 0) return null; // a look, wait for all
+            if (msg.iovlen > 1024) return fail(.MSGSIZE);
+            const rc = vectors(s, slot, msg.iov, msg.iovlen, .read, flags & msg_dontwait != 0);
+            if (@as(i64, @bitCast(rc)) < 0) return rc;
+            if (msg.name != 0) msg.namelen = 0;
+            msg.controllen = 0;
+            msg.flags = 0;
+            return rc;
+        },
         48 => { // shutdown: 0 the reading, 1 the writing, 2 both
             if (a[1] > 2) return fail(.INVAL);
             if (a[1] != 1) pipes[slot.object].shut = true;
@@ -646,10 +673,11 @@ fn eventWrite(s: *Sim, slot: *Slot, buf: []const u8) u64 {
 
 // --- read, write and the rest -----------------------------------------------------
 
-fn read(s: *Sim, slot: *Slot, buf: []u8) u64 {
+/// `dontwait` is `MSG_DONTWAIT`, which only a pair is given.
+fn read(s: *Sim, slot: *Slot, buf: []u8, dontwait: bool) u64 {
     return switch (slot.kind) {
         .pipe_read => pipeRead(s, slot, buf, .{}),
-        .pair => pipeRead(s, slot, buf, .{}),
+        .pair => pipeRead(s, slot, buf, .{ .dontwait = dontwait }),
         .eventfd => eventRead(s, slot, buf),
         .pipe_write => fail(.BADF),
         .epoll => fail(.INVAL),
@@ -657,10 +685,10 @@ fn read(s: *Sim, slot: *Slot, buf: []u8) u64 {
     };
 }
 
-fn write(s: *Sim, slot: *Slot, buf: []const u8) u64 {
+fn write(s: *Sim, slot: *Slot, buf: []const u8, dontwait: bool) u64 {
     return switch (slot.kind) {
         .pipe_write => pipeWrite(s, slot, slot.object, buf, true, false),
-        .pair => pipeWrite(s, slot, slot.out, buf, false, false),
+        .pair => pipeWrite(s, slot, slot.out, buf, false, dontwait),
         .eventfd => eventWrite(s, slot, buf),
         .pipe_read => fail(.BADF),
         .epoll => fail(.INVAL),
@@ -673,8 +701,9 @@ const Iovec = extern struct { base: u64, len: u64 };
 /// `readv`: vector by vector, stopping at the first that is short, and
 /// not waiting after the first. `writev`: as one write. Up to 4096 bytes
 /// in all go in together or not at all; a longer one goes vector by
-/// vector, each waiting for room unless the descriptor is non-blocking.
-fn vectors(s: *Sim, slot: *Slot, iov_ptr: u64, count: u64, comptime direction: enum { read, write }) u64 {
+/// vector, each waiting for room unless the descriptor is non-blocking
+/// or the call said not to wait (`dontwait`: a pair's `MSG_DONTWAIT`).
+fn vectors(s: *Sim, slot: *Slot, iov_ptr: u64, count: u64, comptime direction: enum { read, write }, dontwait: bool) u64 {
     if (count > 1024) return fail(.INVAL);
     if (count > 0 and iov_ptr == 0) return fail(.FAULT);
     const iov: []align(1) const Iovec = if (count == 0) &.{} else @as([*]align(1) const Iovec, @ptrFromInt(iov_ptr))[0..count];
@@ -690,7 +719,7 @@ fn vectors(s: *Sim, slot: *Slot, iov_ptr: u64, count: u64, comptime direction: e
                 @memcpy(joined[at..][0..buf.len], buf);
                 at += buf.len;
             }
-            return write(s, slot, joined[0..at]);
+            return write(s, slot, joined[0..at], dontwait);
         }
     }
     var total: u64 = 0;
@@ -702,7 +731,7 @@ fn vectors(s: *Sim, slot: *Slot, iov_ptr: u64, count: u64, comptime direction: e
         // another task changed through a duplicate.
         const forced = direction == .read and total > 0 and !slot.nonblock;
         if (forced) slot.nonblock = true;
-        const rc = if (direction == .read) read(s, slot, buf) else write(s, slot, buf);
+        const rc = if (direction == .read) read(s, slot, buf, dontwait) else write(s, slot, buf, dontwait);
         if (slot.gen != gen) return if (total > 0) total else rc;
         if (forced) slot.nonblock = false;
         if (@as(i64, @bitCast(rc)) < 0) return if (total > 0) total else rc;

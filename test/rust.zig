@@ -5,7 +5,8 @@
 //! channels, clock, files and sockets, and tokio's two runtimes (the
 //! work-stealing one with a worker count given and with the one it
 //! picks), an HTTP server and clients on hyper, a host name looked up,
-//! a pair of Unix-domain sockets.
+//! a pair of Unix-domain sockets, messages sent and received in pieces
+//! (`sendmsg`, `recvmsg`).
 //! It knows
 //! nothing of TARDIS. System-call mode answers its system calls from the
 //! simulation, and its threads are simulated tasks.
@@ -229,6 +230,21 @@ test "rust: UnixStream::pair, the standard library's between threads and tokio's
     try tardis.check(testing.allocator, unixPair, options);
     try tardis.check(testing.allocator, tokioPairCurrent, options);
     try tardis.check(testing.allocator, tokioPairTwoWorkers, options);
+}
+
+extern fn rust_messages() c_int;
+
+fn messages(env: *Env) !void {
+    _ = env;
+    try testing.expectEqual(@as(c_int, 0), rust_messages());
+}
+
+test "rust: socket2's vectored calls (sendmsg, recvmsg) on datagrams, a TCP connection and a pair" {
+    if (skip()) return error.SkipZigTest;
+    // The program expects each datagram once: none lost, none twice.
+    var no_loss = options;
+    no_loss.faults = .{ .datagram_loss_ppm = 0, .datagram_duplicate_ppm = 0 };
+    try tardis.check(testing.allocator, messages, no_loss);
 }
 
 extern fn rust_resolve() c_int;

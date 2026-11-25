@@ -260,8 +260,10 @@ On musl and on glibc.
 
 A pair of connected sockets (`socketpair`, Unix domain, stream) is
 answered. A named Unix-domain socket is not: `socket(AF_UNIX, ...)`
-fails with `EAFNOSUPPORT`. Nothing passes a descriptor from one end of
-a pair to the other (`sendmsg` is not answered).
+fails with `EAFNOSUPPORT`. `sendmsg` and `recvmsg` are answered on
+IPv4 sockets and on a pair, without ancillary data: nothing passes a
+descriptor from one end of a pair to the other, and `sendmmsg` and
+`recvmmsg` are not answered.
 
 A program that looks host names up finds the ones the test writes to
 `/etc/hosts` in the simulated filesystem, which starts empty; there is

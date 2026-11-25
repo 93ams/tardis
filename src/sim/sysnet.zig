@@ -24,13 +24,14 @@
 //!
 //! Emulated: `socket` (IPv4, stream or datagram, blocking), `bind`,
 //! `listen`, `accept`, `accept4`, `connect`, `read`, `write`, `readv`,
-//! `writev`, `recvfrom`, `sendto`, `shutdown`, `close`, `getsockname`,
+//! `writev`, `recvfrom`, `sendto`, `recvmsg`, `sendmsg`, `shutdown`,
+//! `close`, `getsockname`,
 //! `getpeername`, `setsockopt` (accepted, changes nothing), `getsockopt`
 //! (`SO_ERROR` and `SO_TYPE`; any other reads as 0), and `fcntl` for the
 //! descriptor flags. An IPv6 socket fails with `EAFNOSUPPORT`, which
 //! code that tries IPv6 first takes as the cue to use IPv4.
 //!
-//! As Linux: a blocking stream `send` or `writev` sends everything; a
+//! As Linux: a blocking stream `send`, `writev` or `sendmsg` sends everything; a
 //! write after this end's `shutdown(SHUT_WR)`, or after a reset was
 //! reported once, fails with `EPIPE` (and raises no `SIGPIPE`: signals
 //! are not modelled); `shutdown` of a listening socket wakes its
@@ -44,9 +45,24 @@
 //! details follow Linux as a differential test found them
 //! (`src/tests/sysnet_diff_test.zig`).
 //!
+//! `sendmsg` and `recvmsg` (revision 120) are `sendto` and `recvfrom`
+//! over several buffers, with the address in the message header (but a
+//! stream's `recvmsg` names no sender: `msg_namelen` is 0). A
+//! datagram goes out as one, whatever the number of buffers, and comes in
+//! spread over them, with `MSG_TRUNC` in `msg_flags` when it did not
+//! fit; `readv` and `writev` on a datagram socket do the same. A stream
+//! `recvmsg` or `readv` fills the first buffer with room and no more,
+//! a short read the caller must expect anyway. There is no ancillary
+//! data: a `sendmsg` that carries any is stray, and a `recvmsg` is told
+//! there was none (`msg_controllen` 0).
+//!
 //! `epoll` is in `sysfd.zig`. Not emulated (stray): `select` and
-//! `pselect6`; `sendmsg`, `recvmsg`, `MSG_PEEK`,
-//! `MSG_OOB`, `MSG_WAITALL`; a datagram `writev` of more than one vector;
+//! `pselect6`; `sendmmsg`, `recvmmsg`, `MSG_PEEK`,
+//! `MSG_OOB`, `MSG_WAITALL`, `MSG_MORE` and every flag but
+//! `MSG_DONTWAIT` and `MSG_NOSIGNAL` (and `MSG_CMSG_CLOEXEC` to
+//! `recvmsg`); a datagram sent from several buffers that is longer than
+//! `gather_max` bytes; a datagram read into several buffers with more
+//! than 64 KiB of room when `limits.rx_buffer_bytes` is above that;
 //! families other than IPv4, IPv6, Unix-domain and netlink (those three
 //! are refused with `EAFNOSUPPORT`: the machine has none). A stream `bind` reserves its port, as
 //! the kernel's does, and `listen` or `connect` after it use that port.
@@ -317,8 +333,10 @@ pub fn emulate(s: *Sim, number: u64, a: *const [6]u64) ?u64 {
         43 => accept(s, slot, a[1], a[2], 0),
         288 => accept(s, slot, a[1], a[2], @truncate(a[3])),
         42 => connect(s, slot, a[1], a[2]),
-        0 => receive(s, slot, a[1], a[2], 0, 0, 0),
-        45 => receive(s, slot, a[1], a[2], @truncate(a[3]), a[4], a[5]),
+        0 => receive(s, slot, a[1], a[2], 0, 0, 0, null),
+        45 => receive(s, slot, a[1], a[2], @truncate(a[3]), a[4], a[5], null),
+        46 => sendMessage(s, slot, a[1], @truncate(a[2])),
+        47 => receiveMessage(s, slot, a[1], @truncate(a[2])),
         1 => send(s, slot, a[1], a[2], 0, 0, 0),
         44 => send(s, slot, a[1], a[2], @truncate(a[3]), a[4], a[5]),
         19 => readVectors(s, slot, a[1], a[2]),
@@ -606,7 +624,9 @@ fn userBytes(ptr: u64, len: u64) ?[]u8 {
     return @as([*]u8, @ptrFromInt(ptr))[0..@min(len, 0x7fff_f000)];
 }
 
-fn receive(s: *Sim, slot: *Slot, buf_ptr: u64, len: u64, flags: u32, from_ptr: u64, from_len_ptr: u64) ?u64 {
+/// `truncated`, when asked for, is set for a datagram longer than the
+/// buffer.
+fn receive(s: *Sim, slot: *Slot, buf_ptr: u64, len: u64, flags: u32, from_ptr: u64, from_len_ptr: u64, truncated: ?*bool) ?u64 {
     if (flags & ~@as(u32, msg_nosignal | msg_dontwait) != 0) return null; // peek, waitall, oob
     const buf = userBytes(buf_ptr, len) orelse return fail(.FAULT);
     const nonblock = slot.nonblock or flags & msg_dontwait != 0;
@@ -663,6 +683,7 @@ fn receive(s: *Sim, slot: *Slot, buf_ptr: u64, len: u64, flags: u32, from_ptr: u
                 slot.unfiltered -= 1;
             } else if (slot.peer) |p| if (!icmpMatches(p, message[0].from)) continue;
             if (writeAddress(from_ptr, from_len_ptr, message[0].from)) |e| return fail(e);
+            if (truncated) |t| t.* = message[0].flags.trunc;
             return message[0].data.len;
         },
         // Shut down for reading (see `shutdown`): 0 at once. Otherwise a
@@ -807,54 +828,178 @@ fn noDatagramSocket(s: *Sim, to: ionet.IpAddress, from_port: u16) bool {
 
 const Iovec = extern struct { base: u64, len: u64 };
 
-fn iovecs(iov_ptr: u64, count: u64) union(enum) { ok: []const Iovec, err: E } {
-    if (count > 1024) return .{ .err = .INVAL };
+/// More than 1024 vectors: `EINVAL` from `readv` and `writev`, `EMSGSIZE`
+/// from `recvmsg` and `sendmsg`.
+fn iovecs(iov_ptr: u64, count: u64, too_many: E) union(enum) { ok: []align(1) const Iovec, err: E } {
+    if (count > 1024) return .{ .err = too_many };
     if (count == 0) return .{ .ok = &.{} };
     if (iov_ptr == 0) return .{ .err = .FAULT };
-    return .{ .ok = @as([*]const Iovec, @ptrFromInt(iov_ptr))[0..count] };
+    return .{ .ok = @as([*]align(1) const Iovec, @ptrFromInt(iov_ptr))[0..count] };
 }
 
-/// `readv`: into the first vector with room. A stream read may return
-/// fewer bytes than asked, and the caller loops.
+/// `struct msghdr`, as the caller laid it out.
+pub const Msghdr = extern struct {
+    name: u64,
+    namelen: u32,
+    iov: u64,
+    iovlen: u64,
+    control: u64,
+    controllen: u64,
+    flags: u32,
+};
+
+pub const msg_trunc = 0x20;
+/// Asked of `recvmsg` for the descriptors it might be passed: there are
+/// none, so it changes nothing.
+pub const msg_cmsg_cloexec = 0x4000_0000;
+
+/// The longest datagram that is sent from more than one vector: it is
+/// put together on the task's stack.
+const gather_max = 4096;
+
+/// Where a datagram read into more than one vector arrives. One for the
+/// thread is enough: it is filled by the simulator's receive and emptied
+/// into the caller's vectors with no scheduling point between.
+threadlocal var whole: [65536]u8 = undefined;
+
+/// `readv`. With no room at all it reads nothing (Linux).
 fn readVectors(s: *Sim, slot: *Slot, iov_ptr: u64, count: u64) ?u64 {
-    const iov = switch (iovecs(iov_ptr, count)) {
+    const iov = switch (iovecs(iov_ptr, count, .INVAL)) {
         .ok => |v| v,
         .err => |e| return fail(e),
     };
     for (iov) |v| {
-        if (v.len == 0) continue;
-        return receive(s, slot, v.base, v.len, 0, 0, 0);
+        if (v.len != 0) return receiveVectors(s, slot, iov, 0, 0, 0, null);
     }
     return 0;
 }
 
-/// `writev`: on a stream, every vector in turn, all of it (a blocking
-/// stream write is not short); a datagram is one message, emulated only
-/// when it is one vector.
+/// Into the vectors of a `readv` or a `recvmsg`. A stream read fills the
+/// first vector with room and no more: it may return fewer bytes than
+/// asked, and the caller loops. A datagram is spread over all of them.
+fn receiveVectors(s: *Sim, slot: *Slot, iov: []align(1) const Iovec, flags: u32, from_ptr: u64, from_len_ptr: u64, truncated: ?*bool) ?u64 {
+    var first: ?Iovec = null;
+    var pieces: usize = 0;
+    var room: u64 = 0;
+    for (iov) |v| {
+        if (v.len == 0) continue;
+        if (first == null) first = v;
+        pieces += 1;
+        room +|= v.len;
+    }
+    const one = first orelse return receive(s, slot, 0, 0, flags, from_ptr, from_len_ptr, truncated);
+    if (slot.mode == .stream or pieces == 1) return receive(s, slot, one.base, one.len, flags, from_ptr, from_len_ptr, truncated);
+    // No datagram is longer than a socket's receive buffer.
+    const most = @min(room, s.net.datagramCapacity());
+    if (most > whole.len) return null;
+    const rc = receive(s, slot, @intFromPtr(&whole), most, flags, from_ptr, from_len_ptr, truncated) orelse return null;
+    if (@as(i64, @bitCast(rc)) < 0) return rc;
+    var at: usize = 0;
+    for (iov) |v| {
+        if (at == rc) break;
+        const n: usize = @intCast(@min(v.len, rc - at));
+        if (n == 0) continue;
+        // The datagram is taken and lost, as on Linux.
+        if (v.base == 0) return fail(.FAULT);
+        @memcpy(@as([*]u8, @ptrFromInt(v.base))[0..n], whole[at..][0..n]);
+        at += n;
+    }
+    return rc;
+}
+
+/// `writev`. With nothing to write it sends nothing, not even an empty
+/// datagram (Linux).
 fn writeVectors(s: *Sim, slot: *Slot, iov_ptr: u64, count: u64) ?u64 {
-    const iov = switch (iovecs(iov_ptr, count)) {
+    const iov = switch (iovecs(iov_ptr, count, .INVAL)) {
         .ok => |v| v,
         .err => |e| return fail(e),
     };
+    for (iov) |v| {
+        if (v.len != 0) return sendVectors(s, slot, iov, 0, 0, 0);
+    }
+    return 0;
+}
+
+/// From the vectors of a `writev` or a `sendmsg`. On a stream, every
+/// vector in turn, all of it (a blocking stream write is not short). A
+/// datagram is one message: put together first when it is in several
+/// vectors, which is emulated up to `gather_max` bytes.
+fn sendVectors(s: *Sim, slot: *Slot, iov: []align(1) const Iovec, flags: u32, to_ptr: u64, to_len: u64) ?u64 {
     if (slot.mode == .dgram) {
-        var only: ?Iovec = null;
+        var only: Iovec = .{ .base = 0, .len = 0 };
+        var pieces: usize = 0;
+        var all: u64 = 0;
         for (iov) |v| {
             if (v.len == 0) continue;
-            if (only != null) return null;
             only = v;
+            pieces += 1;
+            all +|= v.len;
         }
-        const v = only orelse return 0;
-        return send(s, slot, v.base, v.len, 0, 0, 0);
+        if (pieces <= 1) return send(s, slot, only.base, only.len, flags, to_ptr, to_len);
+        if (all > gather_max) return null;
+        var joined: [gather_max]u8 = undefined;
+        var at: usize = 0;
+        for (iov) |v| {
+            const part = userBytes(v.base, v.len) orelse return fail(.FAULT);
+            @memcpy(joined[at..][0..part.len], part);
+            at += part.len;
+        }
+        return send(s, slot, @intFromPtr(&joined), at, flags, to_ptr, to_len);
     }
     var total: u64 = 0;
+    var any = false;
+    for (iov) |v| any = any or v.len != 0;
+    // A message of no bytes still hears that the stream is not open.
+    if (!any) return send(s, slot, 0, 0, flags, 0, 0);
     for (iov) |v| {
         if (v.len == 0) continue;
-        const r = send(s, slot, v.base, v.len, 0, 0, 0) orelse return null;
+        const r = send(s, slot, v.base, v.len, flags, 0, 0) orelse return null;
         if (@as(i64, @bitCast(r)) < 0) return if (total > 0) total else r;
         total += r;
         if (r < v.len) break;
     }
     return total;
+}
+
+/// `sendmsg`. A message with ancillary data (a descriptor to pass, a
+/// packet's options) is stray. A stream ignores the address, as Linux's
+/// TCP does.
+fn sendMessage(s: *Sim, slot: *Slot, msg_ptr: u64, flags: u32) ?u64 {
+    if (msg_ptr == 0) return fail(.FAULT);
+    const msg: *align(1) const Msghdr = @ptrFromInt(msg_ptr);
+    if (msg.name != 0 and @as(i32, @bitCast(msg.namelen)) < 0) return fail(.INVAL);
+    if (msg.controllen != 0) return if (msg.control == 0) fail(.FAULT) else null;
+    const iov = switch (iovecs(msg.iov, msg.iovlen, .MSGSIZE)) {
+        .ok => |v| v,
+        .err => |e| return fail(e),
+    };
+    // A null name, or a length of 0, is no address (Linux).
+    const to_ptr: u64 = if (msg.namelen == 0) 0 else msg.name;
+    return sendVectors(s, slot, iov, flags, to_ptr, if (to_ptr == 0) 0 else msg.namelen);
+}
+
+/// `recvmsg`. The sender of a datagram goes where `msg_name` says and
+/// its length into `msg_namelen`; a stream names no one (length 0).
+/// `msg_flags` is `MSG_TRUNC` for a datagram that did not fit, or 0, and
+/// `msg_controllen` 0: nothing here produces ancillary data.
+fn receiveMessage(s: *Sim, slot: *Slot, msg_ptr: u64, flags: u32) ?u64 {
+    if (msg_ptr == 0) return fail(.FAULT);
+    const msg: *align(1) Msghdr = @ptrFromInt(msg_ptr);
+    if (msg.name != 0 and @as(i32, @bitCast(msg.namelen)) < 0) return fail(.INVAL);
+    if (flags & ~@as(u32, msg_nosignal | msg_dontwait | msg_cmsg_cloexec) != 0) return null;
+    const iov = switch (iovecs(msg.iov, msg.iovlen, .MSGSIZE)) {
+        .ok => |v| v,
+        .err => |e| return fail(e),
+    };
+    const mode = slot.mode;
+    var truncated = false;
+    const from_ptr: u64 = if (mode == .dgram) msg.name else 0;
+    const rc = receiveVectors(s, slot, iov, flags & ~@as(u32, msg_cmsg_cloexec), from_ptr, msg_ptr + @offsetOf(Msghdr, "namelen"), &truncated) orelse return null;
+    if (@as(i64, @bitCast(rc)) < 0) return rc;
+    if (mode == .stream and msg.name != 0) msg.namelen = 0;
+    msg.controllen = 0;
+    msg.flags = if (truncated) msg_trunc else 0;
+    return rc;
 }
 
 fn shutdown(s: *Sim, slot: *Slot, how: u64) u64 {

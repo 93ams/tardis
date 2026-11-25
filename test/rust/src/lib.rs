@@ -493,6 +493,130 @@ mod with_tokio {
     }
 }
 
+/// `sendmsg` and `recvmsg`, as the `socket2` crate's vectored calls make
+/// them: a datagram sent in two pieces and received in two with its
+/// sender, one cut short and marked so, and 60,000 bytes echoed through
+/// a TCP connection and through a pair of Unix-domain sockets.
+#[cfg(feature = "messages")]
+#[no_mangle]
+pub extern "C" fn rust_messages() -> i32 {
+    use socket2::{Domain, MaybeUninitSlice, Socket, Type};
+    use std::io::IoSlice;
+    use std::mem::MaybeUninit;
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+
+    fn bytes(b: &[MaybeUninit<u8>]) -> Vec<u8> {
+        // Every buffer here starts out written.
+        b.iter().map(|x| unsafe { x.assume_init() }).collect()
+    }
+    fn send_all(s: &Socket, data: &[u8]) -> bool {
+        let mut at = 0;
+        while at < data.len() {
+            let (x, y) = data[at..].split_at((data.len() - at) / 3);
+            match s.send_vectored(&[IoSlice::new(x), IoSlice::new(y)]) {
+                Ok(0) | Err(_) => return false,
+                Ok(n) => at += n,
+            }
+        }
+        true
+    }
+    fn recv_some(s: &Socket, out: &mut Vec<u8>) -> Option<usize> {
+        let mut x = [MaybeUninit::new(0u8); 700];
+        let mut y = [MaybeUninit::new(0u8); 1300];
+        let n = {
+            let mut into = [MaybeUninitSlice::new(&mut x), MaybeUninitSlice::new(&mut y)];
+            s.recv_vectored(&mut into).ok()?.0
+        };
+        let k = n.min(x.len());
+        out.extend(bytes(&x[..k]));
+        out.extend(bytes(&y[..n - k]));
+        Some(n)
+    }
+    /// `theirs` echoes what `mine` sends, in a thread; another reads it.
+    fn echoed(mine: Socket, theirs: Socket) -> bool {
+        let echo = std::thread::spawn(move || {
+            let mut part = Vec::new();
+            while let Some(n) = recv_some(&theirs, &mut part) {
+                if n == 0 || !send_all(&theirs, &part) {
+                    break;
+                }
+                part.clear();
+            }
+        });
+        let Ok(reader) = mine.try_clone() else { return false };
+        let read = std::thread::spawn(move || {
+            let mut all = Vec::new();
+            while let Some(n) = recv_some(&reader, &mut all) {
+                if n == 0 {
+                    break;
+                }
+            }
+            all
+        });
+        let sent: Vec<u8> = (0..60_000u32).map(|i| (i % 241) as u8).collect();
+        if !send_all(&mine, &sent) || mine.shutdown(std::net::Shutdown::Write).is_err() {
+            return false;
+        }
+        echo.join().is_ok() && read.join().map(|all| all == sent).unwrap_or(false)
+    }
+
+    // Datagrams.
+    let any: SocketAddr = ([127, 0, 0, 1], 0).into();
+    let Ok(a) = Socket::new(Domain::IPV4, Type::DGRAM, None) else { return 1 };
+    let Ok(b) = Socket::new(Domain::IPV4, Type::DGRAM, None) else { return 2 };
+    if a.bind(&any.into()).is_err() || b.bind(&any.into()).is_err() {
+        return 3;
+    }
+    let (Ok(a_at), Ok(b_at)) = (a.local_addr(), b.local_addr()) else { return 4 };
+    let pieces = [IoSlice::new(b"head"), IoSlice::new(b"-and-body")];
+    if !matches!(a.send_to_vectored(&pieces, &b_at), Ok(13)) {
+        return 5;
+    }
+    let mut head = [MaybeUninit::new(0u8); 4];
+    let mut body = [MaybeUninit::new(0u8); 32];
+    {
+        let mut into = [MaybeUninitSlice::new(&mut head), MaybeUninitSlice::new(&mut body)];
+        match b.recv_from_vectored(&mut into) {
+            Ok((13, flags, from)) if !flags.is_truncated() && from.as_socket() == a_at.as_socket() => {}
+            _ => return 6,
+        }
+    }
+    if bytes(&head) != b"head" || bytes(&body[..9]) != b"-and-body" {
+        return 7;
+    }
+    if !matches!(a.send_to_vectored(&pieces, &b_at), Ok(13)) {
+        return 8;
+    }
+    let mut tail = [MaybeUninit::new(0u8); 3];
+    {
+        let mut into = [MaybeUninitSlice::new(&mut head), MaybeUninitSlice::new(&mut tail)];
+        match b.recv_vectored(&mut into) {
+            Ok((7, flags)) if flags.is_truncated() => {}
+            _ => return 9,
+        }
+    }
+    if bytes(&tail) != b"-an" {
+        return 10;
+    }
+
+    // A TCP connection.
+    let Ok(listener) = TcpListener::bind("127.0.0.1:0") else { return 11 };
+    let Ok(at) = listener.local_addr() else { return 12 };
+    let accept = std::thread::spawn(move || listener.accept().map(|(s, _)| s).ok());
+    let Ok(client) = TcpStream::connect(at) else { return 13 };
+    let Ok(Some(server)) = accept.join() else { return 14 };
+    if !echoed(Socket::from(client), Socket::from(server)) {
+        return 15;
+    }
+
+    // A pair of Unix-domain sockets.
+    let Ok((mine, theirs)) = Socket::pair(Domain::UNIX, Type::STREAM, None) else { return 16 };
+    if !echoed(mine, theirs) {
+        return 17;
+    }
+    0
+}
+
 /// A host name looked up through the C library (`getaddrinfo`), as
 /// `connect("localhost:80")` does: how many addresses, or a negative
 /// number when the lookup fails or gives one that is not the loopback.

@@ -14,8 +14,12 @@ hyper = { version = "1", default-features = false, features = ["http1", "server"
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"], optional = true }
 http-body-util = { version = "0.1", optional = true }
 
+# `sendmsg` and `recvmsg` (its vectored calls). tokio depends on it too.
+socket2 = { version = "0.6", optional = true }
+
 [features]
-default = ["tokio", "http"]
+default = ["tokio", "http", "messages"]
+messages = ["dep:socket2"]
 http = ["tokio", "dep:hyper", "dep:hyper-util", "dep:http-body-util"]
 
 [profile.dev]
