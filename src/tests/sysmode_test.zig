@@ -787,7 +787,8 @@ fn readsLinks(env: *Env) !void {
     // procfs names a descriptor by its digits only.
     var odd: [64]u8 = undefined;
     try testing.expectEqual(errOf(.NOENT), linkOf((try std.mem.printSentinel(&odd, "/proc/self/fd/0{d}", .{f}, 0)).ptr, &name));
-    try testing.expectEqual(errOf(.NOENT), linkOf((try std.mem.printSentinel(&odd, "/proc/self/fd/+{d}", .{f}, 0)).ptr, &name));    // A symbolic link, by `readlink` and `readlinkat`.
+    try testing.expectEqual(errOf(.NOENT), linkOf((try std.mem.printSentinel(&odd, "/proc/self/fd/+{d}", .{f}, 0)).ptr, &name));
+    // A symbolic link, by `readlink` and `readlinkat`.
     try env.dir.symLink(env.io, "d/target", "link", .{});
     try expectLink("d/target", "link");
     var buf: [64]u8 = undefined;
