@@ -260,6 +260,10 @@ pub const Options = struct {
     /// chaos or a security layer.
     warm_restore: bool = true,
     warm_report: ?*WarmReport = null,
+    /// Filled when the check ends: how many of its runs had tasks that
+    /// came between one another (`InterleaveReport`), what the warning a
+    /// passing check prints when none had is about.
+    interleave_report: ?*InterleaveReport = null,
     /// Fail a run with `error.StraySyscall` when its code makes a real
     /// system call: it asked the kernel for the time, random bytes, a file
     /// or a socket instead of going through `env.io`, so the run no longer
@@ -1284,6 +1288,7 @@ fn runOnce(s: *Sim, comptime body: fn (*Env) anyerror!void, seed: u64, persona: 
     // Fold the outcome in so a different error is a different trace.
     const outcome_word: u64 = if (result) |_| 0 else |err| @intFromError(err);
     const finding: u64 = if (result) |_| 0 else |err| if (err == error.SecurityViolation) s.secFindingKey() else 0;
+    if (!s.rerun) s.countConcurrency();
     s.endRun();
     return .{ .result = result, .trace_hash = decide.mix(hash, outcome_word), .finding = finding };
 }
@@ -1436,6 +1441,20 @@ pub const WarmReport = struct {
     mismatches: u64 = 0,
     /// A snapshot was in use when the campaign ended.
     active: bool = false,
+};
+
+/// The runs of a check with several tasks, and whether those tasks came
+/// between one another (`Options.interleave_report`). Forked
+/// iterations are not counted.
+pub const InterleaveReport = struct {
+    /// Runs in which the body and at least two other tasks ran (daemons,
+    /// `Env.spawnOn`'s and chaos's, are not counted).
+    several: u32 = 0,
+    /// Those of them in which a task other than the body and the daemons
+    /// stopped before its end (it waited, or the simulator switched to another task at
+    /// one of its scheduling points) while another ran. When it is 0 and
+    /// `several` is not, a check that passes prints a warning.
+    interleaved: u32 = 0,
 };
 
 /// What a token replay did (`Options.replay_report`).
@@ -1869,6 +1888,7 @@ pub fn check(gpa: Allocator, comptime body: fn (*Env) anyerror!void, options: Op
     var shrunk: ShrinkReport = .{};
     if (o.shrink_report == null) o.shrink_report = &shrunk;
     const result = checkOn(gpa, s, body, o, caller);
+    if (options.interleave_report) |r| r.* = .{ .several = s.runs_several, .interleaved = s.runs_interleaved };
     if (options.warm_report) |r| r.* = .{
         .restores = s.warm.restores,
         .checks = s.warm.checks,
@@ -1984,6 +2004,22 @@ fn campaign(gpa: Allocator, s: *Sim, comptime body: fn (*Env) anyerror!void, opt
         if (guided) |*g| g.report(options, null);
     }
     if (s.catalog.reportUnsatisfied(s.config.report) > 0) return error.SometimesNeverTrue;
+    reportNeverInterleaved(s);
+}
+
+/// After a campaign that passed: says so when its tasks always ran one
+/// after another (docs/threads.md, "Where tasks switch"). A run counts
+/// when the body and at least two other tasks ran in it (daemons aside);
+/// its tasks came between one another when one of them (not the body, not
+/// a daemon) stopped before its end, waiting or switched away from, while
+/// another ran. Forked iterations are not counted.
+fn reportNeverInterleaved(s: *const Sim) void {
+    if (!s.config.report or s.runs_several == 0 or s.runs_interleaved > 0) return;
+    std.debug.print(
+        \\tardis: warning: in {d} run{s} with the body and two or more other tasks, no task besides the body was switched away from before its end: each ran from its start to its end with no other task in between
+        \\tardis: if the tasks share memory with no std.Io call between, a tardis.yield() where a switch could matter gives the simulator the choice (docs/threads.md, "Where tasks switch")
+        \\
+    , .{ s.runs_several, if (s.runs_several == 1) "" else "s" });
 }
 
 /// Runs iterations `[first, end)` on `s`, reporting and shrinking the first failure.
@@ -2204,7 +2240,7 @@ fn ParallelWorker(comptime body: fn (*Env) anyerror!void) type {
         /// stopping once it passes the lowest failure any worker has seen.
         /// Every iteration below that failure is still run by someone, so
         /// the lowest failing iteration is the same whatever the timing.
-        fn run(gpa: Allocator, options: Options, w: u32, shared: *ParallelShared, out: []oracle.Entry, out_len: *usize, found: *FoundRuns) void {
+        fn run(gpa: Allocator, options: Options, w: u32, shared: *ParallelShared, out: []oracle.Entry, out_len: *usize, found: *FoundRuns, runs: *[2]u32) void {
             var config = simConfig(options);
             config.report = false;
             const ws = Sim.create(gpa, config) catch {
@@ -2239,6 +2275,7 @@ fn ParallelWorker(comptime body: fn (*Env) anyerror!void) type {
             const n = ws.catalog.len;
             @memcpy(out[0..n], ws.catalog.entries[0..n]);
             out_len.* = n;
+            runs.* = .{ ws.runs_several, ws.runs_interleaved };
         }
     };
 }
@@ -2257,13 +2294,16 @@ fn runParallel(gpa: Allocator, s: *Sim, comptime body: fn (*Env) anyerror!void, 
     const founds = try gpa.alloc(FoundRuns, workers);
     defer gpa.free(founds);
     @memset(founds, .{});
+    const runs = try gpa.alloc([2]u32, workers);
+    defer gpa.free(runs);
+    @memset(runs, .{ 0, 0 });
     const threads = try gpa.alloc(std.Thread, workers);
     defer gpa.free(threads);
     var spawned: usize = 0;
     defer for (threads[0..spawned]) |t| t.join();
     for (0..workers) |w| {
         const out = catalogs[w * options.limits.assertions_max ..][0..options.limits.assertions_max];
-        threads[w] = try std.Thread.spawn(.{}, ParallelWorker(body).run, .{ gpa, options, @as(u32, @intCast(w)), &shared, out, &lens[w], &founds[w] });
+        threads[w] = try std.Thread.spawn(.{}, ParallelWorker(body).run, .{ gpa, options, @as(u32, @intCast(w)), &shared, out, &lens[w], &founds[w], &runs[w] });
         spawned += 1;
     }
     for (threads[0..spawned]) |t| t.join();
@@ -2274,6 +2314,8 @@ fn runParallel(gpa: Allocator, s: *Sim, comptime body: fn (*Env) anyerror!void, 
     for (0..workers) |w| {
         const entries = catalogs[w * options.limits.assertions_max ..][0..lens[w]];
         for (entries) |e| s.catalog.merge(e);
+        s.runs_several += runs[w][0];
+        s.runs_interleaved += runs[w][1];
     }
     if (options.keep_going) |log| {
         var all: FoundRuns = .{};
@@ -2381,7 +2423,9 @@ fn GuidedWorker(comptime body: fn (*Env) anyerror!void) type {
                 var failed = if (out.result) |_| false else |_| true;
                 const every = options.determinism_check_every;
                 if (!failed and every != 0 and job.iteration % every == 0) {
+                    ws.rerun = true;
                     failed = runOnce(ws, body, job.seed, persona, job.iteration, options.leak_check).trace_hash != out.trace_hash;
+                    ws.rerun = false;
                 }
                 ws.overlay = null;
                 if (failed) {
@@ -2497,6 +2541,8 @@ fn runGuidedParallel(gpa: Allocator, s: *Sim, comptime body: fn (*Env) anyerror!
     }
     for (sims) |ws| {
         for (ws.catalog.entries[0..ws.catalog.len]) |e| s.catalog.merge(e);
+        s.runs_several += ws.runs_several;
+        s.runs_interleaved += ws.runs_interleaved;
     }
     g.report(options, null);
 }

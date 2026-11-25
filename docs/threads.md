@@ -77,7 +77,28 @@ These are not:
 Code whose tasks share memory under locks, with no file or network call
 between, gives the simulator nowhere to switch: each task runs to its end
 before the next starts, and a test of it passes while testing nothing.
-The sign is a run of several tasks with few events in its trace. A
+The sign is a run of several tasks with few events in its trace, and a
+`check` that passes says so:
+
+```
+tardis: warning: in 30 runs with the body and two or more other tasks, no task besides the body was switched away from before its end: each ran from its start to its end with no other task in between
+```
+
+It is printed when every run with the body and at least two other tasks
+ran those others one after another, none of them stopping (to wait, or
+switched away from) before its end while another ran. Daemons
+(`Env.spawnOn`, chaos's healer and nemesis) are left out of both counts.
+`Options.interleave_report` gives the counts. Forked iterations
+(`Options.fork`) are not counted.
+
+The warning is a floor, not a measure. One stop by one task in one run
+silences it for the whole check: a worker that waits at a start gate, or
+makes a single file or socket call outside its lock and is switched away
+from there once, counts as interleaved, though its locked section still
+runs from end to end every time. And the body's own steps are not
+looked at: a body that yields between accesses the workers share still
+gets the warning. A check that does not warn may still test nothing
+between two lock holders. A
 `tardis.yield()` where a switch could matter (after taking a lock, before
 giving it back, between two accesses another task could come between)
 gives the simulator the choice; so does `tardis.atomic.Value` for the

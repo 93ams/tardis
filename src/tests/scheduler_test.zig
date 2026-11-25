@@ -322,6 +322,10 @@ fn yieldingWorker(io: Io, counter: *u32, yields: bool) Io.Cancelable!void {
 }
 
 fn lostUpdate(comptime yields: bool) !void {
+    return lostUpdateReporting(yields, null);
+}
+
+fn lostUpdateReporting(comptime yields: bool, report: ?*tardis.InterleaveReport) !void {
     return tardis.check(testing.allocator, struct {
         fn run(env: *tardis.Env) !void {
             var counter: u32 = 0;
@@ -331,7 +335,7 @@ fn lostUpdate(comptime yields: bool) !void {
             try group.await(env.io);
             try env.always("no lost update", counter == 2);
         }
-    }.run, .{ .iterations = 30, .report = false });
+    }.run, .{ .iterations = 30, .report = false, .interleave_report = report });
 }
 
 test "tardis.yield: a race with no switch point between its accesses is found only with one" {
@@ -341,4 +345,48 @@ test "tardis.yield: a race with no switch point between its accesses is found on
     try testing.expectError(error.AssertionFailed, lostUpdate(true));
     // Outside a simulation it does nothing.
     tardis.yield();
+}
+
+test "a check whose tasks never come between one another is told so" {
+    // Two workers with no switch point: each runs to its end before the
+    // other starts, in every run, and the check passes while testing
+    // nothing. The report (and the warning a reporting check prints) says so.
+    var none: tardis.InterleaveReport = .{};
+    try lostUpdateReporting(false, &none);
+    try testing.expectEqual(@as(u32, 30), none.several);
+    try testing.expectEqual(@as(u32, 0), none.interleaved);
+    // With a yield the second worker can start while the first waits at it.
+    var some: tardis.InterleaveReport = .{};
+    try testing.expectError(error.AssertionFailed, lostUpdateReporting(true, &some));
+    try testing.expect(some.interleaved > 0);
+    // One task besides the body is not several.
+    var one: tardis.InterleaveReport = .{};
+    try tardis.check(testing.allocator, struct {
+        fn run(env: *tardis.Env) !void {
+            var f = try env.io.concurrent(struct {
+                fn work(io: Io) void {
+                    io.sleep(.fromMilliseconds(1), .awake) catch {};
+                }
+            }.work, .{env.io});
+            f.await(env.io);
+        }
+    }.run, .{ .iterations = 5, .report = false, .interleave_report = &one });
+    try testing.expectEqual(@as(u32, 0), one.several);
+    // A daemon that sleeps (a server, chaos's healer) is not counted.
+    var daemon: tardis.InterleaveReport = .{};
+    try tardis.check(testing.allocator, struct {
+        fn ticker(env: *tardis.Env) !void {
+            while (true) try env.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        fn run(env: *tardis.Env) !void {
+            try env.spawnOn(0, ticker, .{env});
+            var counter: u32 = 0;
+            var group: Io.Group = .init;
+            try group.concurrent(env.io, yieldingWorker, .{ env.io, &counter, false });
+            try group.concurrent(env.io, yieldingWorker, .{ env.io, &counter, false });
+            try group.await(env.io);
+        }
+    }.run, .{ .iterations = 10, .report = false, .interleave_report = &daemon });
+    try testing.expectEqual(@as(u32, 10), daemon.several);
+    try testing.expectEqual(@as(u32, 0), daemon.interleaved);
 }

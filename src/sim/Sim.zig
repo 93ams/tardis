@@ -368,6 +368,22 @@ timer_heap: []TimerEntry,
 timer_heap_len: usize,
 runq: sched.RunQueue,
 runq_words: []u64,
+/// One bit per task that has run in this run (set when it is first
+/// switched to; task 0 from the start).
+begun_words: []u64,
+/// Tasks other than task 0 and daemons (`spawnDaemon`: a server, chaos's
+/// healer) that have run in this run.
+tasks_begun: u32,
+/// In this run a task other than task 0, a `check`'s body and a daemon
+/// stopped before its end (it waited, or another task was switched to at
+/// one of its scheduling points) and another ran meanwhile. A run without
+/// one ran those tasks one after another, each from its start to its end.
+interleavable: bool,
+/// Over the simulator's life (one `check`): runs in which at least three
+/// tasks counted in `tasks_begun` ran (a `check`'s body and two more), and
+/// those of them that were `interleavable`.
+runs_several: u32,
+runs_interleaved: u32,
 current: TaskId,
 /// The thread number the next task spawned gets (`Task.thread_id`).
 next_thread_id: u32 = thread_id_base,
@@ -534,9 +550,16 @@ pub fn create(gpa: Allocator, config: Config) !*Sim {
     s.timer_heap = try gpa.alloc(TimerEntry, 4 * task_count);
     errdefer gpa.free(s.timer_heap);
     s.timer_heap_len = 0;
-    s.runq_words = try gpa.alloc(u64, (task_count + 63) / 64);
+    const words = (task_count + 63) / 64;
+    s.runq_words = try gpa.alloc(u64, 2 * words);
     errdefer gpa.free(s.runq_words);
-    s.runq = .init(s.runq_words);
+    s.runq = .init(s.runq_words[0..words]);
+    s.begun_words = s.runq_words[words..];
+    @memset(s.begun_words, 0);
+    s.tasks_begun = 0;
+    s.interleavable = false;
+    s.runs_several = 0;
+    s.runs_interleaved = 0;
     s.free_ids = try gpa.alloc(TaskId, task_count);
     errdefer gpa.free(s.free_ids);
 
@@ -676,6 +699,18 @@ pub fn beginRun(s: *Sim, seed: u64, persona: Persona) void {
     s.runq.insert(0);
     s.rebuildFreeList();
     s.pctBegin();
+    @memset(s.begun_words, 0);
+    s.begun_words[0] = 1;
+    s.tasks_begun = 0;
+    s.interleavable = false;
+}
+
+/// At the end of a run of a campaign: counts it in `runs_several` and
+/// `runs_interleaved`.
+pub fn countConcurrency(s: *Sim) void {
+    if (s.tasks_begun < 3) return;
+    s.runs_several += 1;
+    if (s.interleavable) s.runs_interleaved += 1;
 }
 
 /// The keys of a `.pct` run's own draws. The task that runs the body
@@ -1446,7 +1481,16 @@ fn switchToTask(s: *Sim, next: TaskId) void {
     const prev = s.current;
     if (prev == next) return;
     s.checkCanary(prev);
+    // A task stopped before its end (a finished task is `.finished`, or
+    // `.free` when a group or a daemon's).
+    const pt = &s.tasks[prev];
+    if (prev != 0 and prev != s.control and !pt.daemon and pt.state != .finished and pt.state != .free) s.interleavable = true;
     s.current = next;
+    const begun_bit = @as(u64, 1) << @as(u6, @intCast(next & 63));
+    if (s.begun_words[next >> 6] & begun_bit == 0) {
+        s.begun_words[next >> 6] |= begun_bit;
+        if (!s.tasks[next].daemon) s.tasks_begun += 1;
+    }
     s.vfs = &s.nodes[s.tasks[next].node].vfs;
     s.decider.ctx = &s.tasks[next].keys;
     s.record(.switch_to, prev, next, 0, "");
@@ -1866,6 +1910,7 @@ fn spawn(s: *Sim, start: Start, context: []const u8, group: ?*Io.Group, result_l
     @memcpy(t.context_buf[0..context.len], context);
     t.ctx = fiber.initContext(t.stack, Trampoline.entry);
     t.state = .runnable;
+    s.begun_words[id >> 6] &= ~(@as(u64, 1) << @as(u6, @intCast(id & 63)));
     s.runq.insert(id);
     s.record(.spawn, id, @intFromBool(group != null), 0, "");
     s.secSync(.spawn, s.current, id);
