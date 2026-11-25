@@ -291,3 +291,54 @@ test "a thousand tasks: every one runs to its end, and the same seed finishes th
     try tardis.check(testing.allocator, thousandTasks, other);
     try testing.expect(first != thousand_order_sum);
 }
+
+fn noteThreadId(io: Io, out: *std.Thread.Id) Io.Cancelable!void {
+    try io.sleep(.fromMicroseconds(1), .awake);
+    out.* = tardis.threadId();
+}
+
+test "tardis.threadId: each task its own number, the same in every run" {
+    try tardis.check(testing.allocator, struct {
+        fn run(env: *tardis.Env) !void {
+            var ids: [4]std.Thread.Id = undefined;
+            ids[0] = tardis.threadId();
+            var group: Io.Group = .init;
+            for (ids[1..]) |*id| try group.concurrent(env.io, noteThreadId, .{ env.io, id });
+            try group.await(env.io);
+            // The body's task is the second of the run (the first waits for
+            // it); the three it spawns come next, in the order spawned.
+            for (ids, 0..) |id, i| try testing.expectEqual(@as(std.Thread.Id, @intCast(0x2000_0001 + i)), id);
+        }
+    }.run, quiet);
+    // Outside a simulation it is the real thread's.
+    try testing.expectEqual(std.Thread.getCurrentId(), tardis.threadId());
+}
+
+fn yieldingWorker(io: Io, counter: *u32, yields: bool) Io.Cancelable!void {
+    _ = io;
+    const v = counter.*;
+    if (yields) tardis.yield();
+    counter.* = v + 1;
+}
+
+fn lostUpdate(comptime yields: bool) !void {
+    return tardis.check(testing.allocator, struct {
+        fn run(env: *tardis.Env) !void {
+            var counter: u32 = 0;
+            var group: Io.Group = .init;
+            try group.concurrent(env.io, yieldingWorker, .{ env.io, &counter, yields });
+            try group.concurrent(env.io, yieldingWorker, .{ env.io, &counter, yields });
+            try group.await(env.io);
+            try env.always("no lost update", counter == 2);
+        }
+    }.run, .{ .iterations = 30, .report = false });
+}
+
+test "tardis.yield: a race with no switch point between its accesses is found only with one" {
+    // Without a scheduling point each task runs its read and write at once,
+    // and the test passes while testing nothing (docs/threads.md).
+    try lostUpdate(false);
+    try testing.expectError(error.AssertionFailed, lostUpdate(true));
+    // Outside a simulation it does nothing.
+    tardis.yield();
+}

@@ -223,6 +223,9 @@ const Task = struct {
     keys: decide.KeyContext,
     /// Tasks spawned by this task so far (gives children stable paths).
     children: u32,
+    /// What `tardis.threadId` returns in this task: given at spawn, never
+    /// twice in a run (`thread_id_base` up).
+    thread_id: u32 = 0,
     ctx: fiber.Context,
     stack: []align(16) u8,
     block: Block,
@@ -366,6 +369,8 @@ timer_heap_len: usize,
 runq: sched.RunQueue,
 runq_words: []u64,
 current: TaskId,
+/// The thread number the next task spawned gets (`Task.thread_id`).
+next_thread_id: u32 = thread_id_base,
 root_bounds: fiber.Bounds,
 free_ids: []TaskId,
 free_len: u32,
@@ -613,6 +618,8 @@ pub fn beginRun(s: *Sim, seed: u64, persona: Persona) void {
     // Every draw of the run, from here on, is keyed (M3).
     s.tasks[0].keys = .root;
     s.tasks[0].children = 0;
+    s.tasks[0].thread_id = thread_id_base;
+    s.next_thread_id = thread_id_base + 1;
     s.decider.ctx = &s.tasks[0].keys;
     s.decider.overlay = s.overlay;
     s.decider.recorder = s.recorder;
@@ -1805,6 +1812,17 @@ fn dumpTasks(s: *Sim) void {
 // ===========================================================================
 // Task spawning and completion
 
+/// The first task's thread number (`tardis.threadId`); the next task
+/// spawned gets the one after, and so on through the run. Above any
+/// number Linux gives a thread (`pid_max` is at most 2^22), and below
+/// system-call mode's thread numbers (`systhread.tid_base`).
+pub const thread_id_base: u32 = 0x2000_0000;
+
+/// The running task's thread number (`tardis.threadId`).
+pub fn threadId(s: *const Sim) u32 {
+    return s.tasks[s.current].thread_id;
+}
+
 fn allocTask(s: *Sim) ?TaskId {
     if (s.free_len == 0) return null;
     s.free_len -= 1;
@@ -1838,6 +1856,8 @@ fn spawn(s: *Sim, start: Start, context: []const u8, group: ?*Io.Group, result_l
     t.keys = parent.keys.child(parent.children);
     t.children = 0;
     parent.children += 1;
+    t.thread_id = s.next_thread_id;
+    s.next_thread_id +%= 1;
     t.last_ran = s.pct_clock;
     if (s.config.schedule == .pct) s.pctSpawned(t);
     t.start = start;

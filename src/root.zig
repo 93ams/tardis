@@ -1062,6 +1062,38 @@ pub fn assertSometimes(io: std.Io, comptime name: []const u8, cond: bool) void {
     s.catalog.sometimes(name, cond);
 }
 
+/// A number for the running thread, as `std.Thread.getCurrentId()` gives
+/// one, but inside a simulation a number for the running task.
+///
+/// Every task of a run is a fiber on one real thread, so
+/// `std.Thread.getCurrentId()` gives them all the same number, and code
+/// that keys anything by it (a re-entrant lock's owner, a per-thread
+/// table) takes two tasks for one. Inside a simulation this gives each
+/// task its own number: a run's first task has `0x2000_0000` and each task
+/// spawned takes the next, so a number is never given twice in a run and
+/// a seed gives every task the same number each time it runs. The body of
+/// a `check` is the second task (the first waits for it), so it has
+/// `0x2000_0001`; in the loop form (`tardis.sim`) the body is the first.
+/// Outside a simulation (no simulator on this thread) it is
+/// `std.Thread.getCurrentId()`, and so it is in a thread the code under
+/// test starts in system-call mode, which has its own (`gettid`'s).
+/// `threadlocal` variables stay shared by every task (docs/threads.md).
+pub fn threadId() std.Thread.Id {
+    const s = Sim.activeOrNull() orelse return std.Thread.getCurrentId();
+    return @intCast(s.threadId());
+}
+
+/// A scheduling point: inside a simulation the simulator may switch to
+/// another task here, as at any `std.Io` operation that is one. Outside a
+/// simulation it does nothing, and so it does in a thread the code under
+/// test starts in system-call mode (that thread switches at its system
+/// calls). For code that shares memory between tasks with no `std.Io`
+/// call between the accesses (docs/threads.md, "Where tasks switch").
+pub fn yield() void {
+    const s = Sim.activeOrNull() orelse return;
+    s.yieldPoint();
+}
+
 /// Returns true if `io` is a TARDIS simulated io.
 pub fn isSimulated(io: std.Io) bool {
     return Sim.fromIo(io) != null;

@@ -38,7 +38,8 @@ Reference:
 - [docs/measurements.md](docs/measurements.md) has which oracle catches
   which planted bug and how often, and what a simulator costs in memory.
 - [docs/threads.md](docs/threads.md) says why real threads are outside the
-  simulation and what to use instead.
+  simulation, what to use instead, and how system-call mode runs the
+  threads a program starts as simulated tasks.
 - [docs/qualification.md](docs/qualification.md) lists what the tool is
   required to do, the tests behind each requirement, and its known
   limits, for anyone who has to justify relying on it.

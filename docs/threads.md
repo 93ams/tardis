@@ -51,19 +51,89 @@ Write the code against `std.Io`, as the rest of the simulation asks:
 
 Then every interleaving the simulator can produce is one a seed names.
 
+## Where tasks switch
+
+The simulator switches tasks only at a scheduling point. Every `std.Io`
+operation that can block or that the simulator models is one: a file or
+socket operation, a sleep, `async`, `concurrent`, `await`, a group's
+calls, `checkCancel`, a futex wait or wake. So is every operation of a
+`tardis.atomic.Value`, and `tardis.yield()` (except in a thread the code
+under test starts in system-call mode: there `tardis.yield()` does
+nothing, and the thread switches at its system calls).
+
+These are not:
+
+- **An uncontended `std.Io.Mutex`.** `lock` is a compare-and-swap in the
+  caller and reaches the `Io` only when the mutex is already held;
+  `unlock` reaches it only when the lock has been contended (some task
+  had to wait for it since it was last free). A lock taken and given
+  back with no other task in the way is two atomic instructions the
+  simulator never sees. (`std.Io.Condition.wait` always reaches it; `signal` and
+  `broadcast` only when a task waits.)
+- **`now`, `clockResolution`, `random` and `randomSecure`.** They are
+  answered on the spot.
+- **`std.atomic.Value`, plain memory, and anything else in the caller.**
+
+Code whose tasks share memory under locks, with no file or network call
+between, gives the simulator nowhere to switch: each task runs to its end
+before the next starts, and a test of it passes while testing nothing.
+The sign is a run of several tasks with few events in its trace. A
+`tardis.yield()` where a switch could matter (after taking a lock, before
+giving it back, between two accesses another task could come between)
+gives the simulator the choice; so does `tardis.atomic.Value` for the
+atomics.
+
+More switch points are not always better for finding a bug. A user of
+TARDIS whose bug needed one task to stay out while others did three
+transactions found it in 1 to 37 seeds with three yields under the
+random schedule, and needed about 1,500 when every lock and allocation
+was a yield: with more points, a long stretch with no switch to one task
+is less likely. The PCT schedule (`Options.schedule = .pct`), which
+holds a task back by priority rather than at each point, found it in 4
+to 26 either way. Run ordering tests under both.
+
+## What tasks share
+
+Every task of a run is a fiber on the one thread that runs the
+simulation, so whatever belongs to a thread belongs to all of them:
+
+- **The thread id.** `std.Thread.getCurrentId()` gives every task the
+  same number. Code that keys something by it (a re-entrant lock's
+  owner, a per-thread table) takes two tasks for one, under simulation
+  only. `tardis.threadId()` gives each task its own number (and is
+  `std.Thread.getCurrentId()` outside a simulation): use it where the
+  code asks, or behind a seam the test sets. A run's first task has
+  `0x2000_0000` and each task spawned the next, the same for a seed every
+  time; the body of a `check` is the second task, while in the loop form
+  (`tardis.sim`) it is the first, so the numbers differ by one between
+  the two.
+- **`threadlocal` variables.** One copy for every task, so state one task
+  keeps in them is seen and changed by the others. TARDIS has no answer
+  for this yet; keep such state in what the task is given.
+
+In system-call mode a thread the code starts (`std.Thread.spawn`,
+`pthread_create`) is a task with its own thread pointer, so it has its
+own `threadlocal` variables and its own thread id from `gettid`.
+
 Two things that look like exceptions and are not:
 
 - `Options.workers` runs a campaign on several real threads. Each has its
   own simulator, and no run is shared between them. The result does not
   depend on the count.
-- `Options.mode = .syscalls` lets code make its own system calls. It does
-  not add threads: every task still runs on one thread, and creating a
-  thread is not among the calls it answers.
+- `Options.mode = .syscalls` answers the threads the code starts, but
+  does not run them as real threads: each `clone` of a thread becomes a
+  simulated task on the one real thread, and the seed decides when it
+  runs (`src/sim/systhread.zig`). Tasks switch only at system calls, so
+  a thread spinning on memory with no system call in the loop hangs the
+  run, and a data race between two instructions is never explored. It
+  needs Linux x86_64 with the FSGSBASE instructions (Linux 5.9); without
+  them, starting a thread is a stray call.
 
 If some code cannot take an `Io` and must start threads (a C library with
-its own worker pool), TARDIS cannot test its concurrency. Test the parts
-around it, and keep the threaded part behind an interface the test can
-replace.
+its own worker pool), system-call mode on Linux x86_64 runs those threads
+as tasks, with the limits above. Elsewhere TARDIS cannot test its
+concurrency: test the parts around it, and keep the threaded part behind
+an interface the test can replace.
 
 ## What catches an escape
 
