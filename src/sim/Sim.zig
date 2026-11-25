@@ -1152,7 +1152,7 @@ pub fn warmCapture(s: *Sim) void {
         t.uses += 1;
         w.checks += 1;
         var same = s.now_ns == t.now_ns and s.trace.hash == t.trace_hash and s.trace.count == t.trace_count and
-            std.meta.eql(s.tasks[s.current].keys, t.keys) and s.hosts_len == t.hosts.len;
+            s.tasks[s.current].keys.eql(&t.keys) and s.hosts_len == t.hosts.len;
         for (s.nodes, t.files, t.clocks) |*n, *f, c| {
             same = same and n.vfs.matches(f) and n.drift_ppm == c.drift_ppm and n.real_offset_ns == c.real_offset_ns;
             if (same and t.saved) same = n.vfs.pagesMatch(f);

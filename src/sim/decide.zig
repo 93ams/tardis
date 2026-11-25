@@ -48,8 +48,23 @@ pub fn mix(a: u64, b: u64) u64 {
 pub const KeyContext = struct {
     path: u64,
     counters: [stream_count]u32,
+    /// `keyPrefix(stream, path)` for each stream, filled at the stream's
+    /// first draw (0: not yet). It depends only on `path`, so it is not
+    /// part of the context's identity (`eql`).
+    prefixes: [stream_count]u64 = @splat(0),
 
     pub const root: KeyContext = .{ .path = 0, .counters = @splat(0) };
+
+    /// Same task path and counters (the cached prefixes aside).
+    pub fn eql(a: *const KeyContext, b: *const KeyContext) bool {
+        return a.path == b.path and std.mem.eql(u32, &a.counters, &b.counters);
+    }
+
+    fn prefix(c: *KeyContext, stream: Stream) u64 {
+        const p = &c.prefixes[@backingInt(stream)];
+        if (p.* == 0) p.* = keyPrefix(stream, c.path);
+        return p.*;
+    }
 
     /// Context for the `index`-th task spawned by a task with this context.
     pub fn child(parent: *const KeyContext, index: u32) KeyContext {
@@ -256,7 +271,26 @@ pub const DrawHook = struct {
 };
 
 pub fn decisionKey(stream: Stream, path: u64, counter: u32) u64 {
-    return mix(mix(@as(u64, @backingInt(stream)) + 1, path), counter);
+    return mix(keyPrefix(stream, path), counter);
+}
+
+/// The part of a decision key that depends only on the stream and the task.
+fn keyPrefix(stream: Stream, path: u64) u64 {
+    return mix(@as(u64, @backingInt(stream)) + 1, path);
+}
+
+test "a key context's cached prefix gives the key decisionKey gives" {
+    var c = KeyContext.root.child(3);
+    for (0..stream_count) |i| {
+        const stream: Stream = @fromBackingInt(@intCast(i));
+        for (0..3) |counter| {
+            try std.testing.expectEqual(decisionKey(stream, c.path, @intCast(counter)), mix(c.prefix(stream), @intCast(counter)));
+        }
+    }
+    var fresh = KeyContext.root.child(3);
+    try std.testing.expect(fresh.eql(&c));
+    fresh.counters[1] = 1;
+    try std.testing.expect(!fresh.eql(&c));
 }
 
 pub const Decider = struct {
@@ -310,7 +344,7 @@ pub const Decider = struct {
             const counter = c.counters[@backingInt(stream)];
             c.counters[@backingInt(stream)] = counter +% 1;
             d.keyed_draws += 1;
-            const key = decisionKey(stream, c.path, counter);
+            const key = mix(c.prefix(stream), counter);
             d.last_key = key;
             if (d.anchors) |a| a.note(stream, c.path, counter, s.*);
             if (d.overlay) |o| {

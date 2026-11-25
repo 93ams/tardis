@@ -454,4 +454,17 @@ billion), as some of what it did is now counted to the functions it was
 inlined into. In time, the median user time of five runs went from 1.70
 to 1.51 seconds, an indication only, inside the noise of this machine.
 
-Measured at revision 116 and with the change.
+**Fixed: the other two the table lists as fixable** (revision 119),
+measured from revision 118.
+The network keeps a mark one past the highest slot a socket was opened
+in since the run began, and its scans of open sockets stop there; most
+runs open a few sockets, so `Net.nextEventAfter` falls from 552 to 104
+million instructions. And each task keeps the part of its decision key
+that depends only on the stream and the task (two of the key's four
+rounds), made at the stream's first draw; every key is unchanged, so
+are every replay token and trace hash, and the detection table is
+printed byte for byte the same. `Decider.nextRaw` falls from 649 to 518
+million. In all, 5.81 to 5.20 billion instructions, 10.5% fewer.
+
+Measured at revision 116 and with the first change; the second, from
+revision 118.

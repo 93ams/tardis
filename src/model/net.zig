@@ -164,6 +164,9 @@ pub const Net = struct {
     /// `reach[a] & (1 << b) != 0`: packets flow from node a to node b.
     reach: [nodes_limit]Reach,
     ephemeral_next: [nodes_limit]u16,
+    /// Every slot from here on is free: one past the highest slot a socket
+    /// was opened in since `reset`. Scans of open sockets stop here.
+    used: u16 = 0,
 
     pub fn init(gpa: Allocator, limits: Limits, node_count: u8) !Net {
         assert(node_count >= 1 and node_count <= nodes_limit);
@@ -211,6 +214,12 @@ pub const Net = struct {
         }
         net.reach = @splat(std.math.maxInt(Reach));
         net.ephemeral_next = @splat(ephemeral_port_first);
+        net.used = 0;
+    }
+
+    /// The slots that may hold a socket (`used`); the rest are free.
+    fn live(net: *const Net) []Socket {
+        return net.sockets[0..net.used];
     }
 
     /// True if the network is as `reset` leaves it: no socket was ever
@@ -309,6 +318,7 @@ pub const Net = struct {
             s.fault_reported = false;
             s.fault_at = 0;
             s.rto_at = 0;
+            net.used = @max(net.used, @as(u16, @intCast(i + 1)));
             return @intCast(i);
         }
         return null;
@@ -321,7 +331,7 @@ pub const Net = struct {
     /// Sockets owned by the application (excludes un-accepted connections).
     pub fn openCount(net: *const Net) u32 {
         var n: u32 = 0;
-        for (net.sockets) |*s| {
+        for (net.live()) |*s| {
             if (s.kind != .free and !s.in_backlog) n += 1;
         }
         return n;
@@ -329,7 +339,7 @@ pub const Net = struct {
 
     pub fn openCountOn(net: *const Net, node: NodeId) u32 {
         var n: u32 = 0;
-        for (net.sockets) |*s| {
+        for (net.live()) |*s| {
             if (s.kind != .free and !s.in_backlog and s.node == node) n += 1;
         }
         return n;
@@ -337,7 +347,7 @@ pub const Net = struct {
 
     /// TCP and UDP have separate port spaces.
     pub fn portInUse(net: *const Net, node: NodeId, port: u16, dgram: bool) bool {
-        for (net.sockets) |*s| {
+        for (net.live()) |*s| {
             if (s.kind == .free or s.node != node or s.local_port != port) continue;
             if ((s.kind == .dgram) == dgram) return true;
         }
@@ -397,7 +407,7 @@ pub const Net = struct {
     }
 
     pub fn findListener(net: *const Net, node: NodeId, port: u16) ?u16 {
-        for (net.sockets, 0..) |*s, i| {
+        for (net.live(), 0..) |*s, i| {
             if (s.kind == .listener and s.node == node and s.local_port == port) return @intCast(i);
         }
         return null;
@@ -693,7 +703,7 @@ pub const Net = struct {
     /// reset or black-holed. Returns the number of sockets freed.
     pub fn crashNode(net: *Net, node: NodeId, now_ns: u64, d: *decide.Decider, o: Options) u32 {
         var n: u32 = 0;
-        for (net.sockets, 0..) |*s, i| {
+        for (net.live(), 0..) |*s, i| {
             if (s.kind == .free or s.node != node) continue;
             const slot: u16 = @intCast(i);
             if (s.kind == .stream) {
@@ -709,7 +719,7 @@ pub const Net = struct {
             }
             n += 1;
         }
-        for (net.sockets) |*s| {
+        for (net.live()) |*s| {
             if (s.kind != .free and s.node == node) s.kind = .free;
         }
         return n;
@@ -722,7 +732,7 @@ pub const Net = struct {
         const was = net.reach[a] & bit != 0;
         if (was == up) return;
         if (up) net.reach[a] |= bit else net.reach[a] &= ~bit;
-        for (net.sockets, 0..) |*s, i| {
+        for (net.live(), 0..) |*s, i| {
             // `s` receives from a node-`a` socket. The sender may already be
             // closed: its last segments (often a FIN) must still be released.
             if (s.kind != .stream or s.node != b or s.peer_node != a) continue;
@@ -760,7 +770,7 @@ pub const Net = struct {
     /// Tasks blocked on the network wake then and re-check.
     pub fn nextEventAfter(net: *const Net, now_ns: u64) ?u64 {
         var best: ?u64 = null;
-        for (net.sockets) |*s| {
+        for (net.live()) |*s| {
             switch (s.kind) {
                 .free, .listener, .bound => continue,
                 .stream => {
@@ -802,7 +812,7 @@ pub const Net = struct {
     }
 
     pub fn findDgram(net: *const Net, node: NodeId, port: u16) ?u16 {
-        for (net.sockets, 0..) |*s, i| {
+        for (net.live(), 0..) |*s, i| {
             if (s.kind == .dgram and s.node == node and s.local_port == port) return @intCast(i);
         }
         return null;
