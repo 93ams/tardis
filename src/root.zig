@@ -248,7 +248,9 @@ pub const Options = struct {
     chaos: ?Chaos = null,
     /// Run `setup` once per persona and `fork()` a child per iteration
     /// (Linux; elsewhere the same iterations run in-process with identical
-    /// results). Applies to `explore = .random` with `workers = 1`.
+    /// results). Applies to `explore = .random` with `workers = 1`, and
+    /// not in system-call mode (`mode = .syscalls`), whose iterations run
+    /// in this process: a forked child is not trapped.
     fork: bool = false,
     /// With `setup`, in-process: keep a snapshot of what setup left and
     /// start later iterations from it instead of running setup again, when
