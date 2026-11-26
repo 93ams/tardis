@@ -358,6 +358,13 @@ pub fn rawUntrapped(number: u64, a: u64, b: u64, c: u64, d: u64, e: u64, f: u64)
     return raw6(number, a, b, c, d, e, f);
 }
 
+/// The thread is crashing (`crash.zig`): its system calls, the report's
+/// and the standard handler's after it, go to the kernel from here on.
+pub fn allowForCrash() void {
+    if (!supported) return;
+    @atomicStore(u8, &selector, allow, .seq_cst);
+}
+
 /// A call the emulator answers with an error and counts as a stray: the
 /// run fails with `StraySyscall`. For one that returning null would hand
 /// to the kernel (`emulatorFirst`).

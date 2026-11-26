@@ -30,6 +30,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const syscalls = @import("syscalls.zig");
 const vdso = @import("vdso.zig");
+const crash = @import("crash.zig");
 
 pub const supported = builtin.os.tag == .linux and builtin.cpu.arch == .x86_64;
 
@@ -107,6 +108,9 @@ pub fn install() bool {
             else => std.atomic.spinLoopHint(),
         }
     }
+    // The crash report's handler goes in before this one, so this one
+    // answers its own faults first and passes it only the others.
+    crash.install();
     // The handler before this one, first: if it runs on an alternate
     // signal stack (to report a stack overflow), so does this one, and a
     // fault that is not ours reaches it on that stack.

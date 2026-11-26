@@ -29,6 +29,7 @@ pub const trace = @import("sim/trace.zig");
 pub const shrink = @import("search/shrink.zig");
 pub const explore = @import("search/explore.zig");
 const persist = @import("search/persist.zig");
+const crash = @import("sim/crash.zig");
 pub const lin = @import("check/lin.zig");
 pub const elle = @import("check/elle.zig");
 pub const ledger = @import("check/ledger.zig");
@@ -1214,13 +1215,16 @@ fn primeRun(s: *Sim, comptime body: fn (*Env) anyerror!void, persona: Persona) v
     const was_rerun = s.rerun;
     s.rerun = true;
     defer s.rerun = was_rerun;
-    const out = runOnce(s, body, 0, persona, 0, false);
+    const out = runOnce(s, body, 0, persona, null, false);
     out.result catch {};
     // What it reached with `sometimes` is not the campaign's.
     s.catalog.resetCounts();
 }
 
-fn runOnce(s: *Sim, comptime body: fn (*Env) anyerror!void, seed: u64, persona: Persona, iteration: u32, leak_check: bool) RunOutcome {
+/// `iteration`: the campaign's, or null for a run that is not one (a shrink
+/// candidate, a replay, a run of the kept corpus, setup's priming).
+fn runOnce(s: *Sim, comptime body: fn (*Env) anyerror!void, seed: u64, persona: Persona, campaign_iteration: ?u32, leak_check: bool) RunOutcome {
+    const iteration = campaign_iteration orelse 0;
     if (s.config.prime) primeRun(s, body, persona);
     if (s.config.emulate_syscalls) startOneThread();
     s.beginRun(s.setup_seed orelse seed, persona);
@@ -1248,7 +1252,11 @@ fn runOnce(s: *Sim, comptime body: fn (*Env) anyerror!void, seed: u64, persona: 
         s.endRun();
         return .{ .result = error.SyscallModeUnsupported, .trace_hash = 0, .finding = 0 };
     }
+    // A forked child's crash is reported by its parent.
+    const marked = s.child_abort == null;
+    if (marked) crash.enter(.{ .iteration = campaign_iteration, .persona = @tagName(persona), .seed = seed, .overlay = s.overlay });
     const r = s.drive(BodyThunk(body).call, &env);
+    if (marked) crash.leave();
     const stray = if (trapping) syscalls.end() else null;
     const vdso_lifted = vdso_trapped and vdso.end();
     if (virtual_counter) _ = tsc.end();
@@ -1364,7 +1372,7 @@ fn runCandidate(s: *Sim, comptime body: fn (*Env) anyerror!void, seed: u64, pers
         s.overlay = null;
         s.recorder = null;
     }
-    const out = runOnce(s, body, seed, persona, 0, leak_check);
+    const out = runOnce(s, body, seed, persona, null, leak_check);
     if (out.result) |_| return false else |err| return err == target and out.finding == finding;
 }
 
@@ -1409,7 +1417,7 @@ fn shrinkAndReport(gpa: Allocator, s: *Sim, comptime body: fn (*Env) anyerror!vo
     const as_found: decide.Overlay = .{ .forced = forced };
     s.overlay = if (forced.len > 0) &as_found else null;
     s.recorder = &rec;
-    const natural = runOnce(s, body, seed, persona, 0, options.leak_check);
+    const natural = runOnce(s, body, seed, persona, null, options.leak_check);
     s.overlay = null;
     s.recorder = null;
     const ok = if (natural.result) |_| false else |err| err == target;
@@ -1553,7 +1561,7 @@ fn fuzzyReplay(gpa: Allocator, s: *Sim, comptime body: fn (*Env) anyerror!void, 
                     report.runs += 1;
                     const overlay: decide.Overlay = .{ .keep = keep, .forced = forced[0..forced_len] };
                     s.overlay = &overlay;
-                    const out = runOnce(s, body, tok.seed, persona, 0, options.leak_check);
+                    const out = runOnce(s, body, tok.seed, persona, null, options.leak_check);
                     s.overlay = null;
                     out.result catch |err| {
                         report.fuzzy = true;
@@ -1597,7 +1605,7 @@ fn runToken(gpa: Allocator, s: *Sim, comptime body: fn (*Env) anyerror!void, tex
     const overlay = tok.overlay();
     s.overlay = &overlay;
     s.anchors = if (delta != 0) &anchors else null;
-    const out = runOnce(s, body, tok.seed, persona, 0, options.leak_check);
+    const out = runOnce(s, body, tok.seed, persona, null, options.leak_check);
     s.overlay = null;
     s.anchors = null;
     out.result catch |err| {
@@ -1786,7 +1794,7 @@ fn runKept(gpa: Allocator, s: *Sim, comptime body: fn (*Env) anyerror!void, opti
         const forced = f.forcedSlice();
         const overlay: decide.Overlay = .{ .forced = forced };
         s.overlay = if (forced.len > 0) &overlay else null;
-        const out = runOnce(s, body, f.seed, f.persona, 0, options.leak_check);
+        const out = runOnce(s, body, f.seed, f.persona, null, options.leak_check);
         s.overlay = null;
         out.result catch |err| {
             if (options.keep_going) |log| {
@@ -1947,6 +1955,9 @@ fn startOneThread() void {
 }
 
 fn checkOn(gpa: Allocator, s: *Sim, comptime body: fn (*Env) anyerror!void, options: Options, caller: usize) anyerror!void {
+    // A run that crashes says which it was (`sim/crash.zig`).
+    crash.replay_command = replayCommand();
+    crash.install();
     // Notes on C state left behind are about this check's own runs.
     syscalls.dropped_in_call_seed = null;
     if (options.replay) |text| return runToken(gpa, s, body, text, options);
@@ -1962,7 +1973,7 @@ fn checkOn(gpa: Allocator, s: *Sim, comptime body: fn (*Env) anyerror!void, opti
     if (replay_seed) |seed| {
         for (options.personas) |persona| {
             if (env_replay.persona) |p| if (p != persona) continue;
-            const out = runOnce(s, body, seed, persona, 0, options.leak_check);
+            const out = runOnce(s, body, seed, persona, null, options.leak_check);
             out.result catch |err| {
                 reportFailure(s, err, 0, 1, seed, persona, &.{});
                 shrinkAndReport(gpa, s, body, seed, persona, &.{}, err, options);
@@ -2892,7 +2903,7 @@ pub fn traceHash(gpa: Allocator, comptime body: fn (*Env) anyerror!void, seed: u
     const s = try Sim.create(gpa, simConfig(options));
     defer s.destroy();
     applySetup(s, options);
-    const out = runOnce(s, body, seed, persona, 0, options.leak_check);
+    const out = runOnce(s, body, seed, persona, null, options.leak_check);
     try out.result;
     return out.trace_hash;
 }
@@ -2915,7 +2926,7 @@ pub fn traceJson(gpa: Allocator, comptime body: fn (*Env) anyerror!void, seed: u
     const run_persona = if (tok) |t| std.meta.stringToEnum(Persona, t.persona) orelse return error.BadReplayToken else persona;
     const overlay: decide.Overlay = if (tok) |t| t.overlay() else .{};
     if (tok != null) s.overlay = &overlay;
-    const out = runOnce(s, body, run_seed, run_persona, 0, options.leak_check);
+    const out = runOnce(s, body, run_seed, run_persona, null, options.leak_check);
     s.overlay = null;
     try s.trace.writeChromeTrace(w);
     try out.result;
@@ -3464,4 +3475,5 @@ test {
     _ = @import("tests/chaos_test.zig");
     _ = @import("tests/parallel_test.zig");
     _ = @import("tests/fork_test.zig");
+    _ = @import("tests/crash_test.zig");
 }

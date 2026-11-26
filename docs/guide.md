@@ -643,6 +643,11 @@ to a file by itself.
 
 From code, `Options.seed` and `Options.replay` do what the variables do.
 
+A panic or a fault in the code under test ends the process with no
+report; a `check` still prints the run it happened in and its replay line
+before the process ends ([reproducing.md](reproducing.md), "When the
+code under test crashes").
+
 ## 10. The history checkers
 
 Some properties are about a whole history of operations, not about one

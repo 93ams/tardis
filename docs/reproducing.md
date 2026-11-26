@@ -44,6 +44,65 @@ Cases where the report differs:
   `Options.shrink = false` there is only the first line.
 - A forked iteration whose child process crashed prints one line that
   ends in `replay with:  TARDIS_SEED=… TARDIS_PERSONA=…`.
+- A run that crashed the process prints two lines of its own (below).
+
+### When the code under test crashes
+
+A panic or a fault in the code under test ends the process before any
+report is printed. So while a run of a `check` is on, a handler for the
+ways a process ends is ready, and prints two lines for the run it ended
+in, whatever `Options.report` says:
+
+```
+thread 1234 panic: index out of bounds: index 9, len 8
+  …
+tardis: aborted (a panic, or abort) in iteration 23  persona=linux_ext4  seed=0x5c1d…
+tardis: replay with:  TARDIS_SEED=0x5c1d… TARDIS_PERSONA=linux_ext4 zig build test
+```
+
+The first word says how it ended: `aborted` for a panic or `abort()`
+(the line comes after the panic's message and stack), `crashed (a fatal
+signal)` for a segmentation fault, bus error, illegal instruction or
+arithmetic fault (the line comes before the stack the standard handler
+prints), and on Windows `crashed (exception 0x…)` or `ended the process`.
+A run that was given decisions (a shrink candidate, a run of guided
+exploration, a replay token) gets a `TARDIS_REPLAY=` line instead, since
+its seed alone runs another run. A run that is not one of the campaign's
+iterations (shrinking, a replay, the kept corpus, setup's priming run)
+says so in place of an iteration number. The process then ends as it
+would have.
+
+What it covers and what it does not:
+
+- Linux and macOS: `SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE` and `SIGABRT`,
+  which a Zig panic raises. The handlers are installed the first time a
+  `check` runs, chain to whatever handler was there before, and print
+  only while a run is on the thread that faulted; they stay installed.
+  A handler the program installs later replaces them. One it installed
+  before the first `check` and that answers a fault and returns (a
+  garbage collector's write barrier, say) is still called, but each such
+  fault inside a run is first reported as a crash, and only the first
+  report is printed. A stack overflow
+  is reported only where an alternate signal stack is set up (std does
+  that when `std.options.signal_stack_size` is set); otherwise the
+  process ends with no line.
+- Windows: a fault is seen by a vectored exception handler, which runs
+  before any other, so an access violation or the like that the program
+  catches itself is reported too. A panic ends the process without an
+  exception; a callback at process exit prints the line then (not in a
+  single-threaded build, which has no such callbacks). In practice a panic inside a run is also seen as an
+  access violation (`0xc0000005`): std's stack walk faults on a task's
+  stack, which is also why such a panic prints no stack trace, with or
+  without this handler.
+- Every thread that runs part of a campaign (`Options.workers`), and
+  system-call mode (tested for a fault in the body; a fault in a thread
+  the code started has not been tried). A panic in system-call mode
+  reaches the handler only when the abort's own signal does, which needs
+  the trap to let `tkill` of the calling thread through (revision 132).
+- Not the loop form (`tardis.sim`), not `std.process.exit` (except on
+  Windows, where an exit inside a run is reported as `ended the process`),
+  and not a run in a forked child (`Options.fork`): the parent prints
+  its own line for that.
 
 Every line ends in a command, `zig build test` unless told otherwise:
 the library does not know which command started it. A build script says

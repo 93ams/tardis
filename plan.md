@@ -764,6 +764,8 @@ Still not verified after revision 99: glibc; C++; a Rust program that is an exec
 
 **Revision 130: a check whose tasks never interleave says so.** A passing `check` warns when, in every run with the body and two or more other tasks, each of the others ran from its start to its end with none other running in between: the shape of a test that passes while testing nothing (revision 124). `Options.interleave_report` gives the counts.
 
+**Revision 131: a run that crashes says which it was.** A panic or fault inside a run of `check` prints the iteration, persona and seed and a replay line before the process ends (`src/sim/crash.zig`): signal handlers on Linux and macOS, a vectored exception handler and a TLS callback at exit on Windows. Not the loop form.
+
 
 **Revision 100: the last untried rows of the `fsync` rule on ext4.** Four more cases on the real filesystem: the one unsafe doubt (a write within a tick of the clock) could not be produced there, so the model takes the cautious side of it, and the two places where ext4 keeps more than the model (new blocks allotted at the sync) are left as they are and explained. A rename over a file with a full journal no longer hides the file's change from its own `fsync`.
 
