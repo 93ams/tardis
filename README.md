@@ -134,6 +134,7 @@ events, and prints two ways to run it again:
 |---|---|
 | `TARDIS_SEED=0x… TARDIS_PERSONA=…` | the failing run as it was |
 | `TARDIS_REPLAY=<token>` | the shrunk run: only the decisions that matter keep their value |
+| `TARDIS_ONLY=<text>` | nothing: a `check` (or `tardis.sim`) called from a test whose name does not contain the text is skipped, so a seed or a token reaches only the test it was made for ([`docs/reproducing.md`](docs/reproducing.md)) |
 | `TARDIS_CAMPAIGN_SALT=<number>` | nothing: it gives every `check` other seeds than its usual ones, for a long run on new ground |
 | `TARDIS_ITERATIONS_SCALE=<n>` | nothing: it multiplies every `check`'s iterations |
 | `TARDIS_CORPUS_DIR=<dir>` | nothing: each `check` keeps a file there, and the next campaign runs the runs that failed first and goes on exploring where the last stopped |

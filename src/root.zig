@@ -1737,6 +1737,124 @@ fn runToken(gpa: Allocator, s: *Sim, comptime body: fn (*Env) anyerror!void, tex
     if (delta != 0) try fuzzyReplay(gpa, s, body, &tok, persona, &anchors, options, delta, report);
 }
 
+/// `TARDIS_ONLY`: a check called from a test whose name does not contain
+/// this text is skipped (`error.SkipZigTest`), so a replay (`TARDIS_SEED`,
+/// `TARDIS_REPLAY`) reaches only the check it was made for. Test builds
+/// only. The test is found by walking the stack and naming its frames from
+/// the debug information; where that cannot be done the check runs, and a
+/// line says so once.
+fn skippedByOnly(gpa: Allocator) bool {
+    if (!builtin.is_test) return false;
+    const text = std.testing.environ.getAlloc(gpa, "TARDIS_ONLY") catch return false;
+    defer gpa.free(text);
+    return skippedFor(std.mem.trim(u8, text, " \t\r\n"));
+}
+
+/// Whether a check called here is skipped for `TARDIS_ONLY=want`.
+fn skippedFor(want: []const u8) bool {
+    if (want.len == 0) return false;
+    const name = callingTest() orelse {
+        if (!only_warned.swap(true, .monotonic)) std.debug.print("tardis: TARDIS_ONLY is set, and a check was called where no test's frame could be found on the stack (no debug information to name the frames, or a thread the test started): it runs, and so does any other such check\n", .{});
+        return false;
+    };
+    return std.mem.indexOf(u8, name, want) == null;
+}
+
+test "TARDIS_ONLY: the calling test is found by name, and only a check of a test whose name holds the text runs" {
+    const name = callingTest() orelse return error.SkipZigTest;
+    try std.testing.expect(std.mem.endsWith(u8, name, "test.TARDIS_ONLY: the calling test is found by name, and only a check of a test whose name holds the text runs"));
+    try std.testing.expect(!skippedFor("the calling test is found"));
+    try std.testing.expect(!skippedFor(""));
+    try std.testing.expect(skippedFor("a name no test has"));
+    // From a helper the test calls, too.
+    try std.testing.expect(!onlyHelper("TARDIS_ONLY: the calling"));
+}
+
+noinline fn onlyHelper(want: []const u8) bool {
+    return skippedFor(want);
+}
+
+// Two tests of one short name (`test.TARDIS_ONLY twin`), as two files may
+// have, and one whose short name ends another's (`test.only-probe` ends
+// `test.TARDIS_ONLY latest.only-probe`): each is told for itself.
+test "TARDIS_ONLY twin" {
+    const name = callingTest() orelse return error.SkipZigTest;
+    try std.testing.expectEqualStrings("root.test.TARDIS_ONLY twin", name);
+}
+
+const OnlyTwin = struct {
+    test "TARDIS_ONLY twin" {
+        const name = callingTest() orelse return error.SkipZigTest;
+        try std.testing.expectEqualStrings("root.OnlyTwin.test.TARDIS_ONLY twin", name);
+    }
+};
+
+comptime {
+    if (builtin.is_test) _ = OnlyTwin;
+}
+
+test "TARDIS_ONLY latest.only-probe" {
+    const name = callingTest() orelse return error.SkipZigTest;
+    try std.testing.expectEqualStrings("root.test.TARDIS_ONLY latest.only-probe", name);
+}
+
+test "only-probe" {
+    const name = callingTest() orelse return error.SkipZigTest;
+    try std.testing.expectEqualStrings("root.test.only-probe", name);
+}
+
+var only_warned: std.atomic.Value(bool) = .init(false);
+
+/// The full name (`builtin.test_functions`) of the test whose code is on
+/// the stack, the innermost one; null where none is found.
+///
+/// A frame is a test's when the test whose code begins nearest below the
+/// frame's address is the function the debug information names there. The
+/// name alone would not do: it is the test's short name (`test.<name>`),
+/// which tests of two files may share, and which may end another's
+/// (`test.latest.foo` and `test.foo`); the address alone would not either,
+/// since any function placed after a test's code is nearest to that test.
+fn callingTest() ?[]const u8 {
+    if (!builtin.is_test or std.debug.SelfInfo == void) return null;
+    if (!std.debug.sys_can_stack_trace or !std.options.allow_stack_tracing) return null;
+    var addresses: [64]usize = undefined;
+    const stack = std.debug.captureCurrentStackTrace(.{}, &addresses);
+    const info = std.debug.getSelfDebugInfo() catch return null;
+    // As `callerName` symbolizes.
+    const dio = std.Options.debug_io;
+    const prev = dio.swapCancelProtection(.blocked);
+    defer _ = dio.swapCancelProtection(prev);
+    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena.deinit();
+    const symbol_allocator = std.debug.getDebugInfoAllocator();
+    for (stack.return_addresses) |address| {
+        if (address == 0) continue;
+        const at = address - 1;
+        var nearest: ?[]const u8 = null;
+        var nearest_entry: usize = 0;
+        for (builtin.test_functions) |t| {
+            const entry = @intFromPtr(t.func);
+            if (entry <= at and entry >= nearest_entry) {
+                nearest = t.name;
+                nearest_entry = entry;
+            }
+        }
+        const full = nearest orelse continue;
+        var symbols: std.ArrayList(std.debug.Symbol) = .empty;
+        defer symbols.deinit(symbol_allocator);
+        info.getSymbols(dio, symbol_allocator, arena.allocator(), at, false, &symbols) catch continue;
+        for (symbols.items) |sym| {
+            const n = sym.name orelse continue;
+            if (n.len == 0) continue;
+            // `test.<name>` (or `decltest.<name>`) at the end of the full
+            // name, after its namespace.
+            if (std.mem.eql(u8, full, n)) return full;
+            if (std.mem.endsWith(u8, full, n) and full[full.len - n.len - 1] == '.') return full;
+        }
+    }
+    return null;
+}
+
 fn replayTokenFromEnv(gpa: Allocator) ?[]u8 {
     if (!builtin.is_test) return null;
     return std.testing.environ.getAlloc(gpa, "TARDIS_REPLAY") catch null;
@@ -1998,6 +2116,7 @@ const Guided = struct {
 /// Runs `body` across `options.iterations` seeds for each persona.
 pub fn check(gpa: Allocator, comptime body: fn (*Env) anyerror!void, options: Options) !void {
     const caller = @returnAddress();
+    if (skippedByOnly(gpa)) return error.SkipZigTest;
     var o = options;
     campaignFromEnv(gpa, &o);
     // Found here, on the thread that named them, for every worker.
@@ -3510,6 +3629,8 @@ pub const Simulation = struct {
 /// `Options.seed`/`TARDIS_SEED` or a replay token (`Options.replay`,
 /// `TARDIS_REPLAY`) when given.
 pub fn sim(gpa: Allocator, options: Options) !Simulation {
+    // `TARDIS_ONLY`, as `check`: it reads the replay variables too.
+    if (skippedByOnly(gpa)) return error.SkipZigTest;
     // The loop form has no run for the trap to cover.
     if (options.mode == .syscalls) return error.SyscallModeUnsupported;
     var config = simConfig(options);

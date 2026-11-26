@@ -141,7 +141,19 @@ Things to know:
   that failed. A token made for one body is then run against all the
   others. Narrow the run to the failing test with `-Dtest-filter=<text>`
   (this repository's `build.zig` has that option; in your own project use
-  whatever filter your build offers).
+  whatever filter your build offers), or set `TARDIS_ONLY=<text>`: a
+  `check` (or `tardis.sim`) called from a test whose name does not
+  contain the text returns `error.SkipZigTest`, and the test shows as
+  skipped. It needs no rebuild, since the filter is read when the test
+  runs. The test is found on the stack: a frame is a test's when the test
+  whose code begins nearest below it is the function the debug
+  information names there, so tests of one name in two files are told
+  apart. Where no test is found (no debug information, or a check called
+  on a thread the test started) the check runs, and a line says so
+  once. A test that expects an error from the check it calls fails when
+  its check is skipped, as it does with any replay variable. The name is
+  the full one the test runner prints, such as
+  `tests.store_test.test.puts survive a crash`.
 - **The variables are read in test builds only.** A program that is not a
   Zig test passes `Options.replay` or `Options.seed` instead. In a
   test build the order is: `Options.replay`, `TARDIS_REPLAY`,

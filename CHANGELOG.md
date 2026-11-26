@@ -5,6 +5,14 @@ numbers (§) are `plan2.md`'s unless an entry names `plan.md`. Revision 1
 was the first draft of `plan2.md`; the core's earlier history is in
 `plan.md` §9 and §14.
 
+## Revision 138 (core: TARDIS_ONLY, a replay for one test)
+
+The fifth request of the SQL engine's second list: `TARDIS_SEED` and `TARDIS_REPLAY` reach every `check` of a test binary, so a token made for one body was run against all the others. Now `TARDIS_ONLY=<text>` (test builds only) makes a `check`, or the loop form `tardis.sim`, called from a test whose full name (as the test runner prints it) does not contain the text return `error.SkipZigTest`: the test shows as skipped. Unlike the build's own test filter it needs no rebuild. The test is found on the stack (`callingTest` in `src/root.zig`): a frame is a test's when the test whose code begins nearest below the frame's address (`builtin.test_functions`) is the function the debug information names there. Where none is found (no debug information, or a check on a thread the test started) the check runs, and a line says so once. docs/reproducing.md and the README's table have it. Tests in `root.zig`: the calling test is found, from the test and from a helper it calls, and the text is matched against it; two tests of one name in two containers, and two whose short names end one another (`latest.only-probe` and `only-probe`), are each found as themselves. Tried by hand with the variable set, on Windows and Linux, in Debug and ReleaseFast.
+
+**Review.** A fresh reviewer found that the first version matched a frame by its name alone, which is the test's short name (`test.<name>`): it took two tests of one name in two files for the first of them, took `test.foo` for a test named `latest.foo` declared before it, and never matched a decltest; and that the loop form, which reads the replay variables too, was not filtered. Both were fixed (the address now picks the test, and the name confirms it; `tardis.sim` is filtered). Also changed: the line printed where no test is found no longer blames missing debug information alone, and the frames are named as the rest of tardis names them, with cancelation blocked. Not changed: a test that expects an error from a check it calls fails when the check is skipped, as it does under any replay variable.
+
+**Tested on** Windows (Debug, ReleaseSafe, ReleaseFast, ReleaseSmall and `-Dsec`, 84 of 84 steps each) and Linux x86_64 under WSL2 (40 test binaries, the library suite 349 passed and 3 skipped, plain and with the stray-call trap on).
+
 ## Revision 137 (core: a socket's timeouts expire)
 
 In system-call mode `setsockopt` was accepted and changed nothing, so a timeout set with `SO_RCVTIMEO` or `SO_SNDTIMEO` never expired. Rust's `set_read_timeout` and `set_write_timeout` set them, as do C clients and servers that will not wait forever: a read with nothing coming waited until the run ended, where on Linux it gives up.
