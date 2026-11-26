@@ -22,7 +22,7 @@
 //! `fstat`, `newfstatat`, `statx`, `access`, `faccessat`, `faccessat2`,
 //! `link`, `linkat`,
 //! `getdents64`, `getcwd`, `fcntl` (descriptor flags, record locks and
-//! open-file-description locks),
+//! open-file-description locks), `flock`,
 //! `ioctl` (only to say that a file is not a terminal),
 //! `chmod`, `fchmod`, `fchown`, `getuid` and its three relatives, `clock_gettime`,
 //! `clock_getres`, `gettimeofday`, `time`, `nanosleep`, `clock_nanosleep`,
@@ -49,6 +49,16 @@
 //! open-file-description lock, where on Linux the two kinds do; and a
 //! run has at most `ofd_max` locked ranges over all its nodes, and
 //! `waiters_max` tasks waiting for one (`ENOLCK` past them).
+//!
+//! `flock` (revision 139, which `std.Io.File.lock` makes) is modelled the
+//! same way: a lock of the whole file, shared or exclusive, held by the
+//! open file, gone with its last descriptor or its node's crash; `LOCK_NB`
+//! fails with `EWOULDBLOCK` where it would wait; a change between shared
+//! and exclusive gives up the lock first, as Linux's does; `LOCK_MAND` is
+//! ignored, as Linux ignores it. As on Linux, a `flock` lock and a
+//! byte-range lock are never in each other's way. The limits above hold
+//! for both together. `flock` of a socket, a pipe, the root or the random
+//! device is stray, where Linux's succeeds.
 //!
 //! `O_TRUNC`
 //! without `O_CREAT` is an open and then a truncation, two steps another
@@ -438,12 +448,14 @@ pub fn emulate(number: u64, a: *const [6]u64) ?u64 {
         89 => readlink(s, at_fdcwd, a[0], a[1], a[2]),
         267 => readlink(s, fd, a[1], a[2], a[3]),
         // Calls on a descriptor: only on one of ours.
-        0, 1, 3, 5, 8, 16, 17, 18, 19, 20, 32, 72, 74, 75, 77, 91, 93, 217, 295, 296 => {
+        0, 1, 3, 5, 8, 16, 17, 18, 19, 20, 32, 72, 73, 74, 75, 77, 91, 93, 217, 295, 296 => {
             if (!simulated(fd)) return null;
             if (number == 16) return ioctl(s, fd, @truncate(a[1]));
-            // A duplicate of the random device is not emulated.
-            const dups_it = number == 32 or (number == 72 and (@as(u32, @truncate(a[1])) == 0 or @as(u32, @truncate(a[1])) == 1030));
+            // A duplicate of the random device, or a lock of it, is not
+            // emulated; nor is a lock of the root.
+            const dups_it = number == 32 or number == 73 or (number == 72 and (@as(u32, @truncate(a[1])) == 0 or @as(u32, @truncate(a[1])) == 1030));
             if (fd == random_fd) return if (dups_it) null else randomDevice(s, number, a);
+            if (number == 73 and fd == root_fd) return null;
             return switch (number) {
                 0 => read(s, fd, a[1], a[2], null),
                 1 => write(s, fd, a[1], a[2], null),
@@ -456,6 +468,7 @@ pub fn emulate(number: u64, a: *const [6]u64) ?u64 {
                 19 => vectors(s, fd, a[1], a[2], null, .read),
                 20 => vectors(s, fd, a[1], a[2], null, .write),
                 72 => fcntl(s, fd, @truncate(a[1]), a[2]),
+                73 => flock(s, fd, a[1]),
                 74 => fsync(s, fd, false),
                 75 => fsync(s, fd, true),
                 77 => ftruncate(s, fd, a[1]),
@@ -1200,6 +1213,9 @@ const Range = struct {
     /// Exclusive; `to_end` for a lock with no end.
     end: u64 = 0,
     write: bool = false,
+    /// A `flock` lock, of the whole file: Linux keeps those apart from
+    /// the byte-range locks, and neither kind is in the other's way.
+    flock: bool = false,
 
     /// Its open file is still open (closing the last descriptor, or a
     /// crash, frees it: `dropLocks`, `dropNode`).
@@ -1234,10 +1250,11 @@ fn dropLocks(node: u16, value: u32) bool {
 }
 
 /// The first range another open file holds on `inode` that a lock of this
-/// kind over `start`..`end` would conflict with.
-fn conflict(node: u16, value: u32, inode: vfs_mod.InodeId, start: u64, end: u64, exclusive: bool) ?*const Range {
+/// kind over `start`..`end` would conflict with: a `flock` lock only
+/// with another, a byte-range lock only with another.
+fn conflict(node: u16, value: u32, inode: vfs_mod.InodeId, start: u64, end: u64, exclusive: bool, whole_file: bool) ?*const Range {
     for (&ranges) |*r| {
-        if (!r.live() or r.node != node or r.inode != inode or r.value == value) continue;
+        if (!r.live() or r.node != node or r.inode != inode or r.value == value or r.flock != whole_file) continue;
         if (!(exclusive or r.write)) continue;
         if (r.overlaps(start, end)) return r;
     }
@@ -1280,7 +1297,7 @@ fn ofdLock(s: *Sim, fd: i32, cmd: u32, arg: u64) u64 {
         end = @intCast(first);
     }
     if (cmd == 36) { // F_OFD_GETLK: what would be in the way, if anything
-        const r = conflict(node, value, inode, lo, end, fl.type == f_wrlck) orelse {
+        const r = conflict(node, value, inode, lo, end, fl.type == f_wrlck, false) orelse {
             fl.type = f_unlck;
             return 0;
         };
@@ -1294,14 +1311,14 @@ fn ofdLock(s: *Sim, fd: i32, cmd: u32, arg: u64) u64 {
     const exclusive = fl.type == f_wrlck;
     if (fl.type == f_rdlck and !h.readable) return fail(.BADF);
     if (exclusive and !h.writable) return fail(.BADF);
-    if (fl.type != f_unlck and conflict(node, value, inode, lo, end, exclusive) != null) {
+    if (fl.type != f_unlck and conflict(node, value, inode, lo, end, exclusive, false) != null) {
         if (cmd == 37) return fail(.AGAIN);
         const w = for (&waiters) |*w| {
             if (!w.used) break w;
         } else return fail(.NOLCK);
         w.* = .{ .used = true, .node = node, .value = value };
         defer w.* = .{};
-        while (conflict(node, value, inode, lo, end, exclusive) != null) {
+        while (conflict(node, value, inode, lo, end, exclusive, false) != null) {
             s.waitNetwork(null) catch return fail(.INTR);
             // Its file was closed by another task meanwhile: Linux's call
             // holds the file it began with, takes the lock on it, and the
@@ -1327,7 +1344,7 @@ fn setRange(node: u16, value: u32, inode: vfs_mod.InodeId, start: u64, end: u64,
             free += 1;
             continue;
         }
-        if (r.node != node or r.value != value or r.inode != inode) continue;
+        if (r.node != node or r.value != value or r.inode != inode or r.flock) continue;
         // One that goes past both ends is left in two pieces; one inside
         // the range is freed.
         if (r.start < start and r.end > end) need += 1;
@@ -1336,7 +1353,7 @@ fn setRange(node: u16, value: u32, inode: vfs_mod.InodeId, start: u64, end: u64,
     if (need > free) return .NOLCK;
     var tail: ?Range = null;
     for (&ranges) |*r| {
-        if (!r.live() or r.node != node or r.value != value or r.inode != inode or !r.overlaps(start, end)) continue;
+        if (!r.live() or r.node != node or r.value != value or r.inode != inode or r.flock or !r.overlaps(start, end)) continue;
         if (r.start < start and r.end > end) {
             tail = r.*;
             tail.?.start = end;
@@ -1356,7 +1373,7 @@ fn setRange(node: u16, value: u32, inode: vfs_mod.InodeId, start: u64, end: u64,
     var lo = start;
     var hi = end;
     for (&ranges) |*r| {
-        if (!r.live() or r.node != node or r.value != value or r.inode != inode or r.write != (kind == f_wrlck)) continue;
+        if (!r.live() or r.node != node or r.value != value or r.inode != inode or r.flock or r.write != (kind == f_wrlck)) continue;
         if (r.end == start) {
             lo = r.start;
             r.* = .{};
@@ -1367,6 +1384,72 @@ fn setRange(node: u16, value: u32, inode: vfs_mod.InodeId, start: u64, end: u64,
     }
     put(.{ .used = true, .node = node, .value = value, .inode = inode, .start = lo, .end = hi, .write = kind == f_wrlck });
     return null;
+}
+
+const lock_sh = 1;
+const lock_ex = 2;
+const lock_nb = 4;
+const lock_un = 8;
+const lock_mand = 32;
+
+/// `flock`: a lock of the whole file, shared or exclusive, held by the
+/// open file, as Linux's. A change between shared and exclusive gives up
+/// the lock held first, then takes the other, as Linux's does (so a
+/// change that would wait, asked not to, leaves nothing held).
+fn flock(s: *Sim, fd: i32, operation: u64) u64 {
+    const op: u32 = @truncate(operation);
+    // Linux ignores `LOCK_MAND` (it once meant mandatory locking), before
+    // it looks at the descriptor.
+    if (op & lock_mand != 0) return 0;
+    const kind = op & ~@as(u32, lock_nb);
+    if (kind != lock_sh and kind != lock_ex and kind != lock_un) return fail(.INVAL);
+    const h = handleOf(s, fd) orelse return fail(.BADF);
+    const node = s.currentNode();
+    const value = valueOf(fd);
+    const inode = h.inode;
+    const exclusive = kind == lock_ex;
+    // Set when the call has waited: the waiter it is.
+    var waiter: ?*Waiter = null;
+    defer if (waiter) |w| {
+        w.* = .{};
+    };
+    // As Linux's, whose every try looks again at what the open file
+    // holds: another task may have locked through it while this one
+    // waited.
+    while (true) {
+        // What this open file holds now: one lock at most.
+        for (&ranges) |*r| {
+            if (!r.live() or !r.flock or r.node != node or r.value != value) continue;
+            if (kind != lock_un and r.write == exclusive) return 0;
+            r.* = .{};
+            s.wakeNetwork();
+            break;
+        }
+        if (kind == lock_un) return 0;
+        if (conflict(node, value, inode, 0, to_end, exclusive, true) == null) break;
+        if (op & lock_nb != 0) return fail(.AGAIN);
+        const w = waiter orelse for (&waiters) |*w| {
+            if (w.used) continue;
+            w.* = .{ .used = true, .node = node, .value = value };
+            waiter = w;
+            break w;
+        } else return fail(.NOLCK);
+        // Closed by another task meanwhile: Linux's call holds the file
+        // it began with, waits on, takes the lock once it is free, and
+        // the lock goes with the file as the call ends. Nothing is held.
+        if (w.closed) {
+            while (conflict(node, value, inode, 0, to_end, exclusive, true) != null) {
+                s.waitNetwork(null) catch return fail(.INTR);
+            }
+            return 0;
+        }
+        s.waitNetwork(null) catch return fail(.INTR);
+    }
+    for (&ranges) |*r| if (!r.live()) {
+        r.* = .{ .used = true, .node = node, .value = value, .inode = inode, .start = 0, .end = to_end, .write = exclusive, .flock = true };
+        return 0;
+    };
+    return fail(.NOLCK);
 }
 
 fn put(r: Range) void {

@@ -4089,3 +4089,182 @@ test "system-call mode: SO_RCVTIMEO and SO_SNDTIMEO expire in virtual time" {
     if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
     try tardis.check(gpa, socketTimeouts, .{ .iterations = 30, .mode = .syscalls });
 }
+
+// --- flock ------------------------------------------------------------------------
+
+const lock_sh = 1;
+const lock_ex = 2;
+const lock_nb = 4;
+const lock_un = 8;
+
+fn flock(fd: usize, op: usize) isize {
+    return sys(.flock, fd, op, 0, 0);
+}
+
+fn unlocksLater(fd: usize) void {
+    sleepsMs(10);
+    _ = flock(fd, lock_un);
+}
+
+fn flocks(env: *Env) !void {
+    const a = try open("lockfile", o_creat | o_rdwr);
+    const b = try open("lockfile", o_rdonly);
+    defer close(b);
+
+    // Two opens of one file are two holders; a duplicate is the same one.
+    _ = try ok(flock(a, lock_ex));
+    try testing.expectEqual(errOf(.AGAIN), flock(b, lock_ex | lock_nb));
+    try testing.expectEqual(errOf(.AGAIN), flock(b, lock_sh | lock_nb));
+    const a2 = try ok(sys(.dup, a, 0, 0, 0));
+    try testing.expectEqual(@as(isize, 0), flock(a2, lock_ex | lock_nb));
+    // A `flock` lock and a byte-range lock are not in each other's way,
+    // and one open file can hold both. `struct flock`: its type first,
+    // the rest 0, the whole file.
+    var range: [32]u8 = @splat(0);
+    // `b` reads-locks the file while `a` holds an exclusive `flock`.
+    _ = try ok(sys(.fcntl, b, 37, @intFromPtr(&range), 0)); // F_OFD_SETLK
+    // `F_OFD_GETLK` of a write lock through `a` sees `b`'s range, not its
+    // own `flock`; with `b`'s range gone it sees nothing.
+    std.mem.writeInt(i16, range[0..2], 1, .little); // F_WRLCK
+    _ = try ok(sys(.fcntl, a, 36, @intFromPtr(&range), 0)); // F_OFD_GETLK
+    try testing.expectEqual(@as(i16, 0), std.mem.readInt(i16, range[0..2], .little)); // F_RDLCK, b's
+    range = @splat(0);
+    std.mem.writeInt(i16, range[0..2], 2, .little); // F_UNLCK
+    _ = try ok(sys(.fcntl, b, 37, @intFromPtr(&range), 0));
+    std.mem.writeInt(i16, range[0..2], 1, .little);
+    _ = try ok(sys(.fcntl, a, 36, @intFromPtr(&range), 0));
+    try testing.expectEqual(@as(i16, 2), std.mem.readInt(i16, range[0..2], .little)); // F_UNLCK: none
+    // `a` write-locks bytes and lets them go: its `flock` stays.
+    range = @splat(0);
+    std.mem.writeInt(i16, range[0..2], 1, .little);
+    std.mem.writeInt(i64, range[16..24], 10, .little); // l_len
+    _ = try ok(sys(.fcntl, a, 37, @intFromPtr(&range), 0));
+    std.mem.writeInt(i16, range[0..2], 2, .little);
+    _ = try ok(sys(.fcntl, a, 37, @intFromPtr(&range), 0));
+    try testing.expectEqual(errOf(.AGAIN), flock(b, lock_sh | lock_nb));
+    // And a byte-range lock another open file holds does not stop a
+    // `flock`: `b` holds one while `a` lets go and takes its lock again.
+    range = @splat(0);
+    _ = try ok(sys(.fcntl, b, 37, @intFromPtr(&range), 0)); // F_RDLCK (b is read-only)
+    _ = try ok(flock(a, lock_un));
+    _ = try ok(flock(a, lock_ex | lock_nb));
+    std.mem.writeInt(i16, range[0..2], 2, .little);
+    _ = try ok(sys(.fcntl, b, 37, @intFromPtr(&range), 0));
+    // A wait, in virtual time, until the holder lets go.
+    var releaser = try env.io.concurrent(unlocksLater, .{a});
+    const before = try monotonicNs();
+    _ = try ok(flock(b, lock_sh));
+    try testing.expectEqual(10 * std.time.ns_per_ms, try monotonicNs() - before);
+    releaser.await(env.io);
+    // Shared with shared.
+    _ = try ok(flock(a, lock_sh | lock_nb));
+    // A change that cannot be made at once, asked not to wait: the lock
+    // held before is given up all the same, as on Linux.
+    try testing.expectEqual(errOf(.AGAIN), flock(a, lock_ex | lock_nb));
+    _ = try ok(flock(b, lock_ex | lock_nb));
+    // The last descriptor of the open file takes its lock with it.
+    _ = flock(b, lock_un);
+    _ = try ok(flock(a, lock_sh));
+    _ = try ok(flock(a2, lock_ex | lock_nb));
+    close(a);
+    try testing.expectEqual(errOf(.AGAIN), flock(b, lock_sh | lock_nb));
+    close(a2);
+    _ = try ok(flock(b, lock_sh | lock_nb));
+    // Linux's errors.
+    try testing.expectEqual(errOf(.INVAL), flock(b, 0));
+    try testing.expectEqual(errOf(.INVAL), flock(b, lock_sh | lock_ex));
+    try testing.expectEqual(errOf(.INVAL), flock(b, lock_nb));
+    try testing.expectEqual(errOf(.BADF), flock(a, lock_sh));
+    // std's own: `File.lock`, `tryLock` and the `lock` option of an open.
+    const io = std.Options.debug_io;
+    const first = try std.Io.Dir.cwd().openFile(io, "lockfile", .{ .mode = .read_write });
+    defer first.close(io);
+    _ = flock(b, lock_un);
+    try first.lock(io, .exclusive);
+    const second = try std.Io.Dir.cwd().openFile(io, "lockfile", .{});
+    defer second.close(io);
+    try testing.expect(!try second.tryLock(io, .shared));
+    first.unlock(io);
+    try testing.expect(try second.tryLock(io, .shared));
+    try testing.expectError(error.WouldBlock, std.Io.Dir.cwd().openFile(io, "lockfile", .{ .lock = .exclusive, .lock_nonblocking = true }));
+}
+
+fn sharesAWait(fd: usize) void {
+    _ = flock(fd, lock_sh);
+}
+
+var flock_result: isize = 0;
+
+fn waitsExclusive(fd: usize) void {
+    flock_result = flock(fd, lock_ex);
+}
+
+/// Two tasks waiting through one open file, and a file closed under a
+/// task waiting through it.
+fn flocksSharedWaits(env: *Env) !void {
+    const holder = try open("shared", o_creat | o_rdwr);
+    defer close(holder);
+    const f = try open("shared", o_rdwr);
+    defer close(f);
+    const other = try open("shared", o_rdwr);
+    defer close(other);
+    _ = try ok(flock(holder, lock_ex));
+    var one = try env.io.concurrent(sharesAWait, .{f});
+    var two = try env.io.concurrent(sharesAWait, .{f});
+    sleepsMs(5);
+    _ = try ok(flock(holder, lock_un));
+    one.await(env.io);
+    two.await(env.io);
+    // `f` holds one shared lock, which one unlock gives up.
+    try testing.expectEqual(errOf(.AGAIN), flock(other, lock_ex | lock_nb));
+    _ = try ok(flock(f, lock_un));
+    _ = try ok(flock(other, lock_ex | lock_nb));
+    _ = try ok(flock(other, lock_un));
+
+    // Closed while its task waits: the call goes on waiting until the
+    // lock is free, then returns, and nothing is held.
+    _ = try ok(flock(holder, lock_ex));
+    const g = try open("shared", o_rdwr);
+    flock_result = -1;
+    var waiter = try env.io.concurrent(waitsExclusive, .{g});
+    sleepsMs(5);
+    close(g);
+    sleepsMs(5);
+    try testing.expectEqual(@as(isize, -1), flock_result);
+    _ = try ok(flock(holder, lock_un));
+    waiter.await(env.io);
+    try testing.expectEqual(@as(isize, 0), flock_result);
+    _ = try ok(flock(other, lock_ex | lock_nb));
+}
+
+test "system-call mode: flock locks the whole file for its open file, shared or exclusive, and waits in virtual time" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, flocks, .{ .iterations = 20, .mode = .syscalls });
+    try tardis.check(gpa, flocksSharedWaits, .{ .iterations = 20, .mode = .syscalls });
+}
+
+/// Two tasks each holding one file and waiting for the other's: every
+/// task waits, which the simulator reports, where Linux would wait
+/// forever.
+fn flockDeadlock(env: *Env) !void {
+    const x = try open("x", o_creat | o_rdwr);
+    const y = try open("y", o_creat | o_rdwr);
+    _ = try ok(flock(x, lock_ex));
+    var other = try env.io.concurrent(holdsYThenX, .{});
+    sleepsMs(1);
+    _ = flock(y, lock_ex);
+    other.await(env.io);
+}
+
+fn holdsYThenX() void {
+    const y = open("y", o_rdwr) catch return;
+    const x = open("x", o_rdwr) catch return;
+    _ = flock(y, lock_ex);
+    sleepsMs(5);
+    _ = flock(x, lock_ex);
+}
+
+test "system-call mode: two tasks each waiting for the other's flock is a deadlock" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try testing.expectError(error.Deadlock, tardis.check(gpa, flockDeadlock, .{ .iterations = 1, .mode = .syscalls, .report = false }));
+}
