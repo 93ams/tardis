@@ -129,8 +129,37 @@ simulation, so whatever belongs to a thread belongs to all of them:
   (`tardis.sim`) it is the first, so the numbers differ by one between
   the two.
 - **`threadlocal` variables.** One copy for every task, so state one task
-  keeps in them is seen and changed by the others. TARDIS has no answer
-  for this yet; keep such state in what the task is given.
+  keeps in them is seen and changed by the others. Name the ones that
+  matter in `Options.task_locals`, and each task has its own copy:
+
+  ```zig
+  threadlocal var statement: Statement = .{};
+
+  try tardis.check(gpa, body, .{
+      .task_locals = &.{std.mem.asBytes(&statement)},
+  });
+  ```
+
+  Each task starts with the values the variables had on the thread that
+  called `check` when it began, on whichever worker thread the run is
+  made, and that thread has its own back when the run ends. A function
+  `io.async` runs at once, in its caller (`Options.async_inline_ppm`),
+  has its caller's copy, as it would on a real thread. What `setup`
+  writes to them the body sees, so a check that names any keeps no warm
+  snapshot (`warm_restore`). The
+  simulator saves the running task's bytes and puts the next one's in
+  their place at every switch, so the cost is the variables' size per
+  switch; nothing else of the thread's thread-local storage is touched.
+  A variable is named by its bytes on the thread that calls `check`, and
+  must be a `threadlocal` of the program (one that is not panics): at most
+  64. Linux and Windows (`tardis.task_locals_supported`); elsewhere
+  `check` returns `error.TaskLocalsUnsupported`. Not covered: the
+  `threadlocal`s of a C library (`errno` in a shared libc, for one), which
+  live in that library's own block; and in the loop form (`tardis.sim`)
+  the body, which is the thread's own task, keeps the thread's copy, so
+  what it writes carries into later iterations. `exhaustive`,
+  `traceHash`, `traceJson` and the loop form take it too, and panic
+  where `check` would return the error.
 
 In system-call mode a thread the code starts (`std.Thread.spawn`,
 `pthread_create`) is a task with its own thread pointer, so it has its

@@ -31,6 +31,11 @@ pub const explore = @import("search/explore.zig");
 const persist = @import("search/persist.zig");
 const crash = @import("sim/crash.zig");
 const alloc_mod = @import("sim/alloc.zig");
+const tasktls = @import("sim/tasktls.zig");
+
+/// Whether `Options.task_locals` can be used on this target (Linux and
+/// Windows; any target in a single-threaded build).
+pub const task_locals_supported = tasktls.supported;
 pub const lin = @import("check/lin.zig");
 pub const elle = @import("check/elle.zig");
 pub const ledger = @import("check/ledger.zig");
@@ -327,6 +332,20 @@ pub const Options = struct {
     /// value. With a security layer the layer fills freed blocks itself and
     /// this is not done. docs/guide.md §2.
     poison_freed: bool = true,
+    /// `threadlocal` variables each task has its own copy of, given as
+    /// their bytes (`std.mem.asBytes(&x)`) on the thread that calls
+    /// `check`. Without this every task of a run shares the thread's one
+    /// copy, as they share the one thread. Each task starts with the
+    /// values the variables had on the calling thread when `check` began,
+    /// and the thread a run is made on gets its own back when it ends.
+    /// Naming any turns `warm_restore` off. At most 64; a variable that is not
+    /// a `threadlocal` of the program panics. On a target that cannot
+    /// tell one (`task_locals_supported`: Linux and Windows are supported)
+    /// `check` returns `error.TaskLocalsUnsupported`. docs/threads.md.
+    task_locals: []const []u8 = &.{},
+    /// Set by `check` from `task_locals` for the simulators of its worker
+    /// threads; not for callers.
+    task_locals_resolved: ?tasktls.Resolved = null,
     /// An optional security layer such as `tardis_sec` (plan2.md §2.2).
     /// A violation it reports fails the run with `error.SecurityViolation`.
     security: ?sec_seam.Security = null,
@@ -572,6 +591,14 @@ fn trapSyscallsFromEnv() bool {
     return on;
 }
 
+threadlocal var task_locals_buf: [tasktls.ranges_max]tasktls.Range = undefined;
+
+/// `task_locals`' places, found on this thread (the one that named them);
+/// `Sim.create` keeps a copy.
+fn taskLocalsHere(vars: []const []u8) []const tasktls.Range {
+    return tasktls.ranges(vars, &task_locals_buf) catch @panic("tardis: Options.task_locals cannot be used on this target (task_locals_supported)");
+}
+
 fn simConfig(o: Options) Sim.Config {
     return .{
         .preempt_ppm = o.preempt_ppm,
@@ -586,6 +613,8 @@ fn simConfig(o: Options) Sim.Config {
         .prime = o.prime,
         .virtual_tsc = o.virtual_tsc,
         .poison_freed = o.poison_freed,
+        .task_locals = if (o.task_locals_resolved) |r| r.ranges else if (o.task_locals.len == 0) &.{} else taskLocalsHere(o.task_locals),
+        .task_locals_home = if (o.task_locals_resolved) |r| r.home else null,
         .faults = o.faults,
         .limits = o.limits,
         .epoch_offset_ns = o.epoch_offset_ns,
@@ -620,6 +649,9 @@ pub const Error = error{
     FibersUnsupported,
     StraySyscall,
     SyscallModeUnsupported,
+    /// `Options.task_locals` on a target that cannot tell a thread-local
+    /// variable (`task_locals_supported`).
+    TaskLocalsUnsupported,
     /// A block freed through `env.allocator` was changed after its free
     /// (`Options.poison_freed`).
     WriteAfterFree,
@@ -1152,7 +1184,8 @@ pub fn assertSometimes(io: std.Io, comptime name: []const u8, cond: bool) void {
 /// Outside a simulation (no simulator on this thread) it is
 /// `std.Thread.getCurrentId()`, and so it is in a thread the code under
 /// test starts in system-call mode, which has its own (`gettid`'s).
-/// `threadlocal` variables stay shared by every task (docs/threads.md).
+/// `threadlocal` variables stay shared by every task unless
+/// `Options.task_locals` names them (docs/threads.md).
 pub fn threadId() std.Thread.Id {
     const s = Sim.activeOrNull() orelse return std.Thread.getCurrentId();
     return @intCast(s.threadId());
@@ -1248,7 +1281,9 @@ fn applySetup(s: *Sim, options: Options) void {
     const f = options.setup orelse return;
     s.setup_fn = f;
     s.setup_seed = decide.mix(options.campaign_seed, 0x5E70_5E70_5E70_5E70);
-    s.warm.enabled = options.warm_restore;
+    // A snapshot does not hold the body's copies of `task_locals`, which
+    // setup may have set.
+    s.warm.enabled = options.warm_restore and options.task_locals.len == 0;
 }
 
 fn runSetup(env: *Env) !void {
@@ -1965,6 +2000,13 @@ pub fn check(gpa: Allocator, comptime body: fn (*Env) anyerror!void, options: Op
     const caller = @returnAddress();
     var o = options;
     campaignFromEnv(gpa, &o);
+    // Found here, on the thread that named them, for every worker.
+    var task_local_ranges: [tasktls.ranges_max]tasktls.Range = undefined;
+    const tl_ranges = try tasktls.ranges(o.task_locals, &task_local_ranges);
+    const tl_home = try gpa.alloc(u8, tasktls.length(tl_ranges));
+    defer gpa.free(tl_home);
+    tasktls.snapshot(tl_ranges, tl_home);
+    o.task_locals_resolved = .{ .ranges = tl_ranges, .home = tl_home };
     if (o.mode == .syscalls) {
         if (!syscalls.available()) return error.SyscallModeUnsupported;
         // A forked child is not trapped.
@@ -3517,6 +3559,7 @@ test {
     _ = @import("sim/fault.zig");
     _ = @import("check/oracle.zig");
     _ = @import("sim/alloc.zig");
+    _ = @import("sim/tasktls.zig");
     _ = @import("sim/fiber.zig");
     _ = @import("sim/sched.zig");
     _ = @import("search/fuzz.zig");
@@ -3564,4 +3607,5 @@ test {
     _ = @import("tests/crash_test.zig");
     _ = @import("tests/poison_test.zig");
     _ = @import("tests/leak_report_test.zig");
+    _ = @import("tests/tasklocal_test.zig");
 }

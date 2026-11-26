@@ -34,6 +34,7 @@ const sysemu = @import("sysemu.zig");
 const sysnet = @import("sysnet.zig");
 const sysfd = @import("sysfd.zig");
 const systhread = @import("systhread.zig");
+const tasktls = @import("tasktls.zig");
 const ionet = Io.net;
 
 pub const TaskId = sched.TaskId;
@@ -146,6 +147,12 @@ pub const Config = struct {
     virtual_tsc: bool = false,
     /// Fill freed heap blocks and check the fill (`Options.poison_freed`).
     poison_freed: bool = true,
+    /// Thread-local variables each task has its own copy of
+    /// (`Options.task_locals`, `tasktls.zig`).
+    task_locals: []const tasktls.Range = &.{},
+    /// Their values where they were named; null: on the thread that
+    /// creates the simulator.
+    task_locals_home: ?[]const u8 = null,
     /// An optional security layer (plan2.md §2.2), one instance per `Sim`.
     security: ?seam.Security = null,
 };
@@ -363,6 +370,8 @@ fuzz_arena: std.heap.ArenaAllocator,
 now_ns: u64,
 tasks: []Task,
 stacks: fiber.Stacks,
+/// Each task's copy of the thread-locals `Config.task_locals` names.
+task_copies: tasktls.Copies,
 /// Deadline of each blocked task (`no_timer` if none): a compact copy of
 /// `Task.deadline_ns` so timer scans stay in a few cache lines.
 timers: []u64,
@@ -553,6 +562,8 @@ pub fn create(gpa: Allocator, config: Config) !*Sim {
     errdefer gpa.free(s.tasks);
     s.stacks = try fiber.Stacks.init(limits.tasks_max, limits.fiber_stack_bytes);
     errdefer s.stacks.deinit();
+    s.task_copies = try .init(gpa, config.task_locals, config.task_locals_home, task_count);
+    errdefer s.task_copies.deinit(gpa);
     s.timers = try gpa.alloc(u64, task_count);
     errdefer gpa.free(s.timers);
     @memset(s.timers, std.math.maxInt(u64));
@@ -605,6 +616,7 @@ pub fn destroy(s: *Sim) void {
     gpa.free(s.timers);
     gpa.free(s.timer_heap);
     s.stacks.deinit();
+    s.task_copies.deinit(gpa);
     gpa.free(s.tasks);
     s.fuzz_arena.deinit();
     if (s.sec) |a| {
@@ -644,6 +656,8 @@ fn fromUserdata(userdata: ?*anyopaque) *Sim {
 
 pub fn beginRun(s: *Sim, seed: u64, persona: Persona) void {
     tls_sim = s;
+    // The variables of the thread that runs it.
+    s.task_copies.beginRun();
     s.seed = seed;
     s.persona = persona;
     s.decider = .init(seed);
@@ -1506,6 +1520,8 @@ fn switchToTask(s: *Sim, next: TaskId) void {
     // The system-call trap's selector is this fiber's (`syscalls.zig`).
     const selector = syscalls.selectorSave();
     s.tasks[prev].in_call = syscalls.parkedInCall(selector);
+    // From here on the named thread-locals are `next`'s.
+    s.task_copies.swap(prev, next);
     fiber.switchTo(&s.tasks[prev].ctx, &s.tasks[next].ctx, s.boundsOf(next));
     syscalls.selectorRestore(selector);
     // Resumed: whoever switched back to us set `current`.
@@ -1918,6 +1934,7 @@ fn spawn(s: *Sim, start: Start, context: []const u8, group: ?*Io.Group, result_l
     t.result_len = result_len;
     @memcpy(t.context_buf[0..context.len], context);
     t.ctx = fiber.initContext(t.stack, Trampoline.entry);
+    s.task_copies.fresh(id);
     t.state = .runnable;
     s.begun_words[id >> 6] &= ~(@as(u64, 1) << @as(u6, @intCast(id & 63)));
     s.runq.insert(id);
