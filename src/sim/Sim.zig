@@ -348,6 +348,10 @@ auto_chaos: ?@import("../root.zig").Chaos,
 heal_at_ns: u64,
 /// First error returned by a `spawnOn` task this run.
 daemon_error: ?anyerror,
+/// While allocations are tracked (`trackAllocations`): the nodes whose
+/// live allocations a leak check found, one bit each, for the report
+/// printed after the run.
+leak_nodes: u128 = 0,
 daemons_spawned: u32,
 /// The security layer's instance, when `Config.security` is set.
 sec: ?seam.Attached,
@@ -2384,11 +2388,24 @@ pub const LeakReport = struct {
     handles: u32,
     allocations: u64,
     sockets: u32 = 0,
+    /// The nodes counted (those with no live daemon), one bit each.
+    nodes: u128 = 0,
 
     pub fn any(r: LeakReport) bool {
         return r.tasks != 0 or r.handles != 0 or r.allocations != 0 or r.sockets != 0;
     }
 };
+
+/// Records each allocation's size and stack in every node's heap (`on`),
+/// or stops: for the run a leak report makes again.
+pub fn trackAllocations(s: *Sim, on: bool) void {
+    for (s.nodes) |*n| n.heap.track(on);
+}
+
+/// Whether allocations are being recorded (`trackAllocations`).
+pub fn trackingAllocations(s: *const Sim) bool {
+    return s.nodes.len > 0 and s.nodes[0].heap.tracking;
+}
 
 /// Live resources at the end of the test body. Daemon tasks are never
 /// counted. A node with a live daemon is skipped entirely, since its
@@ -2409,6 +2426,7 @@ pub fn leaks(s: *Sim, exclude: TaskId) LeakReport {
     }
     for (s.nodes, 0..) |*node, i| {
         if (daemon_nodes & (@as(u128, 1) << @intCast(i)) != 0) continue;
+        r.nodes |= @as(u128, 1) << @intCast(i);
         r.handles += node.vfs.openHandleCount() + s.pipes.openEndsOn(@intCast(i));
         r.allocations += node.heap.live_count;
         r.sockets += s.net.openCountOn(@intCast(i));

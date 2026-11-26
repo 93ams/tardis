@@ -19,6 +19,7 @@
 //! recognizes where it looks (`tardis_sec`), and this check is not made.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
 const decide = @import("decide.zig");
@@ -38,6 +39,28 @@ pub const FreedWritten = struct {
     ctx: *anyopaque,
     f: *const fn (ctx: *anyopaque, node: u8, len: usize, offset: usize, byte: u8) void,
 };
+
+/// Frames kept of the stack that made a live allocation.
+pub const stack_frames_max = 12;
+
+/// A live allocation, while `track` is on: what a leak report prints.
+pub const Live = struct {
+    len: usize,
+    /// The order it was made in, among this heap's allocations of the run.
+    order: u64,
+    /// Return addresses, innermost first: the code that called the
+    /// allocator, then its callers.
+    stack: [stack_frames_max]usize,
+    depth: u8,
+
+    pub fn frames(l: *const Live) []const usize {
+        return l.stack[0..l.depth];
+    }
+};
+
+/// Whether a live allocation's whole stack is captured here: where std
+/// can unwind a task's stack. Elsewhere only the allocator's caller.
+const unwind_stacks = builtin.os.tag == .linux and std.debug.sys_can_stack_trace;
 
 const Quarantined = struct { ptr: [*]u8, len: usize, alignment: Alignment };
 
@@ -64,6 +87,13 @@ pub const SutAllocator = struct {
     /// This heap's node, for the report of a write after free.
     node: u8 = 0,
     freed_written: ?FreedWritten = null,
+    /// The live allocations and their stacks (`track`): on for the run a
+    /// leak report makes again, off otherwise.
+    live: std.AutoHashMapUnmanaged(usize, Live) = .empty,
+    tracking: bool = false,
+    /// An allocation the table could not hold: the report says so.
+    track_lost: u64 = 0,
+    track_order: u64 = 0,
 
     pub fn init(backing: Allocator, decider: *decide.Decider, budget_bytes: u64) error{OutOfMemory}!SutAllocator {
         return .{
@@ -79,6 +109,7 @@ pub const SutAllocator = struct {
     }
 
     pub fn deinit(s: *SutAllocator) void {
+        s.live.deinit(s.arena.child_allocator);
         s.arena.child_allocator.free(s.quarantine);
         s.arena.deinit();
     }
@@ -113,11 +144,37 @@ pub const SutAllocator = struct {
 
     pub fn reset(s: *SutAllocator) void {
         _ = s.arena.reset(.retain_capacity);
+        s.live.clearRetainingCapacity();
+        s.track_lost = 0;
+        s.track_order = 0;
         s.live_bytes = 0;
         s.live_count = 0;
         s.quarantine_len = 0;
         s.quarantine_next = 0;
         if (s.sec) |a| a.provider.heap_reset(a.ctx, s.sec_node);
+    }
+
+    /// Records each allocation's size and stack from the next run on
+    /// (`on`), or stops.
+    pub fn track(s: *SutAllocator, on: bool) void {
+        s.tracking = on;
+        if (!on) s.live.clearRetainingCapacity();
+    }
+
+    fn trackAlloc(s: *SutAllocator, p: [*]u8, len: usize, ret_addr: usize) void {
+        var l: Live = .{ .len = len, .order = s.track_order, .stack = undefined, .depth = 0 };
+        s.track_order += 1;
+        if (unwind_stacks and std.options.allow_stack_tracing) {
+            const t = std.debug.captureCurrentStackTrace(.{ .first_address = ret_addr }, &l.stack);
+            l.depth = @intCast(t.return_addresses.len);
+        }
+        if (l.depth == 0) {
+            l.stack[0] = ret_addr;
+            l.depth = 1;
+        }
+        s.live.put(s.arena.child_allocator, @intFromPtr(p), l) catch {
+            s.track_lost += 1;
+        };
     }
 
     fn secAlloc(s: *SutAllocator, mem: []u8) void {
@@ -194,6 +251,7 @@ pub const SutAllocator = struct {
         writeGuard(p, len);
         s.live_bytes += len;
         s.live_count += 1;
+        if (s.tracking) s.trackAlloc(p, len, ret_addr);
         s.secAlloc(p[0..len]);
         return p;
     }
@@ -222,6 +280,9 @@ pub const SutAllocator = struct {
     /// poisoned, then the guard moves to the new end.
     fn resized(s: *SutAllocator, memory: []u8, new_len: usize) void {
         s.live_bytes = s.live_bytes - memory.len + new_len;
+        if (s.tracking) if (s.live.getPtr(@intFromPtr(memory.ptr))) |l| {
+            l.len = new_len;
+        };
         if (new_len < memory.len) s.secFree(memory[new_len..]);
         // The dropped tail past the new guard: filled, not checked (the
         // arena may give it to the next allocation).
@@ -241,6 +302,31 @@ pub const SutAllocator = struct {
         s.quarantinePush(memory.ptr[0 .. memory.len + redzone_bytes], alignment, ret_addr);
         s.live_bytes -= memory.len;
         s.live_count -= 1;
+        if (s.tracking) _ = s.live.remove(@intFromPtr(memory.ptr));
+    }
+
+    /// The live allocations recorded, at most `out.len` of them, the
+    /// earliest made first; the count of all of them.
+    pub fn liveAllocations(s: *const SutAllocator, out: []Live) struct { []Live, usize } {
+        var n: usize = 0;
+        var it = s.live.valueIterator();
+        while (it.next()) |l| {
+            // Insertion into the `out.len` earliest, by order.
+            var i = @min(n, out.len);
+            if (i == out.len) {
+                if (out.len == 0 or out[out.len - 1].order < l.order) {
+                    n += 1;
+                    continue;
+                }
+                i -= 1;
+            }
+            while (i > 0 and out[i - 1].order > l.order) : (i -= 1) {
+                if (i < out.len) out[i] = out[i - 1];
+            }
+            out[i] = l.*;
+            n += 1;
+        }
+        return .{ out[0..@min(n, out.len)], n };
     }
 };
 
@@ -327,4 +413,31 @@ test "a freed block is filled, and a write to it is found when it leaves the qua
     a.rawFree(y, .@"1", @returnAddress());
     for (y) |b| try std.testing.expectEqual(@as(u8, 7), b);
     s.reset();
+}
+
+test "with tracking on, the live allocations are listed with their sizes, earliest first" {
+    var d = decide.Decider.init(1);
+    var s = try SutAllocator.init(std.testing.allocator, &d, 1 << 20);
+    defer s.deinit();
+    const a = s.allocator();
+    s.track(true);
+    defer s.track(false);
+    var blocks: [6][]u8 = undefined;
+    for (&blocks, 0..) |*b, i| b.* = try a.alloc(u8, 10 + i);
+    a.free(blocks[1]);
+    try std.testing.expect(a.resize(blocks[4], 3));
+    var out: [3]Live = undefined;
+    const listed, const all = s.liveAllocations(&out);
+    try std.testing.expectEqual(@as(usize, 5), all);
+    try std.testing.expectEqual(@as(usize, 3), listed.len);
+    try std.testing.expectEqual(@as(usize, 10), listed[0].len);
+    try std.testing.expectEqual(@as(usize, 12), listed[1].len);
+    try std.testing.expectEqual(@as(usize, 13), listed[2].len);
+    for (listed) |l| try std.testing.expect(l.depth >= 1);
+    var more: [8]Live = undefined;
+    const every, _ = s.liveAllocations(&more);
+    try std.testing.expectEqual(@as(usize, 5), every.len);
+    try std.testing.expectEqual(@as(usize, 3), every[3].len);
+    s.reset();
+    try std.testing.expectEqual(@as(usize, 0), s.liveAllocations(&out)[1]);
 }

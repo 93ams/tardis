@@ -30,6 +30,7 @@ pub const shrink = @import("search/shrink.zig");
 pub const explore = @import("search/explore.zig");
 const persist = @import("search/persist.zig");
 const crash = @import("sim/crash.zig");
+const alloc_mod = @import("sim/alloc.zig");
 pub const lin = @import("check/lin.zig");
 pub const elle = @import("check/elle.zig");
 pub const ledger = @import("check/ledger.zig");
@@ -1067,7 +1068,60 @@ fn expectNoLeaksExcluding(s: *Sim, exclude: Sim.TaskId) !void {
             r.tasks, r.handles, r.allocations,
         });
     }
+    // Noted, and printed after the run: this may be on a task's stack,
+    // where std cannot print a stack on every system.
+    if (s.trackingAllocations() and r.allocations > 0) s.leak_nodes |= r.nodes;
     return error.ResourceLeak;
+}
+
+/// Live allocations a leak report prints, per node.
+const leaked_shown_max = 8;
+
+/// The live allocations of the nodes in `nodes`, with their sizes and the
+/// stacks that made them (recorded by `trackAllocations`).
+fn printLiveAllocations(s: *Sim, nodes: u128) void {
+    for (s.nodes, 0..) |*n, i| {
+        if (nodes & (@as(u128, 1) << @intCast(i)) == 0 or n.heap.live_count == 0) continue;
+        var out: [leaked_shown_max]alloc_mod.Live = undefined;
+        const shown, const all = n.heap.liveAllocations(&out);
+        std.debug.print("tardis: node {d} has {d} live allocation(s) ({d} bytes)", .{ i, n.heap.live_count, n.heap.live_bytes });
+        if (all > shown.len) std.debug.print("; the first {d} made:\n", .{shown.len}) else std.debug.print(":\n", .{});
+        for (shown, 0..) |l, k| {
+            std.debug.print("tardis: live allocation {d}: {d} bytes, made at:\n", .{ k + 1, l.len });
+            std.debug.dumpStackTrace(&.{ .return_addresses = @constCast(l.frames()), .skipped = .none });
+        }
+        if (all > shown.len) std.debug.print("tardis: and {d} more\n", .{all - shown.len});
+        if (n.heap.track_lost > 0) std.debug.print("tardis: {d} allocation(s) could not be recorded (no memory for the table)\n", .{n.heap.track_lost});
+    }
+}
+
+/// Runs a leaking case once more with every allocation's size and stack
+/// recorded, and prints the ones still live at the end: which they are,
+/// where the leak report's count alone does not say.
+fn reportLeakedAllocations(s: *Sim, comptime body: fn (*Env) anyerror!void, seed: u64, persona: Persona, keep: ?[]const u64, forced: []const decide.Forced) void {
+    const overlay: decide.Overlay = .{ .keep = keep, .forced = forced };
+    s.overlay = if (keep != null or forced.len > 0) &overlay else null;
+    defer s.overlay = null;
+    const was_rerun = s.rerun;
+    s.rerun = true;
+    defer s.rerun = was_rerun;
+    const was_report = s.config.report;
+    s.config.report = false;
+    defer s.config.report = was_report;
+    s.trackAllocations(true);
+    defer s.trackAllocations(false);
+    s.leak_nodes = 0;
+    _ = runOnce(s, body, seed, persona, null, true);
+    // Only a leak with allocations in it: tasks, handles and sockets are
+    // counted in the line before.
+    var any = false;
+    for (s.nodes, 0..) |*n, i| {
+        if (s.leak_nodes & (@as(u128, 1) << @intCast(i)) != 0 and n.heap.live_count > 0) any = true;
+    }
+    if (!any) return;
+    std.debug.print("tardis: the run again, recording each allocation:\n", .{});
+    printLiveAllocations(s, s.leak_nodes);
+    std.debug.print("\n", .{});
 }
 
 /// Generates fuzz input from a TARDIS `io`. Panics if `io` is not simulated.
@@ -1419,7 +1473,11 @@ fn shrinkAndReport(gpa: Allocator, s: *Sim, comptime body: fn (*Env) anyerror!vo
     defer if (options.shrink_report) |r| {
         r.* = report;
     };
-    if (!options.shrink) return;
+    const leaked = target == error.ResourceLeak and s.config.report;
+    if (!options.shrink) {
+        if (leaked) reportLeakedAllocations(s, body, seed, persona, null, forced);
+        return;
+    }
     const was_rerun = s.rerun;
     s.rerun = true;
     defer s.rerun = was_rerun;
@@ -1440,6 +1498,10 @@ fn shrinkAndReport(gpa: Allocator, s: *Sim, comptime body: fn (*Env) anyerror!vo
     const ok = if (natural.result) |_| false else |err| err == target;
     if (!ok or rec.overflowed) {
         if (print) std.debug.print("tardis: not shrinking ({s})\n\n", .{if (rec.overflowed) "too many decisions; raise shrink_decisions_max" else "the failure did not reproduce"});
+        if (leaked and ok) {
+            s.config.report = print;
+            reportLeakedAllocations(s, body, seed, persona, null, forced);
+        }
         return;
     }
 
@@ -1453,6 +1515,10 @@ fn shrinkAndReport(gpa: Allocator, s: *Sim, comptime body: fn (*Env) anyerror!vo
     rec = decide.Recorder.init(rec_buf);
     _ = runCandidate(s, body, seed, persona, .{ .keep = sh.keep(), .forced = sh.forcedResult(), .recorder = &rec }, target, finding, options.leak_check);
     reportShrunk(s, &sh, persona, seed, &report, print);
+    if (leaked) {
+        s.config.report = print;
+        reportLeakedAllocations(s, body, seed, persona, sh.keep(), sh.forcedResult());
+    }
 }
 
 /// What warm starts did on the calling thread's simulator
@@ -3497,4 +3563,5 @@ test {
     _ = @import("tests/fork_test.zig");
     _ = @import("tests/crash_test.zig");
     _ = @import("tests/poison_test.zig");
+    _ = @import("tests/leak_report_test.zig");
 }

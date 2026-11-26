@@ -236,6 +236,28 @@ blocked fails with `Deadlock`
 returns with something still open or allocated fails with `ResourceLeak`.
 `env.expectNoLeaks()` runs the leak check at a point of your choosing.
 
+When `check` reports a leak with allocations in it, it runs the failing
+case once more (the shrunk one, when it shrank), recording every
+allocation through `env.allocator`, and prints the ones still live at the
+end, the earliest eight per node, each with its size and the stack that
+made it:
+
+```
+tardis: the run again, recording each allocation:
+tardis: node 0 has 1 live allocation(s) (24 bytes):
+tardis: live allocation 1: 24 bytes, made at:
+src/tests/leak_report_test.zig:12:41: 0x131416e in leakyHelper (root.zig)
+src/tests/leak_report_test.zig:20:20: 0x131448a in leaks (root.zig)
+...
+```
+
+The whole stack is recorded on Linux; elsewhere, for now, only the
+function that called the allocator (where an optimized build inlined the
+allocator's own call, that frame may be its caller's). Nodes with a
+live daemon are left out, as the leak check leaves them out. The report
+needs `Options.report`, and is not made in the loop form, nor for a leak
+found by `env.expectNoLeaks()` that the body turned into another error.
+
 ### `always`
 
 See section 1. Check it wherever the property should hold, not only at

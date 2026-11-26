@@ -770,6 +770,8 @@ Still not verified after revision 99: glibc; C++; a Rust program that is an exec
 
 **Revision 133: a freed block is filled, and a write to it fails the run.** `Options.poison_freed` (on by default): without a security layer, `env.allocator` fills each freed block with `0xAA`, so a read after the free reads that, the same on every replay, and checks the fill when the block leaves the quarantine, before a crash wipes the heap and at the end of the run; a block found changed fails the run with `error.WriteAfterFree` (`src/sim/alloc.zig`, docs/guide.md §2).
 
+**Revision 134: a leak report says what leaked.** When `check` reports a leak with allocations in it, it runs the failing case once more recording each allocation's size and stack, and prints the earliest eight live ones per node (`src/sim/alloc.zig`, `reportLeakedAllocations` in `src/root.zig`, docs/guide.md §3). Whole stacks on Linux; elsewhere the allocator's caller.
+
 
 **Revision 100: the last untried rows of the `fsync` rule on ext4.** Four more cases on the real filesystem: the one unsafe doubt (a write within a tick of the clock) could not be produced there, so the model takes the cautious side of it, and the two places where ext4 keeps more than the model (new blocks allotted at the sync) are left as they are and explained. A rename over a file with a full journal no longer hides the file's change from its own `fsync`.
 
