@@ -766,6 +766,8 @@ Still not verified after revision 99: glibc; C++; a Rust program that is an exec
 
 **Revision 131: a run that crashes says which it was.** A panic or fault inside a run of `check` prints the iteration, persona and seed and a replay line before the process ends (`src/sim/crash.zig`): signal handlers on Linux and macOS, a vectored exception handler and a TLS callback at exit on Windows. Not the loop form.
 
+**Revision 132: a crash inside a run ends the process.** In system-call mode `tkill` of the calling thread goes to the kernel (`src/sim/syscalls.zig`), so std's `abort` after a stack overflow or a panic inside a run ends the process, where the signal was refused as a stray: a panic printed `unexpected errno: 38`, and before revision 131 the process spun forever.
+
 
 **Revision 100: the last untried rows of the `fsync` rule on ext4.** Four more cases on the real filesystem: the one unsafe doubt (a write within a tick of the clock) could not be produced there, so the model takes the cautious side of it, and the two places where ext4 keeps more than the model (new blocks allotted at the sync) are left as they are and explained. A rename over a file with a full journal no longer hides the file's change from its own `fsync`.
 

@@ -3870,3 +3870,26 @@ test "system-call mode: a crash takes the process's threads with it, and new one
     if (!supported or !tardis.syscallModeAvailable() or !tardis.syscallThreadsAvailable()) return error.SkipZigTest;
     try tardis.check(gpa, threadCrash, .{ .iterations = 30, .mode = .syscalls });
 }
+
+// --- a crash inside a run ------------------------------------------------------
+
+fn tkillsItself(_: *Env) !void {
+    // Signal 0 checks the thread is there and sends nothing.
+    const tid = linux.syscall0(.gettid);
+    try testing.expectEqual(@as(usize, 0), linux.syscall2(.tkill, tid, 0));
+}
+
+fn tkillsAnother(_: *Env) !void {
+    // No thread has this number: above any `pid_max`, below the simulated
+    // threads' numbers.
+    _ = linux.syscall2(.tkill, 0x2fff_ffff, 0);
+}
+
+test "system-call mode: tkill of the thread itself reaches the kernel, as a crash's abort needs; of another thread it is a stray" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    // std's `raise`, and musl's, signal the thread with `tkill`: `abort`
+    // after a panic or a stack overflow inside a run. Refused as a stray,
+    // the crash handler panicked again and the process spun forever.
+    try tardis.check(gpa, tkillsItself, .{ .iterations = 1, .mode = .syscalls });
+    try testing.expectError(error.StraySyscall, tardis.check(gpa, tkillsAnother, .{ .iterations = 1, .mode = .syscalls, .report = false }));
+}

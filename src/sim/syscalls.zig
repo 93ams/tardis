@@ -122,6 +122,11 @@ fn expected(number: u64, arg0: u64) bool {
         // Signals, and the ways out of the process.
         13, 14, 15, 131 => true, // rt_sigaction, rt_sigprocmask, rt_sigreturn, sigaltstack
         60, 231, 62, 234, 186, 39 => true, // exit, exit_group, kill, tgkill, gettid, getpid
+        // `tkill` to the calling thread only (this runs on it): how std's
+        // `raise` and musl's signal the thread itself, as `abort` does
+        // after a panic or a crash in a run. To another thread it is a
+        // stray.
+        200 => arg0 == raw6(186, 0, 0, 0, 0, 0, 0), // tkill, gettid
         157 => true, // prctl (turning the trap off)
         else => false,
     };
