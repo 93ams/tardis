@@ -228,9 +228,14 @@ What it does not catch:
   them: memory calls (`mmap`, `mprotect`, `munmap`, `brk`, `mremap`,
   `madvise`), `write` and `writev` to standard output and standard error,
   `fstat`, `ioctl` and `newfstatat` on the three standard descriptors,
-  `futex`, the signal calls, `getpid`, `gettid`, `kill`, `tgkill`, `exit`,
-  `exit_group` and `prctl`. So code that blocks on a real futex is not
-  reported, and with every task on one thread it stops them all.
+  `futex`, the signal calls, `getpid`, `gettid`, `exit`, `exit_group`
+  and `prctl`; and a signal to the calling thread (`tkill`, or `tgkill`
+  with this process), as `abort` sends, or `kill` of this process with
+  signal 0. So code that blocks on a real futex is not reported, and
+  with every task on one thread it stops them all. A signal aimed
+  anywhere else (another process, the process group, every process,
+  another thread, or this process with a signal that any of its threads
+  may take) is refused and fails the run, here too: it is not sent.
 - **Clock reads through the vDSO.** `clock_gettime`, `gettimeofday` and
   `getcpu` are usually answered in user space and are not system calls.
   (System-call mode answers these from the simulation; the trap alone

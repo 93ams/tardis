@@ -106,7 +106,7 @@ pub const Emulator = *const fn (number: u64, args: *const [6]u64) ?u64;
 var handler_installed: std.atomic.Value(bool) = .init(false);
 
 /// The calls a run makes without leaving the simulation, by x86_64 number.
-fn expected(number: u64, arg0: u64) bool {
+fn expected(number: u64, arg0: u64, arg1: u64) bool {
     return switch (number) {
         // Memory: allocators, fiber stacks, guard pages.
         9, 10, 11, 12, 25, 28 => true, // mmap, mprotect, munmap, brk, mremap, madvise
@@ -121,15 +121,32 @@ fn expected(number: u64, arg0: u64) bool {
         202 => true, // futex
         // Signals, and the ways out of the process.
         13, 14, 15, 131 => true, // rt_sigaction, rt_sigprocmask, rt_sigreturn, sigaltstack
-        60, 231, 62, 234, 186, 39 => true, // exit, exit_group, kill, tgkill, gettid, getpid
-        // `tkill` to the calling thread only (this runs on it): how std's
-        // `raise` and musl's signal the thread itself, as `abort` does
-        // after a panic or a crash in a run. To another thread it is a
-        // stray.
-        200 => arg0 == raw6(186, 0, 0, 0, 0, 0, 0), // tkill, gettid
+        60, 231, 186, 39 => true, // exit, exit_group, gettid, getpid
+        // A signal to the calling thread (this runs on it): how `raise`
+        // and `abort` signal themselves (std's and musl's `tkill`,
+        // glibc's `tgkill`). Aimed anywhere else (another process, a
+        // process group, every process with -1, another thread of the
+        // harness) it is a stray. A signal `kill` sends to this process
+        // may be delivered on any of its threads, a worker's running
+        // another run among them: only signal 0, which delivers nothing,
+        // is let through. The kernel reads each number as an `int`.
+        62 => sameId(arg0, raw6(39, 0, 0, 0, 0, 0, 0)) and sameId(arg1, 0), // kill, getpid
+        200 => sameId(arg0, raw6(186, 0, 0, 0, 0, 0, 0)), // tkill, gettid
+        234 => sameId(arg0, raw6(39, 0, 0, 0, 0, 0, 0)) and sameId(arg1, raw6(186, 0, 0, 0, 0, 0, 0)), // tgkill
         157 => true, // prctl (turning the trap off)
         else => false,
     };
+}
+
+/// A process or thread number as the kernel reads it, an `int`, against
+/// one the kernel gave.
+fn sameId(arg: u64, id: u64) bool {
+    return @as(u32, @truncate(arg)) == @as(u32, @truncate(id));
+}
+
+/// kill, tkill, tgkill.
+fn sendsSignal(number: u64) bool {
+    return number == 62 or number == 200 or number == 234;
 }
 
 /// clone, fork, vfork, clone3: calls the trap refuses instead of making.
@@ -197,7 +214,7 @@ fn onSigsys(_: i32, _: ?*anyopaque, context: ?*anyopaque) callconv(.c) void {
         map_fd >= 0x1000_0000 and map_fd < 0x8000_0000;
     const first = emulator != null and emulatorFirst(number);
     stray: {
-        if (!(maps_simulated or first or !expected(number, a))) break :stray;
+        if (!(maps_simulated or first or !expected(number, a, gregs[@backingInt(Reg.rsi)]))) break :stray;
         if (emulator) |emulate| {
             frame_regs = gregs;
             const args: [6]u64 = .{
@@ -216,7 +233,7 @@ fn onSigsys(_: i32, _: ?*anyopaque, context: ?*anyopaque) callconv(.c) void {
             }
             // One of the harness's own, which the emulator left alone (a
             // futex operation it does not know is a stray).
-            if (first and number != 202 and !maps_simulated and expected(number, a)) break :stray;
+            if (first and number != 202 and !maps_simulated and expected(number, a, gregs[@backingInt(Reg.rsi)])) break :stray;
         }
         if (stray_count == 0) {
             stray_first = number;
@@ -240,6 +257,16 @@ fn onSigsys(_: i32, _: ?*anyopaque, context: ?*anyopaque) callconv(.c) void {
         if (startsThreadOrProcess(number)) {
             stray_refused +|= 1;
             gregs[@backingInt(Reg.rax)] = @bitCast(@as(i64, -@as(i64, @backingInt(linux.E.AGAIN))));
+            @atomicStore(u8, &selector, block, .seq_cst);
+            return;
+        }
+        // A signal aimed past the calling thread (`expected` lets the
+        // rest through) could stop or kill the test process, another of
+        // the user's processes, or all of them: not sent, and the run
+        // fails.
+        if (sendsSignal(number)) {
+            stray_refused +|= 1;
+            gregs[@backingInt(Reg.rax)] = @bitCast(@as(i64, -@as(i64, @backingInt(linux.E.PERM))));
             @atomicStore(u8, &selector, block, .seq_cst);
             return;
         }

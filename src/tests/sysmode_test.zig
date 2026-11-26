@@ -3873,23 +3873,67 @@ test "system-call mode: a crash takes the process's threads with it, and new one
 
 // --- a crash inside a run ------------------------------------------------------
 
-fn tkillsItself(_: *Env) !void {
-    // Signal 0 checks the thread is there and sends nothing.
+// Signal 0 everywhere: it checks the target is there and sends nothing.
+
+fn signalsItselfEachWay(_: *Env) !void {
+    const pid = linux.syscall0(.getpid);
     const tid = linux.syscall0(.gettid);
     try testing.expectEqual(@as(usize, 0), linux.syscall2(.tkill, tid, 0));
+    try testing.expectEqual(@as(usize, 0), linux.syscall3(.tgkill, pid, tid, 0));
+    try testing.expectEqual(@as(usize, 0), linux.syscall2(.kill, pid, 0));
 }
 
-fn tkillsAnother(_: *Env) !void {
-    // No thread has this number: above any `pid_max`, below the simulated
-    // threads' numbers.
-    _ = linux.syscall2(.tkill, 0x2fff_ffff, 0);
+/// No process or thread has this number: above any `pid_max`, below the
+/// simulated threads' numbers.
+const nobody: usize = 0x2fff_ffff;
+const every_process: usize = @bitCast(@as(isize, -1));
+
+/// Ignored unless the program catches it: harmless if it were delivered.
+const sigwinch = 28;
+
+const Elsewhere = enum { tkill_other, tgkill_other_thread, tgkill_other_process, kill_other, kill_group, kill_every, kill_itself_with_a_signal };
+var signal_target: Elsewhere = .tkill_other;
+var signal_result: usize = 0;
+
+fn signalsElsewhere(_: *Env) !void {
+    const pid = linux.syscall0(.getpid);
+    const tid = linux.syscall0(.gettid);
+    signal_result = switch (signal_target) {
+        .tkill_other => linux.syscall2(.tkill, nobody, 0),
+        .tgkill_other_thread => linux.syscall3(.tgkill, pid, nobody, 0),
+        .tgkill_other_process => linux.syscall3(.tgkill, nobody, tid, 0),
+        .kill_other => linux.syscall2(.kill, nobody, 0),
+        .kill_group => linux.syscall2(.kill, 0, 0),
+        .kill_every => linux.syscall2(.kill, every_process, 0),
+        // Any thread of the process may take it, a worker's among them.
+        .kill_itself_with_a_signal => linux.syscall2(.kill, pid, sigwinch),
+    };
 }
 
-test "system-call mode: tkill of the thread itself reaches the kernel, as a crash's abort needs; of another thread it is a stray" {
+test "system-call mode: a signal to this process or the calling thread reaches the kernel, as a crash's abort needs; one aimed elsewhere is a stray" {
     if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
-    // std's `raise`, and musl's, signal the thread with `tkill`: `abort`
-    // after a panic or a stack overflow inside a run. Refused as a stray,
-    // the crash handler panicked again and the process spun forever.
-    try tardis.check(gpa, tkillsItself, .{ .iterations = 1, .mode = .syscalls });
-    try testing.expectError(error.StraySyscall, tardis.check(gpa, tkillsAnother, .{ .iterations = 1, .mode = .syscalls, .report = false }));
+    // std's `raise`, and musl's, signal the thread with `tkill`, glibc's
+    // with `tgkill`: `abort` after a panic or a stack overflow inside a
+    // run. Refused as a stray, the crash handler panicked again and the
+    // process spun forever.
+    try tardis.check(gpa, signalsItselfEachWay, .{ .iterations = 1, .mode = .syscalls });
+    // Another thread of the harness, another process, the process group,
+    // every process the user has: the code under test cannot reach them.
+    for (std.enums.values(Elsewhere)) |e| {
+        signal_target = e;
+        tardis.check(gpa, signalsElsewhere, .{ .iterations = 1, .mode = .syscalls, .report = false }) catch |err| {
+            try testing.expectEqual(error.StraySyscall, err);
+            continue;
+        };
+        std.debug.print("not a stray: {t}\n", .{e});
+        return error.TestUnexpectedResult;
+    }
+    // Trapped only, with no emulator: strays are made there, but not
+    // these. The run fails, and the signal is not sent.
+    for (std.enums.values(Elsewhere)) |e| {
+        signal_target = e;
+        signal_result = 0;
+        try testing.expectError(error.StraySyscall, tardis.check(gpa, signalsElsewhere, .{ .iterations = 1, .trap_syscalls = true, .report = false }));
+        try testing.expectEqual(errOf(.PERM), @as(isize, @bitCast(signal_result)));
+    }
 }

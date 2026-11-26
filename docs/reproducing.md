@@ -98,8 +98,8 @@ What it covers and what it does not:
   system-call mode (tested for a fault in the body; a fault in a thread
   the code started has not been tried). A panic in system-call mode
   reaches the handler too: the trap lets the abort's own signal, `tkill`
-  of the calling thread, through to the kernel (revision 132; looked at
-  by hand, not tested).
+  or `tgkill` of the calling thread, through to the kernel (revisions
+  132 and 135; looked at by hand, not tested).
 - Not the loop form (`tardis.sim`), not `std.process.exit` (except on
   Windows, where an exit inside a run is reported as `ended the process`),
   and not a run in a forked child (`Options.fork`): the parent prints
