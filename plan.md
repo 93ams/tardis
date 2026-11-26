@@ -776,6 +776,8 @@ Still not verified after revision 99: glibc; C++; a Rust program that is an exec
 
 **Revision 136: each task its own copy of the thread-locals a check names.** `Options.task_locals`: named `threadlocal` variables are swapped per task at each switch, starting from the calling thread's values (`src/sim/tasktls.zig`, docs/threads.md). Linux and Windows.
 
+**Revision 137: a socket's timeouts expire.** In system-call mode `SO_RCVTIMEO` and `SO_SNDTIMEO` on an IPv4 socket or a pair expire in virtual time with Linux's `EAGAIN` (`src/sim/sysnet.zig`, `sysfd.zig`), as Rust's `set_read_timeout` and `set_write_timeout` expect; before, they were accepted and never expired.
+
 
 **Revision 100: the last untried rows of the `fsync` rule on ext4.** Four more cases on the real filesystem: the one unsafe doubt (a write within a tick of the clock) could not be produced there, so the model takes the cautious side of it, and the two places where ext4 keeps more than the model (new blocks allotted at the sync) are left as they are and explained. A rename over a file with a full journal no longer hides the file's change from its own `fsync`.
 

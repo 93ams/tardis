@@ -26,9 +26,22 @@
 //! `listen`, `accept`, `accept4`, `connect`, `read`, `write`, `readv`,
 //! `writev`, `recvfrom`, `sendto`, `recvmsg`, `sendmsg`, `shutdown`,
 //! `close`, `getsockname`,
-//! `getpeername`, `setsockopt` (accepted, changes nothing), `getsockopt`
-//! (`SO_ERROR` and `SO_TYPE`; any other reads as 0), and `fcntl` for the
-//! descriptor flags. An IPv6 socket fails with `EAFNOSUPPORT`, which
+//! `getpeername`, `setsockopt` (`SO_RCVTIMEO` and `SO_SNDTIMEO`; any
+//! other is accepted and changes nothing), `getsockopt` (those two,
+//! `SO_ERROR` and `SO_TYPE`; any other reads as 0), and `fcntl` for the
+//! descriptor flags.
+//!
+//! A timeout set with `SO_RCVTIMEO` or `SO_SNDTIMEO` expires in virtual
+//! time, as Linux's: a blocking read, `recvfrom`, `recvmsg` or `accept`
+//! that waits that long fails with `EAGAIN`, and a blocking stream write
+//! returns what it sent, or `EAGAIN` if nothing. A `writev` or `sendmsg`
+//! on a stream waits up to the timeout for each of its buffers, where
+//! Linux's waits once for all of them; `connect` does not look at
+//! `SO_SNDTIMEO`, where Linux's gives up with `EINPROGRESS`. A call that
+//! found its socket ready, and lost what made it so to another task
+//! sharing the socket before it took it (a scheduling point lies
+//! between), then waits with no limit; a non-blocking call does the same.
+//! An accepted socket has its listener's timeouts, as on Linux. An IPv6 socket fails with `EAFNOSUPPORT`, which
 //! code that tries IPv6 first takes as the cue to use IPv4.
 //!
 //! As Linux: a blocking stream `send`, `writev` or `sendmsg` sends everything; a
@@ -145,6 +158,11 @@ const Slot = struct {
     unfiltered: u32 = 0,
     /// Its own number was closed, and a duplicate keeps the socket.
     primary_closed: bool = false,
+    /// `SO_RCVTIMEO` and `SO_SNDTIMEO` (`sysfd.readTimeout`): a read or
+    /// `accept`, or a write, that waits this long in virtual time fails
+    /// with `EAGAIN` (a write returns what it sent, if any).
+    recv_timeout: ?u64 = null,
+    send_timeout: ?u64 = null,
 };
 
 const unspecified: ionet.IpAddress = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } };
@@ -351,7 +369,7 @@ pub fn emulate(s: *Sim, number: u64, a: *const [6]u64) ?u64 {
             (if (writeAddress(a[1], a[2], slot.peer.?)) |e| fail(e) else 0)
         else
             fail(.NOTCONN),
-        54 => 0, // setsockopt: accepted, changes nothing
+        54 => setsockopt(slot, a[1], a[2], a[3], a[4]),
         55 => getsockopt(s, slot, a[1], a[2], a[3], a[4]),
         32 => duplicate(indexOf(fd).?),
         72 => switch (@as(u32, @truncate(a[1]))) {
@@ -448,6 +466,7 @@ fn accept(s: *Sim, slot: *Slot, addr_ptr: u64, len_ptr: u64, flags: u32) ?u64 {
     if (slot.mode == .dgram) return fail(.OPNOTSUPP);
     if (slot.kind != .listening) return fail(.INVAL);
     if (slot.nonblock and !s.listenerReady(slot.handle)) return fail(.AGAIN);
+    if (sysfd.deadlineOf(s, slot.recv_timeout)) |d| if (waitReady(s, slot, d, listenerReady)) |e| return fail(e);
     // Taken before the wait: another task's `socket` must not take it.
     const fresh = take(s, .fresh, .stream) orelse return fail(.MFILE);
     const fresh_gen = slots[fresh].gen;
@@ -483,6 +502,9 @@ fn accept(s: *Sim, slot: *Slot, addr_ptr: u64, len_ptr: u64, flags: u32) ?u64 {
     slots[fresh].handle = sock.handle;
     slots[fresh].local = here;
     slots[fresh].peer = sock.address;
+    // Linux's accepted socket is a copy of the listener: its timeouts too.
+    slots[fresh].recv_timeout = slot.recv_timeout;
+    slots[fresh].send_timeout = slot.send_timeout;
     return fdOf(fresh);
 }
 
@@ -630,6 +652,7 @@ fn receive(s: *Sim, slot: *Slot, buf_ptr: u64, len: u64, flags: u32, from_ptr: u
     if (flags & ~@as(u32, msg_nosignal | msg_dontwait) != 0) return null; // peek, waitall, oob
     const buf = userBytes(buf_ptr, len) orelse return fail(.FAULT);
     const nonblock = slot.nonblock or flags & msg_dontwait != 0;
+    const deadline = sysfd.deadlineOf(s, slot.recv_timeout);
     const io = s.io();
     switch (slot.kind) {
         .stream => {
@@ -638,6 +661,7 @@ fn receive(s: *Sim, slot: *Slot, buf_ptr: u64, len: u64, flags: u32, from_ptr: u
             // the end.
             if (buf.len == 0) return 0;
             if (nonblock and !s.streamReadable(slot.handle)) return fail(.AGAIN);
+            if (!nonblock) if (deadline) |d| if (waitReady(s, slot, d, streamReadable)) |e| return fail(e);
             var data = [_][]u8{buf};
             const r = io.operate(.{ .net_read = .{ .socket_handle = slot.handle, .data = &data } }) catch return fail(.INTR);
             const got = r.net_read catch |err| {
@@ -659,8 +683,9 @@ fn receive(s: *Sim, slot: *Slot, buf_ptr: u64, len: u64, flags: u32, from_ptr: u
             while (readable(s, slot) == 0) {
                 if (nonblock) return fail(.AGAIN);
                 if (slot.shut_recv) return 0;
+                if (deadline) |d| if (s.now_ns >= d) return fail(.AGAIN);
                 const gen = slot.gen;
-                s.waitNetwork(s.net.nextEventAfter(s.now_ns)) catch return fail(.INTR);
+                s.waitNetwork(sysfd.earliest(s.net.nextEventAfter(s.now_ns), deadline)) catch return fail(.INTR);
                 if (slot.gen != gen or slot.kind != .dgram) return fail(.BADF);
                 if (slot.pending) |e| {
                     slot.pending = null;
@@ -700,7 +725,20 @@ fn receive(s: *Sim, slot: *Slot, buf_ptr: u64, len: u64, flags: u32, from_ptr: u
                 return fail(.NOTCONN);
             }
             if (nonblock) return fail(.AGAIN);
-            return if (slot.shut_recv) 0 else null;
+            if (slot.shut_recv) return 0;
+            // An unbound datagram socket receives nothing: with a timeout,
+            // the read waits it out.
+            const d = deadline orelse return null;
+            const gen = slot.gen;
+            while (s.now_ns < d) {
+                s.waitNetwork(d) catch return fail(.INTR);
+                if (slot.gen != gen) return fail(.BADF);
+                // Shut down meanwhile: the end. Bound or connected by
+                // another task: a read of that, its timeout started anew.
+                if (slot.shut_recv) return 0;
+                if (slot.kind != .fresh) return receive(s, slot, buf_ptr, len, flags, from_ptr, from_len_ptr, truncated);
+            }
+            return fail(.AGAIN);
         },
         .listening => return fail(.NOTCONN),
         .free => unreachable,
@@ -734,9 +772,12 @@ fn send(s: *Sim, slot: *Slot, buf_ptr: u64, len: u64, flags: u32, to_ptr: u64, t
             // (Linux: short only on a signal): the simulator's writes may
             // be short, so continue until done or failed.
             var sent: usize = 0;
+            const deadline = sysfd.deadlineOf(s, slot.send_timeout);
             while (sent < buf.len) {
                 // Non-blocking: as much as fits now, or `EAGAIN`.
                 if (nonblock and !s.streamWritable(slot.handle)) return if (sent > 0) sent else fail(.AGAIN);
+                // `SO_SNDTIMEO`: what was sent before it expired, or `EAGAIN`.
+                if (!nonblock) if (deadline) |d| if (waitReady(s, slot, d, streamWritable)) |e| return if (sent > 0) sent else fail(e);
                 const data = [_][]const u8{buf[sent..]};
                 const r = io.operate(.{ .net_write = .{ .socket_handle = slot.handle, .data = &data } }) catch
                     return if (sent > 0) sent else fail(.INTR);
@@ -1097,7 +1138,54 @@ fn resetOf(s: *Sim, slot: *const Slot) bool {
     return slot.kind == .stream and (slot.reset_reported or s.streamReset(slot.handle));
 }
 
+/// The timeouts; any other option is accepted and changes nothing.
+fn setsockopt(slot: *Slot, level: u64, name: u64, value_ptr: u64, len: u64) u64 {
+    const which = sysfd.timeoutOption(level, name) orelse return 0;
+    const timeout = switch (sysfd.readTimeout(value_ptr, len)) {
+        .set => |t| t,
+        .err => |e| return fail(e),
+    };
+    switch (which) {
+        .recv => slot.recv_timeout = timeout,
+        .send => slot.send_timeout = timeout,
+    }
+    return 0;
+}
+
+/// Waits until `ready`, for a call on a socket with a timeout: null once
+/// ready, or once the socket changed under the wait (a listener's
+/// `shutdown`), for the call to find out what that means; `EAGAIN` if
+/// `deadline` came first, Linux's answer to a timeout; or the error that
+/// ended the wait.
+fn waitReady(s: *Sim, slot: *Slot, deadline: u64, comptime ready: fn (*Sim, *Slot) bool) ?E {
+    const kind = slot.kind;
+    while (!ready(s, slot)) {
+        if (s.now_ns >= deadline) return .AGAIN;
+        const gen = slot.gen;
+        s.waitNetwork(sysfd.earliest(s.net.nextEventAfter(s.now_ns), deadline)) catch return .INTR;
+        if (slot.gen != gen) return .BADF;
+        if (slot.kind != kind) return null;
+    }
+    return null;
+}
+
+fn streamReadable(s: *Sim, slot: *Slot) bool {
+    return s.streamReadable(slot.handle);
+}
+
+fn streamWritable(s: *Sim, slot: *Slot) bool {
+    return s.streamWritable(slot.handle);
+}
+
+fn listenerReady(s: *Sim, slot: *Slot) bool {
+    return s.listenerReady(slot.handle);
+}
+
 fn getsockopt(s: *Sim, slot: *Slot, level: u64, name: u64, value_ptr: u64, len_ptr: u64) u64 {
+    if (sysfd.timeoutOption(level, name)) |which| return sysfd.writeTimeout(switch (which) {
+        .recv => slot.recv_timeout,
+        .send => slot.send_timeout,
+    }, value_ptr, len_ptr);
     if (value_ptr == 0 or len_ptr == 0) return fail(.FAULT);
     const len: *align(1) u32 = @ptrFromInt(len_ptr);
     if (len.* < 4) return fail(.INVAL);

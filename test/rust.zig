@@ -247,6 +247,18 @@ test "rust: socket2's vectored calls (sendmsg, recvmsg) on datagrams, a TCP conn
     try tardis.check(testing.allocator, messages, no_loss);
 }
 
+extern fn rust_timeouts() c_int;
+
+fn timeouts(env: *Env) !void {
+    _ = env;
+    try testing.expectEqual(@as(c_int, 0), rust_timeouts());
+}
+
+test "rust: set_read_timeout and set_write_timeout give up in virtual time" {
+    if (skip()) return error.SkipZigTest;
+    try tardis.check(testing.allocator, timeouts, options);
+}
+
 extern fn rust_resolve() c_int;
 
 /// The simulated filesystem starts empty: the program's host names are

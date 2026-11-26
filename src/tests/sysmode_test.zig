@@ -3937,3 +3937,155 @@ test "system-call mode: a signal to this process or the calling thread reaches t
         try testing.expectEqual(errOf(.PERM), @as(isize, @bitCast(signal_result)));
     }
 }
+
+// --- a socket's timeouts (SO_RCVTIMEO, SO_SNDTIMEO) -----------------------------
+
+const so_rcvtimeo = 20;
+const so_sndtimeo = 21;
+const Timeval = extern struct { sec: i64, usec: i64 };
+
+fn setTimeout(fd: usize, name: usize, sec: i64, usec: i64) isize {
+    const tv: Timeval = .{ .sec = sec, .usec = usec };
+    return sys6(.setsockopt, fd, 1, name, @intFromPtr(&tv), @sizeOf(Timeval), 0);
+}
+
+fn getTimeout(fd: usize, name: usize) !Timeval {
+    var tv: Timeval = .{ .sec = -1, .usec = -1 };
+    var len: u32 = @sizeOf(Timeval);
+    _ = try ok(sys6(.getsockopt, fd, 1, name, @intFromPtr(&tv), @intFromPtr(&len), 0));
+    try testing.expectEqual(@as(u32, @sizeOf(Timeval)), len);
+    return tv;
+}
+
+/// Runs `call`, which must fail with `EAGAIN` after exactly `ms` of
+/// virtual time.
+fn expectTimesOut(ms: u64, call: anytype, args: anytype) !void {
+    const before = try monotonicNs();
+    try testing.expectEqual(errOf(.AGAIN), @call(.auto, call, args));
+    try testing.expectEqual(ms * std.time.ns_per_ms, try monotonicNs() - before);
+}
+
+var accepted: std.atomic.Value(usize) = .init(0);
+
+fn acceptsOne(listener: usize) void {
+    accepted.store(ok(sys(.accept, listener, 0, 0, 0)) catch 0, .seq_cst);
+}
+
+fn writesOneByteLater(fd: usize) void {
+    sleepsMs(10);
+    _ = sys(.write, fd, @intFromPtr("x"), 1, 0);
+}
+
+fn socketTimeouts(env: *Env) !void {
+    var buf: [64 * 1024]u8 = @splat(7);
+
+    // A listener's `accept`.
+    const listener = try ok(sys(.socket, 2, 1, 0, 0));
+    defer _ = sys(.close, listener, 0, 0, 0);
+    const at = sockaddr(.{ 127, 0, 0, 1 }, 7300);
+    _ = try ok(sys(.bind, listener, @intFromPtr(&at), @sizeOf(SockaddrIn), 0));
+    _ = try ok(sys(.listen, listener, 8, 0, 0));
+    _ = try ok(setTimeout(listener, so_rcvtimeo, 0, 50_000));
+    try expectTimesOut(50, sys, .{ .accept, listener, 0, 0, 0 });
+
+    // A connected stream: a read with nothing coming, then one that gets
+    // what arrives in time.
+    _ = try ok(setTimeout(listener, so_rcvtimeo, 0, 0));
+    // An accepted socket has its listener's timeouts.
+    _ = try ok(setTimeout(listener, so_sndtimeo, 0, 7_000));
+    accepted.store(0, .seq_cst);
+    var server = try env.io.concurrent(acceptsOne, .{listener});
+    const client = try ok(sys(.socket, 2, 1, 0, 0));
+    defer _ = sys(.close, client, 0, 0, 0);
+    _ = try ok(sys(.connect, client, @intFromPtr(&at), @sizeOf(SockaddrIn), 0));
+    server.await(env.io);
+    const conn = accepted.load(.seq_cst);
+    try testing.expect(conn != 0);
+    defer _ = sys(.close, conn, 0, 0, 0);
+    try testing.expectEqual(Timeval{ .sec = 0, .usec = 7_000 }, try getTimeout(conn, so_sndtimeo));
+    try testing.expectEqual(Timeval{ .sec = 0, .usec = 0 }, try getTimeout(conn, so_rcvtimeo));
+    _ = try ok(setTimeout(client, so_rcvtimeo, 0, 30_000));
+    try testing.expectEqual(Timeval{ .sec = 0, .usec = 30_000 }, try getTimeout(client, so_rcvtimeo));
+    try expectTimesOut(30, sys, .{ .read, client, @intFromPtr(&buf), buf.len, 0 });
+    try expectTimesOut(30, sys6, .{ .recvfrom, client, @intFromPtr(&buf), buf.len, 0, 0, 0 });
+    var writer = try env.io.concurrent(writesOneByteLater, .{conn});
+    try testing.expectEqual(@as(isize, 1), sys(.read, client, @intFromPtr(&buf), buf.len, 0));
+    writer.await(env.io);
+
+    // A write to a peer that reads nothing: what fit, then `EAGAIN`.
+    _ = try ok(setTimeout(client, so_sndtimeo, 0, 20_000));
+    var sent: usize = 0;
+    var timed_out = false;
+    for (0..1000) |_| {
+        const rc = sys(.write, client, @intFromPtr(&buf), buf.len, 0);
+        if (rc == errOf(.AGAIN)) {
+            timed_out = true;
+            break;
+        }
+        sent += try ok(rc);
+    }
+    try testing.expect(timed_out and sent > 0);
+
+    // Negative seconds: over at once. 0 and 0: none. Linux's errors.
+    _ = try ok(setTimeout(client, so_rcvtimeo, -1, 0));
+    try expectTimesOut(0, sys, .{ .read, client, @intFromPtr(&buf), buf.len, 0 });
+    _ = try ok(setTimeout(client, so_rcvtimeo, 0, 0));
+    try testing.expectEqual(Timeval{ .sec = 0, .usec = 0 }, try getTimeout(client, so_rcvtimeo));
+    try testing.expectEqual(errOf(.DOM), setTimeout(client, so_rcvtimeo, 1, 1_000_000));
+    try testing.expectEqual(errOf(.DOM), setTimeout(client, so_rcvtimeo, 1, -1));
+    const tv: Timeval = .{ .sec = 1, .usec = 0 };
+    try testing.expectEqual(errOf(.INVAL), sys6(.setsockopt, client, 1, so_rcvtimeo, @intFromPtr(&tv), 8, 0));
+    // The 64-bit option numbers are the same option.
+    _ = try ok(sys6(.setsockopt, client, 1, 66, @intFromPtr(&tv), @sizeOf(Timeval), 0));
+    try testing.expectEqual(tv, try getTimeout(client, so_rcvtimeo));
+
+    // Datagrams: bound, and not bound (nothing can come).
+    const bound = try ok(sys(.socket, 2, 2, 0, 0));
+    defer _ = sys(.close, bound, 0, 0, 0);
+    const there = sockaddr(.{ 127, 0, 0, 1 }, 9300);
+    _ = try ok(sys(.bind, bound, @intFromPtr(&there), @sizeOf(SockaddrIn), 0));
+    _ = try ok(setTimeout(bound, so_rcvtimeo, 0, 25_000));
+    try expectTimesOut(25, sys6, .{ .recvfrom, bound, @intFromPtr(&buf), buf.len, 0, 0, 0 });
+    const unbound = try ok(sys(.socket, 2, 2, 0, 0));
+    defer _ = sys(.close, unbound, 0, 0, 0);
+    _ = try ok(setTimeout(unbound, so_rcvtimeo, 0, 5_000));
+    try expectTimesOut(5, sys, .{ .read, unbound, @intFromPtr(&buf), buf.len, 0 });
+
+    // A listener shut down while a timed `accept` waits: `EINVAL` then,
+    // as without a timeout.
+    const stopped = try ok(sys(.socket, 2, 1, 0, 0));
+    defer _ = sys(.close, stopped, 0, 0, 0);
+    const stop_at = sockaddr(.{ 127, 0, 0, 1 }, 7301);
+    _ = try ok(sys(.bind, stopped, @intFromPtr(&stop_at), @sizeOf(SockaddrIn), 0));
+    _ = try ok(sys(.listen, stopped, 8, 0, 0));
+    _ = try ok(setTimeout(stopped, so_rcvtimeo, 0, 50_000));
+    var stopper = try env.io.concurrent(shutsDown, .{stopped});
+    try testing.expectEqual(errOf(.INVAL), sys(.accept, stopped, 0, 0, 0));
+    stopper.await(env.io);
+
+    // A pair: the timeout is the socket's, so a duplicate has it.
+    const pair = try socketPair(0);
+    defer for (pair) |fd| {
+        _ = sys(.close, fd, 0, 0, 0);
+    };
+    _ = try ok(setTimeout(pair[0], so_rcvtimeo, 0, 15_000));
+    const copy = try ok(sys(.dup, pair[0], 0, 0, 0));
+    defer _ = sys(.close, copy, 0, 0, 0);
+    try expectTimesOut(15, sys, .{ .read, copy, @intFromPtr(&buf), buf.len, 0 });
+    _ = try ok(setTimeout(copy, so_rcvtimeo, 0, 3_000));
+    try expectTimesOut(3, sys, .{ .read, pair[0], @intFromPtr(&buf), buf.len, 0 });
+    _ = try ok(setTimeout(pair[0], so_sndtimeo, 0, 4_000));
+    var pair_sent: usize = 0;
+    while (true) {
+        const rc = sys(.write, pair[0], @intFromPtr(&buf), buf.len, 0);
+        if (rc == errOf(.AGAIN)) break;
+        pair_sent += try ok(rc);
+        try testing.expect(pair_sent < 1 << 20);
+    }
+    try testing.expect(pair_sent > 0);
+}
+
+test "system-call mode: SO_RCVTIMEO and SO_SNDTIMEO expire in virtual time" {
+    if (!supported or !tardis.syscallModeAvailable()) return error.SkipZigTest;
+    try tardis.check(gpa, socketTimeouts, .{ .iterations = 30, .mode = .syscalls });
+}

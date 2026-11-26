@@ -255,8 +255,10 @@ on its work-stealing one with two and four workers, and with the
 number it picks itself (one, or six when the test's `processors`
 option says six); an HTTP/1.1 server and three clients on hyper;
 `localhost` looked up through the C library; and `UnixStream::pair`,
-the standard library's between threads and tokio's between tasks.
-On musl and on glibc.
+the standard library's between threads and tokio's between tasks;
+and `set_read_timeout` and `set_write_timeout` on a TCP stream and a
+pair, which give up after their time in virtual time (`SO_RCVTIMEO`,
+`SO_SNDTIMEO`, revision 137). On musl and on glibc.
 
 A pair of connected sockets (`socketpair`, Unix domain, stream) is
 answered. A named Unix-domain socket is not: `socket(AF_UNIX, ...)`

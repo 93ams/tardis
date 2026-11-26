@@ -27,11 +27,14 @@
 //!   beside what is listed below: `recvfrom` (`MSG_DONTWAIT`, `MSG_PEEK`),
 //!   `sendto` (`MSG_DONTWAIT`, `MSG_NOSIGNAL`), `recvmsg` and `sendmsg`
 //!   (the same flags but `MSG_PEEK`, and no ancillary data), `shutdown`, `getsockname`
-//!   and `getpeername` (unnamed), `setsockopt` (accepted, changes
-//!   nothing) and `getsockopt` for `SO_ERROR`, `SO_TYPE`, `SO_DOMAIN`,
-//!   `SO_SNDBUF`, `SO_RCVBUF`. Divergences: closing an end with unread
-//!   bytes does not give the other end `ECONNRESET`; a timeout set with
-//!   `SO_RCVTIMEO` or `SO_SNDTIMEO` never expires; no `SIGPIPE` is
+//!   and `getpeername` (unnamed), `setsockopt` (`SO_RCVTIMEO` and
+//!   `SO_SNDTIMEO`, which expire in virtual time; any other is accepted
+//!   and changes nothing) and `getsockopt` for those two, `SO_ERROR`,
+//!   `SO_TYPE`, `SO_DOMAIN`, `SO_SNDBUF`, `SO_RCVBUF`. Divergences:
+//!   closing an end with unread bytes does not give the other end
+//!   `ECONNRESET`; a `writev` or `sendmsg` of more than 4096 bytes waits
+//!   up to `SO_SNDTIMEO` for each buffer, where Linux's waits once; no
+//!   `SIGPIPE` is
 //!   raised; and a task that writes more than 64 KiB before anyone reads
 //!   waits here where on Linux it would wait only past about 208 KiB.
 //! - `epoll_create`, `epoll_create1`, `epoll_ctl`, `epoll_wait`,
@@ -116,6 +119,10 @@ const Slot = struct {
     /// Changes whenever the slot is taken: an operation that waited
     /// checks it to see whether its descriptor was closed meanwhile.
     gen: u32 = 0,
+    /// One of a pair of sockets: `SO_RCVTIMEO` and `SO_SNDTIMEO`
+    /// (`readTimeout`), which every duplicate has.
+    recv_timeout: ?u64 = null,
+    send_timeout: ?u64 = null,
 };
 
 const Pipe = struct {
@@ -321,10 +328,79 @@ fn userBytes(ptr: u64, len: u64) ?[]u8 {
     return @as([*]u8, @ptrFromInt(ptr))[0..len];
 }
 
-/// Waits for anything to change. False if the wait was canceled.
-fn wait(s: *Sim) bool {
-    s.waitNetwork(null) catch return false;
+/// Waits for anything to change, or until `deadline` (null: no limit).
+/// False if the wait was canceled.
+fn wait(s: *Sim, deadline: ?u64) bool {
+    s.waitNetwork(deadline) catch return false;
     return true;
+}
+
+// --- a socket's timeouts ----------------------------------------------------------
+
+pub const Direction = enum { recv, send };
+
+/// The timeout a `setsockopt` or `getsockopt` names, if it names one:
+/// `SO_RCVTIMEO` or `SO_SNDTIMEO`, by the old numbers or the 64-bit ones
+/// (the same `struct timeval` on x86_64).
+pub fn timeoutOption(level: u64, name: u64) ?Direction {
+    if (level != 1) return null; // SOL_SOCKET
+    return switch (name) {
+        20, 66 => .recv,
+        21, 67 => .send,
+        else => null,
+    };
+}
+
+pub const TimeoutValue = union(enum) {
+    /// Nanoseconds of virtual time; 0 for a timeout already over; null
+    /// for none.
+    set: ?u64,
+    err: E,
+};
+
+/// Reads the `struct timeval` given to `setsockopt`, with Linux's errors:
+/// 0 seconds and 0 microseconds is no timeout; negative seconds is a
+/// timeout already over. Linux keeps the time in clock ticks, rounded up
+/// (`getsockopt` then gives the rounded time back), and takes only some
+/// 10^16 seconds or more as none; here the time is exact to the
+/// microsecond, and more than about 10^10 seconds is none.
+pub fn readTimeout(value_ptr: u64, len: u64) TimeoutValue {
+    if (@as(i32, @bitCast(@as(u32, @truncate(len)))) < 16) return .{ .err = .INVAL };
+    if (value_ptr == 0) return .{ .err = .FAULT };
+    const tv: *align(1) const [2]i64 = @ptrFromInt(value_ptr);
+    if (tv[1] < 0 or tv[1] >= 1_000_000) return .{ .err = .DOM };
+    if (tv[0] < 0) return .{ .set = 0 };
+    if (tv[0] == 0 and tv[1] == 0) return .{ .set = null };
+    const ns = std.math.mul(u64, @intCast(tv[0]), std.time.ns_per_s) catch return .{ .set = null };
+    return .{ .set = ns +| @as(u64, @intCast(tv[1])) * std.time.ns_per_us };
+}
+
+/// Writes a timeout for `getsockopt`: as much of its `struct timeval` as
+/// the length allows.
+pub fn writeTimeout(timeout: ?u64, value_ptr: u64, len_ptr: u64) u64 {
+    if (len_ptr == 0) return fail(.FAULT);
+    const len: *align(1) u32 = @ptrFromInt(len_ptr);
+    if (@as(i32, @bitCast(len.*)) < 0) return fail(.INVAL);
+    const ns = timeout orelse 0;
+    const tv = [2]i64{ @intCast(ns / std.time.ns_per_s), @intCast(ns % std.time.ns_per_s / std.time.ns_per_us) };
+    const bytes = std.mem.asBytes(&tv);
+    const n = @min(len.*, bytes.len);
+    if (n > 0 and value_ptr == 0) return fail(.FAULT);
+    if (n > 0) @memcpy(@as([*]u8, @ptrFromInt(value_ptr))[0..n], bytes[0..n]);
+    len.* = n;
+    return 0;
+}
+
+/// When a wait with `timeout` gives up, in virtual time: null for never.
+pub fn deadlineOf(s: *const Sim, timeout: ?u64) ?u64 {
+    return s.now_ns +| (timeout orelse return null);
+}
+
+/// The earlier of two deadlines, either of which may be none.
+pub fn earliest(a: ?u64, b: ?u64) ?u64 {
+    const x = a orelse return b;
+    const y = b orelse return x;
+    return @min(x, y);
 }
 
 // --- the calls ------------------------------------------------------------------
@@ -438,10 +514,14 @@ fn pipeRead(s: *Sim, slot: *Slot, buf: []u8, how: ReadHow) u64 {
     const index = slot.object;
     const gen = slot.gen;
     const p = &pipes[index];
+    // A pair's `SO_RCVTIMEO`: a read that waits that long fails, as a
+    // non-blocking one would.
+    const deadline = if (slot.kind == .pair) deadlineOf(s, slot.recv_timeout) else null;
     while (p.len == 0) {
         if (p.writers == 0 or p.shut) return 0;
         if (slot.nonblock or how.dontwait) return fail(.AGAIN);
-        if (!wait(s)) return fail(.INTR);
+        if (deadline) |d| if (s.now_ns >= d) return fail(.AGAIN);
+        if (!wait(s, deadline)) return fail(.INTR);
         // Closed by another task while this one waited.
         if (slot.gen != gen) return fail(.BADF);
     }
@@ -465,6 +545,9 @@ fn pipeWrite(s: *Sim, slot: *Slot, index: usize, buf: []const u8, atomic: bool, 
     const gen = slot.gen;
     const p = &pipes[index];
     const bytes = pipeBytes(index).?;
+    // A pair's `SO_SNDTIMEO`: a write that waits that long returns what it
+    // wrote, or fails if that is nothing.
+    const deadline = if (slot.kind == .pair) deadlineOf(s, slot.send_timeout) else null;
     var done: usize = 0;
     while (done < buf.len) {
         if (p.readers == 0 or p.shut) return if (done > 0) done else fail(.PIPE);
@@ -473,7 +556,8 @@ fn pipeWrite(s: *Sim, slot: *Slot, index: usize, buf: []const u8, atomic: bool, 
         const need: usize = if (atomic and buf.len <= pipe_atomic_bytes) buf.len else 1;
         if (room < need) {
             if (slot.nonblock or dontwait) return if (done > 0) done else fail(.AGAIN);
-            if (!wait(s)) return if (done > 0) done else fail(.INTR);
+            if (deadline) |d| if (s.now_ns >= d) return if (done > 0) done else fail(.AGAIN);
+            if (!wait(s, deadline)) return if (done > 0) done else fail(.INTR);
             if (slot.gen != gen) return if (done > 0) done else fail(.BADF);
             continue;
         }
@@ -596,8 +680,27 @@ fn onSocket(s: *Sim, slot: *Slot, number: u64, a: *const [6]u64) ?u64 {
             len.* = family.len;
             return 0;
         },
-        54 => return 0, // setsockopt: accepted, changes nothing
+        54 => { // setsockopt: the timeouts; any other is accepted and changes nothing
+            const which = timeoutOption(a[1], a[2]) orelse return 0;
+            const timeout = switch (readTimeout(a[3], a[4])) {
+                .set => |t| t,
+                .err => |e| return fail(e),
+            };
+            // The socket's: every duplicate has it.
+            for (&slots) |*other| {
+                if (other.kind != .pair or other.description != slot.description) continue;
+                switch (which) {
+                    .recv => other.recv_timeout = timeout,
+                    .send => other.send_timeout = timeout,
+                }
+            }
+            return 0;
+        },
         55 => { // getsockopt
+            if (timeoutOption(a[1], a[2])) |which| return writeTimeout(switch (which) {
+                .recv => slot.recv_timeout,
+                .send => slot.send_timeout,
+            }, a[3], a[4]);
             if (a[1] != 1) return fail(.OPNOTSUPP); // not SOL_SOCKET
             const value: i32 = switch (a[2]) {
                 4 => 0, // SO_ERROR
@@ -643,7 +746,7 @@ fn eventRead(s: *Sim, slot: *Slot, buf: []u8) u64 {
     const counter = &counters[slot.object].value;
     while (counter.* == 0) {
         if (slot.nonblock) return fail(.AGAIN);
-        if (!wait(s)) return fail(.INTR);
+        if (!wait(s, null)) return fail(.INTR);
         if (slot.gen != gen) return fail(.BADF);
     }
     const value: u64 = if (slot.semaphore) 1 else counter.*;
@@ -662,7 +765,7 @@ fn eventWrite(s: *Sim, slot: *Slot, buf: []const u8) u64 {
     const counter = &counters[slot.object].value;
     while (value > counter_max - counter.*) {
         if (slot.nonblock) return fail(.AGAIN);
-        if (!wait(s)) return fail(.INTR);
+        if (!wait(s, null)) return fail(.INTR);
         if (slot.gen != gen) return fail(.BADF);
     }
     counter.* += value;
@@ -766,6 +869,8 @@ fn duplicate(s: *Sim, slot: *Slot) u64 {
     slots[i].object = from.object;
     slots[i].out = from.out;
     slots[i].description = from.description;
+    slots[i].recv_timeout = from.recv_timeout;
+    slots[i].send_timeout = from.send_timeout;
     switch (from.kind) {
         .free => unreachable,
         .pipe_read => pipes[from.object].readers += 1,

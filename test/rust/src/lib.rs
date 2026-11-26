@@ -162,8 +162,7 @@ pub extern "C" fn rust_unix_pair() -> i32 {
         Ok(Some(all)) if all == sent => {}
         _ => return 6,
     }
-    // A read that times out is not answered: `SO_RCVTIMEO` is accepted
-    // and does nothing, so none is asked for here.
+    // Timeouts are `rust_timeouts`'s.
     if mine.peer_addr().map(|a| a.is_unnamed()).unwrap_or(false) { 0 } else { 7 }
 }
 
@@ -283,6 +282,64 @@ pub extern "C" fn rust_tcp() -> i32 {
     }
     if served.load(Ordering::SeqCst) != 600 {
         return 4;
+    }
+    0
+}
+
+/// `set_read_timeout` and `set_write_timeout` on a TCP stream and on a
+/// Unix-domain pair: a read with nothing coming, or a write to a peer
+/// that reads nothing, gives up after the timeout in virtual time.
+#[no_mangle]
+pub extern "C" fn rust_timeouts() -> i32 {
+    use std::io::ErrorKind;
+    use std::time::{Duration, Instant};
+    let timed_out = |e: &std::io::Error| matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut);
+    let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:7400") else { return 1 };
+    let Ok(mut client) = std::net::TcpStream::connect("127.0.0.1:7400") else { return 2 };
+    let Ok((_conn, _)) = listener.accept() else { return 3 };
+    let wait = Duration::from_millis(40);
+    if client.set_read_timeout(Some(wait)).is_err() || client.read_timeout().ok() != Some(Some(wait)) {
+        return 4;
+    }
+    let start = Instant::now();
+    let mut buf = [0u8; 16];
+    match client.read(&mut buf) {
+        Err(e) if timed_out(&e) => {}
+        _ => return 5,
+    }
+    if start.elapsed() != wait {
+        return 6;
+    }
+    // A write to a peer that reads nothing: what fits, then the timeout.
+    if client.set_write_timeout(Some(Duration::from_millis(10))).is_err() {
+        return 7;
+    }
+    let block = vec![7u8; 64 * 1024];
+    let mut sent = 0usize;
+    loop {
+        match client.write(&block) {
+            Ok(n) => sent += n,
+            Err(e) if timed_out(&e) => break,
+            Err(_) => return 8,
+        }
+        if sent > 1 << 24 {
+            return 9;
+        }
+    }
+    if sent == 0 {
+        return 10;
+    }
+    let Ok((mut a, _b)) = std::os::unix::net::UnixStream::pair() else { return 11 };
+    if a.set_read_timeout(Some(Duration::from_millis(15))).is_err() {
+        return 12;
+    }
+    let start = Instant::now();
+    match a.read(&mut buf) {
+        Err(e) if timed_out(&e) => {}
+        _ => return 13,
+    }
+    if start.elapsed() != Duration::from_millis(15) {
+        return 14;
     }
     0
 }
