@@ -9,6 +9,14 @@
 //! freed block goes through a FIFO of `quarantine_slots` before the arena
 //! may reclaim it (plan2.md §3.5). Both hold with or without a security
 //! layer, so attaching one never changes an address.
+//!
+//! Without a security layer a freed block is filled with `freed_fill`
+//! (`Options.poison_freed`): code that reads it after the free reads the
+//! fill, the same on every replay, instead of the value it left there. The
+//! fill is checked when the block leaves the quarantine and when the run
+//! ends or the node crashes, which finds a write after the free. With a
+//! layer the layer fills freed blocks with its own pattern, which it
+//! recognizes where it looks (`tardis_sec`), and this check is not made.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -19,6 +27,17 @@ const seam = @import("sec_seam.zig");
 pub const redzone_bytes = seam.redzone_bytes;
 /// Freed blocks held back from reuse, per node.
 pub const quarantine_slots = 4096;
+/// What a freed block is filled with: what Zig writes for `undefined` in
+/// a build with runtime safety, so a read of it looks like one; as a
+/// pointer it is not canonical on x86_64 and faults on aarch64.
+pub const freed_fill: u8 = 0xAA;
+
+/// Told of a freed block found changed: its length, and the first changed
+/// byte's offset and value.
+pub const FreedWritten = struct {
+    ctx: *anyopaque,
+    f: *const fn (ctx: *anyopaque, node: u8, len: usize, offset: usize, byte: u8) void,
+};
 
 const Quarantined = struct { ptr: [*]u8, len: usize, alignment: Alignment };
 
@@ -39,6 +58,12 @@ pub const SutAllocator = struct {
     sec: ?seam.Attached = null,
     sec_node: seam.NodeId = 0,
     sec_violation: ?seam.ViolationSink = null,
+    /// Fill freed blocks and check the fill (`Options.poison_freed`);
+    /// not with a security layer, which fills them itself.
+    poison: bool = true,
+    /// This heap's node, for the report of a write after free.
+    node: u8 = 0,
+    freed_written: ?FreedWritten = null,
 
     pub fn init(backing: Allocator, decider: *decide.Decider, budget_bytes: u64) error{OutOfMemory}!SutAllocator {
         return .{
@@ -62,6 +87,28 @@ pub const SutAllocator = struct {
     /// True if nothing was allocated since `reset`.
     pub fn pristine(s: *const SutAllocator) bool {
         return s.live_bytes == 0 and s.live_count == 0 and s.oom_count == 0 and s.quarantine_len == 0;
+    }
+
+    /// Whether freed blocks are filled and checked here.
+    fn filling(s: *const SutAllocator) bool {
+        return s.poison and s.sec == null;
+    }
+
+    /// Checks every quarantined block's fill (`freed_written` hears of the
+    /// first changed one); before the heap is wiped.
+    pub fn checkQuarantine(s: *SutAllocator) void {
+        if (!s.filling()) return;
+        for (s.quarantine[0..s.quarantine_len]) |q| {
+            if (s.checkFill(q)) return;
+        }
+    }
+
+    /// True if `q` was written after its free (and says so).
+    fn checkFill(s: *SutAllocator, q: Quarantined) bool {
+        const bytes = q.ptr[0 .. q.len - redzone_bytes];
+        const at = firstChanged(bytes) orelse return false;
+        if (s.freed_written) |sink| sink.f(sink.ctx, s.node, bytes.len, at, bytes[at]);
+        return true;
     }
 
     pub fn reset(s: *SutAllocator) void {
@@ -98,9 +145,26 @@ pub const SutAllocator = struct {
             return;
         }
         const old = s.quarantine[s.quarantine_next];
+        if (s.filling()) _ = s.checkFill(old);
         s.arena.allocator().rawFree(old.ptr[0..old.len], old.alignment, ret_addr);
         s.quarantine[s.quarantine_next] = q;
         s.quarantine_next = (s.quarantine_next + 1) % s.quarantine.len;
+    }
+
+    /// The first byte of `bytes` that is not `freed_fill`: sixteen at a
+    /// time (every freed byte is looked at once, even in a debug build).
+    fn firstChanged(bytes: []const u8) ?usize {
+        const V = @Vector(16, u8);
+        const fill: V = @splat(freed_fill);
+        var i: usize = 0;
+        while (i + 16 <= bytes.len) : (i += 16) {
+            const v: V = bytes[i..][0..16].*;
+            if (@reduce(.Or, v != fill)) break;
+        }
+        while (i < bytes.len) : (i += 1) {
+            if (bytes[i] != freed_fill) return i;
+        }
+        return null;
     }
 
     pub fn allocator(s: *SutAllocator) Allocator {
@@ -159,6 +223,9 @@ pub const SutAllocator = struct {
     fn resized(s: *SutAllocator, memory: []u8, new_len: usize) void {
         s.live_bytes = s.live_bytes - memory.len + new_len;
         if (new_len < memory.len) s.secFree(memory[new_len..]);
+        // The dropped tail past the new guard: filled, not checked (the
+        // arena may give it to the next allocation).
+        if (new_len + redzone_bytes < memory.len and s.filling()) @memset(memory[new_len + redzone_bytes ..], freed_fill);
         if (new_len > memory.len) s.secAlloc(memory.ptr[memory.len..new_len]);
         writeGuard(memory.ptr, new_len);
         // The guard now stands inside what was just dropped: an empty
@@ -170,6 +237,7 @@ pub const SutAllocator = struct {
         const s: *SutAllocator = @ptrCast(@alignCast(ctx));
         std.debug.assert(s.live_count > 0);
         s.secFree(memory);
+        if (s.filling()) @memset(memory, freed_fill);
         s.quarantinePush(memory.ptr[0 .. memory.len + redzone_bytes], alignment, ret_addr);
         s.live_bytes -= memory.len;
         s.live_count -= 1;
@@ -210,4 +278,53 @@ test "a guard follows every allocation and moves with a resize; a freed block is
     try std.testing.expectEqual(@as(usize, 2), s.quarantine_len);
     s.reset();
     try std.testing.expectEqual(@as(usize, 0), s.quarantine_len);
+}
+
+test "a freed block is filled, and a write to it is found when it leaves the quarantine or is checked" {
+    var d = decide.Decider.init(1);
+    var s = try SutAllocator.init(std.testing.allocator, &d, 1 << 30);
+    defer s.deinit();
+    const Seen = struct {
+        count: usize = 0,
+        len: usize = 0,
+        offset: usize = 0,
+        byte: u8 = 0,
+        fn f(ctx: *anyopaque, _: u8, len: usize, offset: usize, byte: u8) void {
+            const seen: *@This() = @ptrCast(@alignCast(ctx));
+            seen.count += 1;
+            seen.len = len;
+            seen.offset = offset;
+            seen.byte = byte;
+        }
+    };
+    var seen: Seen = .{};
+    s.freed_written = .{ .ctx = &seen, .f = Seen.f };
+    const a = s.allocator();
+    const x = try a.alloc(u8, 40);
+    @memset(x, 7);
+    a.rawFree(x, .@"1", @returnAddress());
+    for (x) |b| try std.testing.expectEqual(freed_fill, b);
+    s.checkQuarantine();
+    try std.testing.expectEqual(@as(usize, 0), seen.count);
+    // A write after the free.
+    x[13] = 1;
+    s.checkQuarantine();
+    try std.testing.expectEqual(@as(usize, 1), seen.count);
+    try std.testing.expectEqual(@as(usize, 40), seen.len);
+    try std.testing.expectEqual(@as(usize, 13), seen.offset);
+    try std.testing.expectEqual(@as(u8, 1), seen.byte);
+    // And when it leaves the quarantine.
+    for (0..quarantine_slots) |_| a.free(try a.alloc(u8, 1));
+    try std.testing.expectEqual(@as(usize, 2), seen.count);
+    s.reset();
+
+    // Off: the bytes stay as the program left them.
+    s.poison = false;
+    const y = try a.alloc(u8, 8);
+    @memset(y, 7);
+    // Past `free`, which writes `undefined` first in a build with runtime
+    // safety.
+    a.rawFree(y, .@"1", @returnAddress());
+    for (y) |b| try std.testing.expectEqual(@as(u8, 7), b);
+    s.reset();
 }

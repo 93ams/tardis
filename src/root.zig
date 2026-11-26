@@ -316,6 +316,16 @@ pub const Options = struct {
     /// x86_64 (`PR_SET_TSC`); ignored elsewhere, in forked iterations and
     /// in `sim`'s loop form.
     virtual_tsc: bool = false,
+    /// Fill each block freed through `env.allocator` with `0xAA`, so code
+    /// that reads it after the free reads that instead of what it left
+    /// there, the same on every replay; and check the fill when the block
+    /// is given back for reuse (after 4,096 later frees on its node), when
+    /// its node crashes and when the run ends: a block found changed fails
+    /// the run with `error.WriteAfterFree`. Off, a freed block keeps its
+    /// bytes until it is reused, and a read after the free reads the old
+    /// value. With a security layer the layer fills freed blocks itself and
+    /// this is not done. docs/guide.md §2.
+    poison_freed: bool = true,
     /// An optional security layer such as `tardis_sec` (plan2.md §2.2).
     /// A violation it reports fails the run with `error.SecurityViolation`.
     security: ?sec_seam.Security = null,
@@ -574,6 +584,7 @@ fn simConfig(o: Options) Sim.Config {
         .processors = o.processors,
         .prime = o.prime,
         .virtual_tsc = o.virtual_tsc,
+        .poison_freed = o.poison_freed,
         .faults = o.faults,
         .limits = o.limits,
         .epoch_offset_ns = o.epoch_offset_ns,
@@ -608,6 +619,9 @@ pub const Error = error{
     FibersUnsupported,
     StraySyscall,
     SyscallModeUnsupported,
+    /// A block freed through `env.allocator` was changed after its free
+    /// (`Options.poison_freed`).
+    WriteAfterFree,
 };
 
 /// A simulated process: what a program registered with
@@ -1250,7 +1264,7 @@ fn runOnce(s: *Sim, comptime body: fn (*Env) anyerror!void, seed: u64, persona: 
         // real kernel and the real disk, so it is not run.
         if (vdso_trapped) _ = vdso.end();
         if (virtual_counter) _ = tsc.end();
-        s.secEndRun();
+        s.endRunChecks();
         s.endRun();
         return .{ .result = error.SyscallModeUnsupported, .trace_hash = 0, .finding = 0 };
     }
@@ -1262,7 +1276,7 @@ fn runOnce(s: *Sim, comptime body: fn (*Env) anyerror!void, seed: u64, persona: 
     const stray = if (trapping) syscalls.end() else null;
     const vdso_lifted = vdso_trapped and vdso.end();
     if (virtual_counter) _ = tsc.end();
-    s.secEndRun();
+    s.endRunChecks();
     var result = r.outcome;
     if (vdso_lifted) {
         if (s.config.report) std.debug.print("tardis: the vDSO could not stay trapped (a thread was inside it when the run began, the code read its image, or it called a vDSO function tardis does not answer): the run's later clock reads may have been the host's\n", .{});
@@ -1287,7 +1301,8 @@ fn runOnce(s: *Sim, comptime body: fn (*Env) anyerror!void, seed: u64, persona: 
     }
     if (result) |_| {
         if (s.daemon_error) |err| {
-            if (s.config.report and err != error.SecurityViolation) std.debug.print("tardis: a daemon task failed with error.{s}\n", .{@errorName(err)});
+            // These two said what they were where they were found.
+            if (s.config.report and err != error.SecurityViolation and err != error.WriteAfterFree) std.debug.print("tardis: a daemon task failed with error.{s}\n", .{@errorName(err)});
             result = err;
         }
     } else |_| {}
@@ -2698,7 +2713,7 @@ fn ForkServer(comptime body: fn (*Env) anyerror!void) type {
                     c.env.iteration = it;
                     s.iteration = it;
                     var result: anyerror!void = if (startAutoChaos(c.env)) body(c.env) else |err| err;
-                    s.secEndRun();
+                    s.endRunChecks();
                     if (result) |_| {
                         if (s.daemon_error) |e| result = e;
                     } else |_| {}
@@ -3215,9 +3230,12 @@ pub const Simulation = struct {
     /// is done `step` returns null and `finish` returns the error.
     pub fn step(self: *Simulation) ?*Env {
         if (self.in_progress) {
-            const failed_now = self.failure;
+            var failed_now = self.failure;
             self.failure = null;
-            self.s.secEndRun();
+            self.s.endRunChecks();
+            // A write after free fails the iteration as `fail` would,
+            // whether it was found during it or at its end.
+            if (failed_now == null and self.s.daemon_error != null and self.s.daemon_error.? == error.WriteAfterFree) failed_now = error.WriteAfterFree;
             self.s.endRun();
             self.s.overlay = null;
             self.s.recorder = null;
@@ -3345,7 +3363,7 @@ pub const Simulation = struct {
     /// error an iteration reported with `fail`, if any (after shrinking it).
     pub fn finish(self: *Simulation) !void {
         if (self.in_progress) {
-            self.s.secEndRun();
+            self.s.endRunChecks();
             self.s.endRun();
             self.s.overlay = null;
             self.s.recorder = null;
@@ -3478,4 +3496,5 @@ test {
     _ = @import("tests/parallel_test.zig");
     _ = @import("tests/fork_test.zig");
     _ = @import("tests/crash_test.zig");
+    _ = @import("tests/poison_test.zig");
 }

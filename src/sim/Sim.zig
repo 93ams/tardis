@@ -144,6 +144,8 @@ pub const Config = struct {
     prime: bool = false,
     /// Answer `rdtsc` with virtual time (`tsc.zig`).
     virtual_tsc: bool = false,
+    /// Fill freed heap blocks and check the fill (`Options.poison_freed`).
+    poison_freed: bool = true,
     /// An optional security layer (plan2.md §2.2), one instance per `Sim`.
     security: ?seam.Security = null,
 };
@@ -472,10 +474,13 @@ pub fn create(gpa: Allocator, config: Config) !*Sim {
         n.vfs.deinit();
         n.heap.deinit();
     };
-    for (s.nodes) |*n| {
+    for (s.nodes, 0..) |*n, i| {
         // A fresh heap holds no pointers into itself, so it can be moved in.
         var heap: alloc_mod.SutAllocator = try .init(gpa, &s.decider, limits.heap_bytes_max);
         errdefer heap.deinit();
+        heap.poison = config.poison_freed;
+        heap.node = @intCast(i);
+        heap.freed_written = .{ .ctx = s, .f = freedWrittenThunk };
         n.* = .{
             .vfs = try .init(gpa, limits.vfs, .linux_ext4),
             .drift_ppm = 0,
@@ -2051,6 +2056,7 @@ pub fn crashAndReboot(s: *Sim, mode: CrashMode) void {
     sysnet.dropNode(null);
     sysfd.dropNode(null);
     systhread.dropNode(null);
+    for (s.nodes) |*n| n.heap.checkQuarantine();
     for (s.nodes) |*n| n.heap.reset();
     s.plan.clearTargeted();
     s.boot_count += 1;
@@ -2124,6 +2130,7 @@ pub fn crashNode(s: *Sim, node: NodeId, mode: CrashMode) void {
     sysnet.dropNode(node);
     sysfd.dropNode(node);
     systhread.dropNode(node);
+    s.nodes[node].heap.checkQuarantine();
     s.nodes[node].heap.reset();
     const freed = s.net.crashNode(node, s.now_ns, &s.decider, s.config.net);
     s.record(.net_fault, node, freed, 0, "node crash");
@@ -2183,8 +2190,10 @@ pub fn secTokens(s: *Sim) []const u64 {
     return f(a.ctx);
 }
 
-/// The body returned: the security layer checks the run as a whole.
-pub fn secEndRun(s: *Sim) void {
+/// The body returned: the run's freed blocks are checked for writes after
+/// their free, and the security layer checks the run as a whole.
+pub fn endRunChecks(s: *Sim) void {
+    for (s.nodes) |*n| n.heap.checkQuarantine();
     const a = s.sec orelse return;
     const cwe = a.provider.end_run(a.ctx);
     if (cwe != 0) s.securityFailed(cwe, "found at the end of the run");
@@ -2218,6 +2227,17 @@ pub fn secCampaignEnd(s: *Sim, end: *const seam.CampaignEnd) void {
     const a = s.sec orelse return;
     const f = a.provider.campaign_end orelse return;
     f(a.ctx, end);
+}
+
+/// A freed block was found changed since its free: the run fails with
+/// `error.WriteAfterFree`.
+fn freedWrittenThunk(ctx: *anyopaque, node: u8, len: usize, offset: usize, byte: u8) void {
+    const s: *Sim = @ptrCast(@alignCast(ctx));
+    // In the trace: a = node, b = the block's length, c = the offset.
+    s.record(.note, node, len, offset, "write after free");
+    if (s.daemon_error != null) return;
+    s.daemon_error = error.WriteAfterFree;
+    if (s.config.report) std.debug.print("tardis: a heap block of {d} bytes on node {d} was written after it was freed: its byte {d} is 0x{x:0>2} where the free left 0x{x:0>2} (Options.poison_freed)\n", .{ len, node, offset, byte, alloc_mod.freed_fill });
 }
 
 fn secViolationThunk(ctx: *anyopaque, cwe: u16) void {

@@ -68,6 +68,7 @@ finds one of these (`tardis.Error`):
 | `NonDeterministic` | a run did not repeat when run again with the same seed (`Options.determinism_check_every`, 16 by default; 0 turns it off) |
 | `SometimesNeverTrue` | a `sometimes` never held in the whole campaign |
 | `StraySyscall` | the code made a real system call while the trap was on |
+| `WriteAfterFree` | a block freed through `env.allocator` was changed after its free (`Options.poison_freed`, on by default) |
 | `SyscallModeUnsupported`, `FibersUnsupported` | the platform cannot do what was asked |
 
 A test that expects a failure turns the report off so the log stays
@@ -119,7 +120,7 @@ watch, system-call mode is refused, and the campaign variables of section
 |---|---|
 | `io` | a `std.Io`. Files, sockets, tasks, sleeping, clocks and random bytes all go through it |
 | `dir` | the root of the simulated filesystem, a `std.Io.Dir`. It stays valid across crashes |
-| `allocator` | the heap of the code under test. It is wiped at every crash and every iteration, it is checked for leaks, and it can be made to fail (`faults.oom_ppm`) |
+| `allocator` | the heap of the code under test. It is wiped at every crash and every iteration, it is checked for leaks, it can be made to fail (`faults.oom_ppm`), and it fills what is freed (below) |
 | `seed`, `persona`, `iteration` | which run this is |
 | `sim` | the simulator itself; tests rarely need it |
 
@@ -150,6 +151,29 @@ clocks are not affected by a step.
 in [`src/tests/determinism_test.zig`](../src/tests/determinism_test.zig).
 Code under test that asks its `Io` for randomness gets the same bytes on
 every replay.
+
+**Freed memory.** A block freed through `env.allocator` is not reused
+at once: it waits until 4,096 more blocks on its node have been freed,
+so a use after the free does not reach some other allocation. It is
+filled with `0xAA` when it is freed (`Options.poison_freed`, on by
+default): code that reads it afterwards reads `0xAA` bytes, not the value
+it left there, so the run goes wrong where a run in production might
+not, the same way on every replay. (`0xAA` is what Zig writes for
+`undefined` in Debug and ReleaseSafe, where std's `Allocator.free` and
+`realloc` already write it before the block reaches the heap; in
+ReleaseFast and ReleaseSmall, and for code that calls `rawFree`, only
+this fill does. As a pointer it faults.) The fill is checked when the
+block is reused, when its node crashes and when the run ends, and a block
+found changed fails the run with `error.WriteAfterFree`, with a line
+saying its length and which byte changed. A write after the free is found
+only if it changes a byte from `0xAA`, and only once it is checked, not
+where it was made; a write of something that differs from run to run,
+such as an address, can make the run fail with `NonDeterministic`
+instead. A security layer (`docs/security.md`) fills freed blocks with its
+own pattern instead, and then this check is not made. In the loop form
+(`tardis.sim`) a write found during the iteration shows in
+`env.daemonError()`, and one found by the iteration's end fails it as
+`fail` would.
 
 **Test inputs.** `env.fuzz(T)` builds a value of type `T` from the seed:
 integers (biased towards boundary values), structs, enums, optionals,
